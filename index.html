@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TIONGTECH (Supabase)</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin src="https://cdn.jsdelivr.net/npm/recharts@2.12.7/umd/Recharts.min.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>html,body,#root{height:100%} body{margin:0;background:#10151b;font-family:Inter,system-ui,sans-serif} #boot{position:fixed;inset:0;display:grid;place-items:center;color:#8394a3;font:14px/1.5 system-ui,sans-serif;z-index:5}#boot .ring{width:34px;height:34px;border:3px solid #26313c;border-top-color:#2CC9E4;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}@keyframes spin{to{transform:rotate(360deg)}}.leaflet-container{background:#0e1319}</style>
+</head><body>
+<div id="boot"><div><div class="ring"></div>Loading TIONGTECH (Supabase)…</div></div>
+<div id="root"></div>
+<script>
+  // Your Supabase project. The anon key below is safe to be public
+  // (your data is protected by Row Level Security). Never put the
+  // service_role key or database password here.
+  window.SB = window.supabase.createClient(
+    "https://mgwrjynhbebjtneuahmq.supabase.co",
+    "PASTE_YOUR_ANON_KEY_HERE"
+  );
+</script>
+<script src="app.js"></script>
+</body></html>
