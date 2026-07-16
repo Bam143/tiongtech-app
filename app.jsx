@@ -476,6 +476,23 @@ async function _supaBootstrap() {
   out.payroll = [];
   return out;
 }
+// Map an ERP client record to the clients table. Mirrors api.php's create_client /
+// update_client: the same 16 columns, and the same empty-string rules. Anything else the
+// form carries (olt / pon / napPort) isn't a column, and balance / billing_status /
+// renewal_note / bill_date / due_date / active_profile are owned by other actions — writing
+// them here would wipe them on every save.
+const _cTxt = (v) => (v === undefined || v === null ? null : v);   // keeps "" as "" like api.php, so names never render as "null"
+const _cNum = (v) => { const n = Number(v); return v === "" || v === null || v === undefined || !isFinite(n) ? null : n; };
+function _clientPayload(c) {
+  return {
+    account_number: _cTxt(c.account_number), first_name: _cTxt(c.first_name), last_name: _cTxt(c.last_name),
+    address: _cTxt(c.address), coordinates: _cTxt(c.coordinates), area: _cTxt(c.area),
+    phone: _cTxt(c.phone), email: _cTxt(c.email),
+    subscription_date: c.subscription_date ? c.subscription_date : null, // "" is not a valid date in Postgres
+    profile: _cTxt(c.profile), mrc: _cNum(c.mrc), port: _cTxt(c.port), nap: _cTxt(c.nap),
+    url_link: _cTxt(c.url_link), notes: _cTxt(c.notes), nap_port_id: _cNum(c.nap_port_id),
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -490,6 +507,23 @@ const API = (action, payload) => {
         }
         if (action === "logout") { await sb.auth.signOut(); return { ok: true }; }
         if (action === "bootstrap") { return await _supaBootstrap(); }
+        if (action === "create_client") {
+          const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
+          if (error) return { ok: false, error: error.message };
+          return { ok: true, id: data ? data.id : null }; // the caller stores this id so a later edit/delete can find the row
+        }
+        if (action === "update_client") {
+          if (!payload || !payload.id) return { ok: false, error: "Missing id" };
+          const { error } = await sb.from("clients").update(_clientPayload(payload)).eq("id", payload.id);
+          if (error) return { ok: false, error: error.message };
+          return { ok: true };
+        }
+        if (action === "delete_client") {
+          if (!payload || !payload.id) return { ok: false, error: "Missing id" };
+          const { error } = await sb.from("clients").delete().eq("id", payload.id);
+          if (error) return { ok: false, error: error.message };
+          return { ok: true };
+        }
         return { ok: false, error: "\u201C" + action + "\u201D is not connected to Supabase yet." };
       } catch (e) { return { ok: false, error: (e && e.message) || String(e) }; }
     })();
