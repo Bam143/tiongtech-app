@@ -540,12 +540,167 @@ await t.test("a normal unlock is unaffected — still ok:true", async () => {
 });
 
 // ---- the other payroll writes must still fall through ----
-const FALLTHROUGH = ["pr_publish", "pr_lock", "pr_delete_period", "pr_apply_plans", "pr_set_dayoff",
+/* ---------- pr_publish ---------- */
+// Publish is two writes with no transaction around them, so most of what matters here is what
+// happens when the second one is refused after the first has landed.
+
+const PUB_ITEMS = [
+  { id: 71, period_id: 3, employee_id: 5, status: "approved" },   // a prior approval, to be reset
+  { id: 72, period_id: 3, employee_id: 6, status: null },
+  { id: 73, period_id: 4, employee_id: 5, status: null },         // another week — must not move
+];
+const publish = async (periods, items, payload, role, opts) => {
+  const was = getME();
+  if (role !== undefined) setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_periods: periods, pr_items: items }, opts);
+    window.SB = sb;
+    const res = await API("pr_publish", payload);
+    return { sb, res };
+  } finally { setME(was); }   // ME is global; a leak here would silently re-role later tests
+};
+const draft = [{ id: 3, status: "draft" }];
+const pubWrites = (sb) => sb.calls.filter((c) => c.op === "update");
+
+await t.test("publish sets every line to 'pending' AND flips the period to 'published'", async () => {
+  const { sb, res } = await publish(draft, PUB_ITEMS, { id: 3 }, "owner");
+  t.eq(res.ok, true, `published, got: ${res.error}`);
+  const w = pubWrites(sb);
+  t.eq(w.length, 2, "exactly two writes");
+  t.eq(w[0].table, "pr_items", "first write is the lines");
+  t.eq(w[0].row.status, "pending", "lines go to pending — Awaiting Review");
+  t.eq(w[0].filters.period_id, 3, "scoped to this week only");
+  t.eq(w[1].table, "pr_periods", "second write is the period");
+  t.eq(w[1].row.status, "published", "period is published");
+  t.eq(w[1].filters.id, 3, "the right period");
+});
+
+await t.test("the items write comes FIRST — the period must never publish before its lines move", async () => {
+  // The ordering is the only safety available: there is no transaction, so if the lines are
+  // refused the period must not already say 'published'.
+  const { sb } = await publish(draft, PUB_ITEMS, { id: 3 }, "owner");
+  const w = pubWrites(sb);
+  t.ok(w.findIndex((c) => c.table === "pr_items") < w.findIndex((c) => c.table === "pr_periods"), "items before period");
+});
+
+await t.test("publish writes status and nothing else on either table", async () => {
+  const { sb } = await publish(draft, PUB_ITEMS, { id: 3 }, "owner");
+  const w = pubWrites(sb);
+  t.eq(Object.keys(w[0].row).join(","), "status", "pr_items: only status");
+  // published_at is a real column (app.jsx:680) and nothing in the UI reads it. Stamping it was
+  // not asked for; if that changes, change this test deliberately.
+  t.eq(Object.keys(w[1].row).join(","), "status", "pr_periods: only status");
+});
+
+await t.test("a prior approval is reset — republishing means everyone reviews again", async () => {
+  const { sb } = await publish(draft, PUB_ITEMS, { id: 3 }, "owner");
+  const w = pubWrites(sb).find((c) => c.table === "pr_items");
+  t.eq(w.row.status, "pending", "the approved line is sent back to pending");
+  t.ok(!("employee_remark" in w.row) && !("approved_at" in w.row), "and nothing else on the line is touched");
+});
+
+await t.test("the payroll officer may publish; the owner may publish", async () => {
+  for (const role of ["owner", "payroll"]) {
+    const { res } = await publish(draft, PUB_ITEMS, { id: 3 }, role);
+    t.eq(res.ok, true, `${role} published, got: ${res.error}`);
+  }
+});
+
+await t.test("everyone else is refused and writes NOTHING — not even the lines", async () => {
+  // The point of refusing before the first write: the two writes are not atomic, so an account
+  // that will be refused on the period must never move the lines first. Otherwise every employee
+  // is notified about a week that never published.
+  for (const role of ["admin", "technician", "cfo", "admin_officer"]) {
+    const { sb, res } = await publish(draft, PUB_ITEMS, { id: 3 }, role);
+    t.eq(res.ok, false, `${role} refused`);
+    t.eq(res.error, "Only the superadmin or the payroll officer can publish a week.", `${role} message`);
+    t.eq(sb.calls.length, 0, `${role} touched nothing at all`);
+  }
+});
+
+await t.test("publishing an already-published week is refused — it would wipe the approvals", async () => {
+  const { sb, res } = await publish([{ id: 3, status: "published" }], PUB_ITEMS, { id: 3 }, "owner");
+  t.eq(res.ok, false, "refused");
+  t.ok(/already published/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(pubWrites(sb).length, 0, "no approval was reset");
+});
+
+await t.test("publishing a LOCKED week is refused", async () => {
+  const { sb, res } = await publish([{ id: 3, status: "locked" }], PUB_ITEMS, { id: 3 }, "owner");
+  t.eq(res.ok, false, "refused");
+  t.eq(pubWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("publishing an unknown week is refused", async () => {
+  const { sb, res } = await publish([], PUB_ITEMS, { id: 3 }, "owner");
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(pubWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("publish with no id is refused before any lookup", async () => {
+  const { sb, res } = await publish(draft, PUB_ITEMS, {}, "owner");
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("a week with no pay lines is refused rather than published empty", async () => {
+  // Zero rows from the items UPDATE is ambiguous — refused, or nothing to update? Counting first
+  // is what makes the refusal check below mean something.
+  const { sb, res } = await publish(draft, [{ id: 73, period_id: 4, employee_id: 5 }], { id: 3 }, "owner");
+  t.eq(res.ok, false, "refused");
+  t.ok(/no pay lines/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(pubWrites(sb).length, 0, "the empty week was NOT published");
+});
+
+await t.test("lines refused SILENTLY (USING policy, 200 + []) — the week does not publish", async () => {
+  const { sb, res } = await publish(draft, PUB_ITEMS, { id: 3 }, "owner", { blockWrites: "pr_items" });
+  t.eq(res.ok, false, "refused");
+  t.ok(/NOT published/.test(res.error), `says the week did not publish, got: ${res.error}`);
+  t.eq(pubWrites(sb).filter((c) => c.table === "pr_periods").length, 0, "the period never flipped");
+  // "nothing changed", NOT the partial message. Asserting only /NOT published/ here let the
+  // mutation that deletes this guard survive: with it gone, `moved < expected` catches the same
+  // case and also says "NOT published" — but it says "0 of 2 lines were set before the database
+  // refused the REST", which claims a partial write that never happened. Total refusal is the
+  // ordinary way RLS says no, and it has to read as total.
+  t.ok(/nothing changed/.test(res.error), `a total refusal reads as total, not partial, got: ${res.error}`);
+});
+
+await t.test("lines refused with 42501 — the week does not publish", async () => {
+  const { sb, res } = await publish(draft, PUB_ITEMS, { id: 3 }, "owner", { errorWrites: "pr_items" });
+  t.eq(res.ok, false, "refused");
+  t.ok(/NOT published/.test(res.error), `says the week did not publish, got: ${res.error}`);
+  t.eq(pubWrites(sb).filter((c) => c.table === "pr_periods").length, 0, "the period never flipped");
+  // Same trap as above: a raise and a silent refusal both end in "NOT published", so without
+  // surfacing what Postgres actually said, deleting the `if (itemsErr)` branch changes nothing a
+  // test can see. The database's own words are the only thing that separates the two.
+  t.ok(/new row violates/.test(res.error), `surfaces what the database actually said, got: ${res.error}`);
+});
+
+await t.test("period flip refused with 42501 — reported as permission, and says the lines already moved", async () => {
+  // The live branch for pr_periods: Piece B v2 refuses via WITH CHECK, which RAISES rather than
+  // hiding the row, so `error` fires and !hit.length never does (tests/rls-live.mjs case 5).
+  const { sb, res } = await publish(draft, PUB_ITEMS, { id: 3 }, "payroll", { errorWrites: "pr_periods" });
+  t.eq(res.ok, false, "refused");
+  t.ok(/don't have permission/.test(res.error), `names the cause, got: ${res.error}`);
+  // The honest half: the lines DID move, and the officer is told so rather than left to assume
+  // the publish simply didn't happen.
+  t.ok(/already set to Awaiting Review/.test(res.error), `admits the lines moved, got: ${res.error}`);
+  t.eq(pubWrites(sb).filter((c) => c.table === "pr_items").length, 1, "the lines were written before the refusal");
+});
+
+await t.test("period flip refused SILENTLY (0 rows) — still a failure, never a false success", async () => {
+  const { res } = await publish(draft, PUB_ITEMS, { id: 3 }, "payroll", { blockWrites: "pr_periods" });
+  t.eq(res.ok, false, "refused — not reported as published");
+  t.ok(/already set to Awaiting Review/.test(res.error), `admits the lines moved, got: ${res.error}`);
+});
+
+const FALLTHROUGH = ["pr_lock", "pr_delete_period", "pr_apply_plans", "pr_set_dayoff",
   "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan", "pr_item_approve",
   "pr_item_contest", "pr_item_reply", "pr_request_print", "pr_mark_printed", "pr_save_period"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 15, "15 actions still deferred");
+  t.eq(FALLTHROUGH.length, 14, "14 actions still deferred — pr_publish is wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;

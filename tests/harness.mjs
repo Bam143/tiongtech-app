@@ -37,7 +37,7 @@ export function loadApp(appJsPath) {
   // setME/getME exist because ME is a script-lexical `let` (app.jsx:239) — invisible from
   // outside the VM. These arrows close over that binding, so a test can sign in as somebody
   // else. Restore what getME returned; ME is global state and leaks across tests otherwise.
-  src += "\n;globalThis.__TT = { API, _supaSaveItems, _supaUnlock, _prSaveRow, _prSaveCalc, _stamp, prCalc,"
+  src += "\n;globalThis.__TT = { API, _supaSaveItems, _supaUnlock, _supaPublish, _prSaveRow, _prSaveCalc, _stamp, prCalc,"
       +  " setME: (v) => { ME = v; }, getME: () => ME };\n";
 
   const windowObj = { SB: null, __LIVE__: true, addEventListener() {}, location: { href: "" }, matchMedia: () => ({ matches: false, addEventListener() {} }) };
@@ -77,26 +77,37 @@ export function loadApp(appJsPath) {
 // {data,error}. Every awaited call is recorded so a test can assert what was written.
 // Tables are keyed by name — the save reads pr_items, pr_employees and pr_schedules, so a
 // single-table fake would hand pr_items rows back to a pr_employees select and quietly pass.
-// opts.blockWrites simulates an RLS USING policy: the row is invisible to the write, so
-// PostgREST answers 200 with an EMPTY ARRAY and no error. That is the real behaviour the live
-// RLS test observed against the actual database, and it is the whole reason the adapter has to
-// ask for the affected rows back — `error` stays null on a write that never happened.
-//   true            block every write
-//   "pr_items"      block writes to that table
-//   (table, n) => … block by table and 1-based write number (n=2 blocks the second write)
+// RLS refuses a write in TWO shapes, and they are not interchangeable — the live RLS test sees
+// both against the real database in a single run, so the fake has to be able to do both too.
+//
+// opts.blockWrites simulates a USING policy: the row is invisible to the write, so PostgREST
+// answers 200 with an EMPTY ARRAY and NO error. This is the whole reason the adapter asks for the
+// affected rows back — `error` stays null on a write that never happened.
+//
+// opts.errorWrites simulates a WITH CHECK violation: the row is visible, Postgres evaluates the
+// NEW row, rejects it, and RAISES. PostgREST surfaces 42501 with error set and data null. This is
+// how pr_periods actually refuses (proved by tests/rls-live.mjs case 5), which means for that
+// table `if (error)` is the branch that fires in production and `!hit.length` never runs. A fake
+// that could only do silent refusals would leave the live branch untested.
+//
+// Both take the same shapes:
+//   true            every write
+//   "pr_items"      writes to that table
+//   (table, n) => … by table and 1-based write number (n=2 is the second write)
 export function makeFakeSB(tables = {}, opts = {}) {
   const db = Array.isArray(tables) ? { pr_items: tables } : tables;
   const calls = [];
   const WRITES = ["update", "insert", "upsert", "delete"];
   let writeNo = 0, nextId = 9000;
-  const blocked = (table, n) => {
-    const b = opts.blockWrites;
-    if (!b) return false;
-    if (b === true) return true;
-    if (typeof b === "string") return b === table;
-    if (typeof b === "function") return !!b(table, n);
+  const matches = (rule, table, n) => {
+    if (!rule) return false;
+    if (rule === true) return true;
+    if (typeof rule === "string") return rule === table;
+    if (typeof rule === "function") return !!rule(table, n);
     return false;
   };
+  const blocked = (table, n) => matches(opts.blockWrites, table, n);
+  const errored = (table, n) => matches(opts.errorWrites, table, n);
   return {
     calls,
     from(table) {
@@ -121,6 +132,14 @@ export function makeFakeSB(tables = {}, opts = {}) {
             data = q.one ? (h[0] || null) : h;
           } else if (WRITES.includes(q.op)) {
             const n = ++writeNo;
+            // A raise beats a return: 42501 arrives with data null whether or not the caller asked
+            // for the rows back, so this cannot live inside the q.returning branch.
+            if (errored(q.table, n)) {
+              return Promise.resolve({
+                data: null,
+                error: { code: "42501", message: `new row violates row-level security policy for table "${q.table}"` },
+              }).then(res, rej);
+            }
             if (q.returning) {
               data = blocked(q.table, n) ? []                                   // <- the silent refusal
                 : q.op === "insert" ? [{ id: nextId++, ...q.row }]

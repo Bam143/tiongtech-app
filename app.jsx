@@ -940,6 +940,95 @@ async function _supaUnlock(payload) {
   if (!hit || !hit.length) return { ok: false, error: "Unlock was blocked — the week is still locked. Your account may not have permission to unlock it." };
   return { ok: true };
 }
+/* ---- Publish a draft week (pr_publish) ----
+   publish (app.jsx:4797) saves the grid first, then sends { id }. Two writes, because the screen
+   needs both: every pr_items row for the week to status 'pending', and the period to 'published'.
+
+   WHY THE ITEMS WRITE IS NOT OPTIONAL. The employee's payslip list does not filter on the
+   period's status — _supaPayroll narrows an employee's rows by employee_id and nothing else
+   (app.jsx:723) — so a draft week's card is already on their screen. What publishing changes is
+   whether the line is ACTIONABLE: Approve/Contest render only for 'pending' (app.jsx:5110), the
+   review banner counts 'pending' (app.jsx:5079) and so does the sidebar badge (app.jsx:738), and
+   PrStatusChip knows three statuses and draws anything else as "—" (app.jsx:4164). Flip only the
+   period and the employee is handed a payslip with no way to approve it.
+
+   ITEMS FIRST, PERIOD LAST. Nothing here spans a transaction — the same gap _supaSaveItems lives
+   with — so the order is the only safety on offer. If the lines are refused the period never
+   flips, and the officer still has "Publish & notify" to try again. The reverse order publishes a
+   week nobody can act on.
+
+   The residue ordering cannot remove: because the employee UI keys off the ITEM status, a failure
+   at the period flip leaves the lines already reviewable while the officer still sees a draft.
+   That is the better half of a bad trade — the work done and the flag missing, rather than the
+   flag set over work that never happened — but it is not nothing, and the message below says so
+   instead of implying the publish simply didn't happen.
+
+   REPUBLISHING RESETS APPROVALS. That is the confirmed behaviour, and it is why _supaUnlock
+   returns a week to 'published' and never 'draft' (app.jsx:907): a second publish sets every line
+   back to 'pending' and wipes what employees already approved. The draft-only precondition below
+   is what keeps that reachable only on purpose.
+
+   THE ROLE CHECK IS NOT A SECURITY BOUNDARY — same as _supaUnlock (app.jsx:912), and RLS is the
+   one that counts: Piece B v2 admits is_owner() OR is_payroll() for draft->published. It is here
+   because the two writes are not atomic. Without it an ineligible account sets every line to
+   'pending' and only THEN gets refused on the period, notifying every employee about a week that
+   never published. The database cannot prevent that; refusing before the first write can.
+
+   It reads ME.role directly rather than can("payroll"), and the difference is real: can() also
+   returns true for anyone GRANTED payroll access in Settings (app.jsx:265 via _hasPerms), while
+   the database's is_payroll() reads erp_users.role. A granted admin passes can() and is still
+   refused 42501 by Postgres — the client check has to ask the same question the policy asks. */
+async function _supaPublish(payload) {
+  const sb = window.SB;
+  if (!ME || (ME.role !== "owner" && ME.role !== "payroll")) {
+    return { ok: false, error: "Only the superadmin or the payroll officer can publish a week." };
+  }
+  const periodId = Number((payload && payload.id) || 0);
+  if (!periodId) return { ok: false, error: "Missing id" };
+  const { data: per, error: readErr } = await sb.from("pr_periods").select("status").eq("id", periodId).maybeSingle();
+  if (readErr) return { ok: false, error: readErr.message };
+  if (!per) return { ok: false, error: "This payroll period no longer exists. Reload the page and try again." };
+  // Draft only, and not as a formality: on a published week this would reset every line to
+  // 'pending', and on a locked one it would do that to the approvals the lock exists to protect.
+  if (per.status !== "draft") {
+    return { ok: false, error: per.status === "published"
+      ? "This week is already published. Publishing it again would reset every payslip to Awaiting Review and wipe the approvals employees have already given."
+      : "Only a draft week can be published. This one is " + per.status + "." };
+  }
+  // How many lines SHOULD move. Without this, the zero-rows check below cannot tell "the database
+  // refused every row" from "this week has no lines at all" — the update is filtered by period_id
+  // rather than by a resolved id, so zero is ambiguous here in a way _supaSaveItems' per-row
+  // write never is.
+  const { data: before, error: cntErr } = await sb.from("pr_items").select("id").eq("period_id", periodId);
+  if (cntErr) return { ok: false, error: cntErr.message };
+  const expected = (before || []).length;
+  if (!expected) return { ok: false, error: "This week has no pay lines to publish. Add employees to the week and save it first." };
+  // .select() for the reason it is everywhere else in this file: an RLS USING policy hides rows
+  // rather than raising, so a refused update is 200 with an empty array and `error` stays null.
+  const { data: hitItems, error: itemsErr } = await sb.from("pr_items")
+    .update({ status: "pending" }).eq("period_id", periodId).select("id");
+  if (itemsErr) return { ok: false, error: "Publish stopped — the database refused to update this week's pay lines: " + itemsErr.message + " The week was NOT published." };
+  const moved = (hitItems || []).length;
+  if (!moved) return { ok: false, error: "Publish stopped — the database refused to update this week's pay lines. Your account may not have permission. The week was NOT published and nothing changed." };
+  // A partial is possible in principle: RLS filters an UPDATE row by row, so some lines can move
+  // while others stay hidden. Reporting "published" over that would be wrong in both directions.
+  if (moved < expected) {
+    return { ok: false, error: "Publish stopped — " + moved + " of " + expected + " pay lines were set to Awaiting Review before the database refused the rest. The week was NOT published; fix the permission and publish again." };
+  }
+  // Only now the period. Piece B v2 refuses this with a WITH CHECK, which RAISES 42501 rather
+  // than hiding the row, so `error` is the branch that actually fires here — the live RLS test
+  // confirmed it. The zero-rows branch is what a USING policy would do, and both stay because
+  // this table is one policy edit away from either.
+  const { data: hit, error } = await sb.from("pr_periods").update({ status: "published" }).eq("id", periodId).select("id");
+  const stranded = " This week's pay lines are already set to Awaiting Review, so employees can see them, but the week still shows as a draft — ask the payroll officer or the superadmin to publish it.";
+  if (error) {
+    return { ok: false, error: (error.code === "42501"
+      ? "You don't have permission to publish this week."
+      : "Publishing the week failed: " + error.message) + stranded };
+  }
+  if (!hit || !hit.length) return { ok: false, error: "Publishing the week was refused — your account may not have permission." + stranded };
+  return { ok: true };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -958,6 +1047,7 @@ const API = (action, payload) => {
         // The wired payroll writes. Every other pr_* action still falls through below.
         if (action === "pr_save_items") { return await _supaSaveItems(payload); }
         if (action === "pr_unlock") { return await _supaUnlock(payload); }
+        if (action === "pr_publish") { return await _supaPublish(payload); }
         if (action === "create_client") {
           const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
           if (error) return { ok: false, error: error.message };
@@ -4713,6 +4803,11 @@ function PayrollPage({ t }) {
   // Who may unlock. Same gate as every other owner-only action (app.jsx:277/3293/6765), and
   // like those it decides what renders, not what is permitted — see _supaUnlock.
   const isOwner = !!ME && ME.role === "owner";
+  // Who may publish. ME.role, deliberately, and NOT can("payroll"): can() is also true for anyone
+  // granted payroll access in Settings (app.jsx:265), while the RLS policy behind Publish reads
+  // erp_users.role. Gating on can() would render the button for a granted admin and hand them a
+  // 42501 — a button that is always there and never works. Same question as the policy asks.
+  const isPayroll = !!ME && ME.role === "payroll";
   const empMap = useMemo(() => { const m = {}; pr.employees.forEach((e) => { m[e.id] = e; }); return m; }, [pr]);
   const schedMap = useMemo(() => { const m = {}; (pr.schedules || []).forEach((s) => { m[s.id] = s; }); return m; }, [pr]);
   const leaveTypes = pr.leaveTypes || [];
@@ -4845,7 +4940,7 @@ function PayrollPage({ t }) {
           {period && period.status !== "locked" && <button onClick={applyPlans} title="Auto-fill installment deductions from plans" className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.violet + "22", color: t.violet, border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><PiggyBank size={15} />Apply plans</button>}
           {period && <button onClick={downloadPayroll} title="Download this period's payroll (Excel)" className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.surface2, color: t.text, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><IconDownload size={15} />Download</button>}
           <span className="flex-1" />
-          {period && period.status === "draft" && <button onClick={publish} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.good, color: "#04222A", border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 14px" }}><Send size={15} />Publish &amp; notify</button>}
+          {period && period.status === "draft" && (isOwner || isPayroll) && <button onClick={publish} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.good, color: "#04222A", border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 14px" }}><Send size={15} />Publish &amp; notify</button>}
           {period && period.status === "published" && <button onClick={lockWeek} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.surface2, color: t.textMuted, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 14px" }}>Lock week</button>}
           {period && locked && isOwner && <button onClick={unlockWeek} title="Superadmin only — reopens this week for editing" className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.warnSoft, color: t.warn, border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 14px" }}>Unlock week</button>}
         </div>

@@ -119,6 +119,10 @@ const MUTATIONS = [
   },
   {
     name: "unlock-to-draft",
+    // Scoped because _supaPublish writes the identical statement to the identical table. Without
+    // `in`, this matches twice and the harness refuses it — correctly. Anchoring on a neighbouring
+    // comment instead would rot the moment either function is edited.
+    in: "_supaUnlock",
     why: "unlock resurrects Publish & notify, and re-publishing wipes every approval the lock protected",
     from: `await sb.from("pr_periods").update({
     status: "published"
@@ -126,6 +130,102 @@ const MUTATIONS = [
     to: `await sb.from("pr_periods").update({
     status: "draft"
   }).eq("id", periodId)`,
+  },
+  // ---- publish (pr_publish) ----
+  // Two writes, no transaction. Every mutation here is about the gap between them.
+  {
+    name: "publish-period-before-items",
+    // THE ordering guard. Items-first is the only safety available without a transaction, so a
+    // silent reordering has to be caught by something. This flips the period BEFORE the lines
+    // move, which is exactly the bug the order exists to prevent.
+    in: "_supaPublish",
+    why: "the period publishes before its lines move, so a refused items write leaves employees a payslip they cannot approve while the officer sees a published week",
+    from: `  const {
+    data: hitItems,
+    error: itemsErr
+  } = await sb.from("pr_items").update({
+    status: "pending"
+  }).eq("period_id", periodId).select("id");`,
+    to: `  await sb.from("pr_periods").update({
+    status: "published"
+  }).eq("id", periodId).select("id");
+  const {
+    data: hitItems,
+    error: itemsErr
+  } = await sb.from("pr_items").update({
+    status: "pending"
+  }).eq("period_id", periodId).select("id");`,
+  },
+  {
+    name: "drop-publish-role-gate",
+    why: "an ineligible account sets every line to 'pending' and only THEN gets refused on the period — notifying every employee about a week that never published",
+    from: `  if (!ME || ME.role !== "owner" && ME.role !== "payroll") {
+    return {
+      ok: false,
+      error: "Only the superadmin or the payroll officer can publish a week."
+    };
+  }
+`,
+    to: "",
+  },
+  {
+    name: "drop-publish-draft-guard",
+    why: "publishing an already-published week resets every approved line to 'pending', silently wiping approvals employees already gave",
+    from: `  if (per.status !== "draft") {`,
+    to: `  if (false) {`,
+  },
+  {
+    name: "drop-publish-empty-guard",
+    why: "a week with no pay lines publishes, and zero-rows can no longer tell a refusal from an empty week",
+    from: `  if (!expected) return {
+    ok: false,
+    error: "This week has no pay lines to publish. Add employees to the week and save it first."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-publish-items-error",
+    // Deleting this looks harmless: itemsErr leaves data null, so `moved` is 0 and the zero-rows
+    // guard below still refuses. What is lost is WHY — the officer stops being told what Postgres
+    // said and gets a generic "may not have permission" for what could be any error at all.
+    in: "_supaPublish",
+    why: "a raised error on the lines is swallowed and reported as a permission problem, whatever it actually was",
+    from: `  if (itemsErr) return {
+    ok: false,
+    error: "Publish stopped — the database refused to update this week's pay lines: " + itemsErr.message + " The week was NOT published."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-publish-items-zerorows",
+    // Shadowed by `moved < expected` (expected is >= 1 by the empty-week guard), so dropping this
+    // still refuses — with a message claiming 0 of N lines landed "before the database refused the
+    // rest". It survived until the test asserted the total-refusal wording, which is the point:
+    // the guard is about telling the truth, not about stopping the write.
+    why: "a total refusal is reported as a partial one, telling the officer some lines landed when none did",
+    from: `  if (!moved) return {
+    ok: false,
+    error: "Publish stopped — the database refused to update this week's pay lines. Your account may not have permission. The week was NOT published and nothing changed."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-publish-period-error",
+    // The live branch for pr_periods: a WITH CHECK violation RAISES 42501 rather than hiding the
+    // row, so this `if (error)` is what fires in production and !hit.length never does.
+    in: "_supaPublish",
+    why: "a 42501 on the period flip is swallowed and the officer is told the week published when it did not",
+    from: `  if (error) {
+    return {
+      ok: false,
+      error: (error.code === "42501" ? "You don't have permission to publish this week." : "Publishing the week failed: " + error.message) + stranded
+    };
+  }
+`,
+    to: "",
   },
   // ---- money ----
   {
