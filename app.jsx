@@ -825,6 +825,16 @@ async function _supaSaveItems(payload) {
   const sb = window.SB;
   const periodId = Number((payload && payload.period_id) || 0);
   if (!periodId) return { ok: false, error: "Missing period_id" };
+  // A locked week is frozen for everyone, and this is where that is true. The grid disables
+  // its inputs as well, but that is only a courtesy to the officer: the buttons are the one
+  // layer a caller can skip, so the freeze has to live on the write path or it isn't a freeze.
+  // First check on purpose — nothing below may run for a locked period.
+  const { data: per, error: perErr } = await sb.from("pr_periods").select("status").eq("id", periodId).maybeSingle();
+  if (perErr) return { ok: false, error: perErr.message };
+  // No row: the week was deleted mid-edit, or the id is wrong. Either way the lock state is
+  // unknown, and unknown must not read as unlocked — that is the whole point of the guard.
+  if (!per) return { ok: false, error: "This payroll period no longer exists. Reload the page and try again." };
+  if (per.status === "locked") return { ok: false, error: "This payroll period is locked and cannot be edited. Ask the superadmin to unlock it first." };
   const items = (payload && payload.items) || [];
   if (!items.length) return { ok: true };
   // This read does double duty: it resolves the ids Save doesn't send, and it supplies the
@@ -4635,6 +4645,9 @@ function PayrollPage({ t }) {
   useEffect(() => { (async () => { await reload(); if (!selId && PR.periods[0]) setSelId(PR.periods[0].id); })(); }, []);
 
   const period = pr.periods.find((p) => p.id === selId) || null;
+  // Same test the status chip already renders (app.jsx:4757). The real freeze is in
+  // _supaSaveItems; this only stops the officer typing into a week that cannot be saved.
+  const locked = !!period && period.status === "locked";
   const empMap = useMemo(() => { const m = {}; pr.employees.forEach((e) => { m[e.id] = e; }); return m; }, [pr]);
   const schedMap = useMemo(() => { const m = {}; (pr.schedules || []).forEach((s) => { m[s.id] = s; }); return m; }, [pr]);
   const leaveTypes = pr.leaveTypes || [];
@@ -4680,7 +4693,10 @@ function PayrollPage({ t }) {
     try { const r = await API("pr_summary", { period_id: selId }); if (r && r.ok) setSummary(r.summary); else setSummary(null); } catch (e) { setSummary(null); }
   })(); }, [selId, pr]);
 
-  const setCell = (eid, k, v) => setGrid((g) => g.map((r) => {
+  // The three grid mutators all refuse when the week is locked. The inputs are disabled too,
+  // but gating here means a control that gets added later and forgets `disabled` still cannot
+  // dirty a frozen week.
+  const setCell = (eid, k, v) => !locked && setGrid((g) => g.map((r) => {
     if (r.employee_id !== eid) return r;
     const total = r._working_days != null ? prNum(r._working_days) : 6; // scheduled working days (6)
     const restday = prSundayRest(r);                                    // schedule A = has Sunday duty
@@ -4697,10 +4713,11 @@ function PayrollPage({ t }) {
     return { ...r, [k]: v };
   }));
   const setDayOff = (eid, val) => {
+    if (locked) return;
     setGrid((g) => g.map((r) => (r.employee_id === eid ? { ...r, day_off: val } : r)));
     API("pr_set_dayoff", { employee_id: eid, day_off: val }).catch(() => {});
   };
-  const removeRow = (eid) => setGrid((g) => g.filter((r) => r.employee_id !== eid));
+  const removeRow = (eid) => !locked && setGrid((g) => g.filter((r) => r.employee_id !== eid));
   const totals = grid.reduce((a, r) => { const c = prCalc(r); a.gross += c.gross; a.net += c.net; a.ded += c.ded; a.ot += c.ot; a.sunday += c.sunday; a.incent += c.incent; a.missing += (prMissingAtt(r) ? 1 : 0); return a; }, { gross: 0, net: 0, ded: 0, ot: 0, sunday: 0, incent: 0, missing: 0 });
 
   const saveGrid = async () => {
@@ -4830,8 +4847,13 @@ function PayrollPage({ t }) {
         <Card t={t} style={{ padding: 18 }}>
           <div className="flex items-center justify-between flex-wrap gap-2">
             <SectionTitle t={t} right={<Eyebrow t={t} icon={Banknote}>{grid.length} employees · {peso(totals.net)} net{totals.missing > 0 ? " · " + totals.missing + " missing att." : ""}</Eyebrow>}>{period.label}</SectionTitle>
-            <button onClick={() => { if (window.confirm("Save this week's payroll entries?")) saveGrid(); }} disabled={busy} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.good, color: "#04222A", border: "none", cursor: busy ? "default" : "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 16px", opacity: busy ? 0.6 : 1 }}><CheckCircle2 size={15} />{busy ? "Saving…" : "Save"}</button>
+            <button onClick={() => { if (window.confirm("Save this week's payroll entries?")) saveGrid(); }} disabled={busy || locked} title={locked ? "This week is locked — unlock required to edit." : undefined} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: locked ? t.surface2 : t.good, color: locked ? t.textFaint : "#04222A", border: locked ? `1px solid ${t.border}` : "none", cursor: (busy || locked) ? "default" : "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 16px", opacity: busy ? 0.6 : 1 }}><CheckCircle2 size={15} />{busy ? "Saving…" : "Save"}</button>
           </div>
+          {locked && (
+            <div className="rounded-xl" style={{ marginTop: 10, background: t.surface2, border: `1px solid ${t.border}`, color: t.textMuted, fontSize: 12.5, fontWeight: 600, padding: "8px 12px" }}>
+              Locked — unlock required to edit.
+            </div>
+          )}
           {(() => { const fg = grid.filter((r) => r.full_name.toLowerCase().includes(gq.trim().toLowerCase())); const gpg = prPaginate(fg, gsize, gpage); return (
           <div style={{ marginTop: 12 }}>
           <EntriesBar t={t} size={gsize} setSize={setGsize} total={gpg.total} from={gpg.from} to={gpg.to} page={gpg.page} setPage={setGpage} pages={gpg.pages} right={
@@ -4864,23 +4886,23 @@ function PayrollPage({ t }) {
                         </div>
                         <div style={{ color: awop > 0 ? t.warn || t.bad : t.textFaint, fontSize: 9.5, fontWeight: awop > 0 ? 700 : 400 }}>attendance {prNum(r.att_present)}/{wdTotal}{awop > 0 ? " · AWOP " + awop : ""}</div>
                       </td>
-                      <td style={{ padding: "4px 5px" }}><input type="number" step="0.5" min="0" max="7" value={r.att_present} onChange={(e) => setCell(r.employee_id, "att_present", e.target.value)} style={{ ...cellInp, width: 54 }} title="Days worked (default 6; a 7th day = 1 Sunday duty)" /></td>
+                      <td style={{ padding: "4px 5px" }}><input type="number" step="0.5" min="0" max="7" value={r.att_present} disabled={locked} onChange={(e) => setCell(r.employee_id, "att_present", e.target.value)} style={{ ...cellInp, width: 54 }} title="Days worked (default 6; a 7th day = 1 Sunday duty)" /></td>
                       <td style={{ padding: "5px 6px", textAlign: "right", color: awop > 0 ? (t.warn || t.bad) : t.textFaint, fontSize: 12, fontWeight: awop > 0 ? 700 : 400 }}>{awop}</td>
                       <td style={{ padding: "5px 6px", textAlign: "right", color: t.textMuted, fontSize: 12 }}>{Math.round(prNum(r.per_day)).toLocaleString("en-PH")}</td>
                       <td style={{ padding: "4px 5px" }}>
-                        <input type="number" value={r.ot_hours} onChange={(e) => setCell(r.employee_id, "ot_hours", e.target.value)} style={{ ...cellInp, width: 46 }} />
+                        <input type="number" value={r.ot_hours} disabled={locked} onChange={(e) => setCell(r.employee_id, "ot_hours", e.target.value)} style={{ ...cellInp, width: 46 }} />
                         {prNum(r.ot_hours) > 0 ? <div style={{ color: t.textFaint, fontSize: 9.5, textAlign: "right" }}>₱{Math.round(prOtPay(r))}</div> : null}
                       </td>
                       <td style={{ padding: "4px 5px" }}>
-                        <select value={r.day_off || "sun"} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: 92, cursor: "pointer" }} title="Which day is this employee's day off">
+                        <select value={r.day_off || "sun"} disabled={locked} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: 92, cursor: locked ? "default" : "pointer" }} title="Which day is this employee's day off">
                           <option value="sun" style={{ background: t.surface, color: t.text }}>Sun Day Off</option>
                           <option value="sat" style={{ background: t.surface, color: t.text }}>Sat Day Off</option>
                         </select>
                       </td>
-                      <td style={{ padding: "4px 5px" }}><input type="number" value={r.add_incentive} onChange={(e) => setCell(r.employee_id, "add_incentive", e.target.value)} style={{ ...cellInp, width: 60 }} /></td>
+                      <td style={{ padding: "4px 5px" }}><input type="number" value={r.add_incentive} disabled={locked} onChange={(e) => setCell(r.employee_id, "add_incentive", e.target.value)} style={{ ...cellInp, width: 60 }} /></td>
                       <td style={{ padding: "4px 5px" }}>
-                        <input type="number" value={r.ded_manual} onChange={(e) => setCell(r.employee_id, "ded_manual", e.target.value)} style={{ ...cellInp, width: 60 }} />
-                        {prNum(r.ded_manual) > 0 ? <input value={r.ded_manual_note} onChange={(e) => setCell(r.employee_id, "ded_manual_note", e.target.value)} placeholder="note" style={{ ...cellInp, width: 60, textAlign: "left", fontSize: 10, marginTop: 2 }} /> : null}
+                        <input type="number" value={r.ded_manual} disabled={locked} onChange={(e) => setCell(r.employee_id, "ded_manual", e.target.value)} style={{ ...cellInp, width: 60 }} />
+                        {prNum(r.ded_manual) > 0 ? <input value={r.ded_manual_note} disabled={locked} onChange={(e) => setCell(r.employee_id, "ded_manual_note", e.target.value)} placeholder="note" style={{ ...cellInp, width: 60, textAlign: "left", fontSize: 10, marginTop: 2 }} /> : null}
                       </td>
                       <td style={{ padding: "5px 6px", textAlign: "right", color: t.textMuted, fontSize: 12, fontWeight: 600 }}>{Math.round(c.gross).toLocaleString("en-PH")}</td>
                       <td style={{ padding: "5px 6px", textAlign: "right" }}>
@@ -4891,7 +4913,7 @@ function PayrollPage({ t }) {
                       <td style={{ padding: "5px 6px", whiteSpace: "nowrap" }}>
                         {r._id && <button onClick={() => downloadPayslipXLS(r.full_name, r.position, period, r)} title="Download payslip" style={{ background: "transparent", border: "none", color: t.textMuted, cursor: "pointer", padding: 2, marginRight: 4 }}><IconDownload size={15} /></button>}
                         {r._id && <button onClick={() => printPayslip(r.full_name, r.position, period, r)} title="Print payslip" style={{ background: "transparent", border: "none", color: t.textMuted, cursor: "pointer", padding: 2, marginRight: 4 }}><IconPrint size={15} /></button>}
-                        <button onClick={() => { if (window.confirm(`Remove ${r.full_name} from this week?`)) removeRow(r.employee_id); }} title="Remove from this week" style={{ background: "transparent", border: "none", color: t.bad, cursor: "pointer", padding: 2 }}><IconX size={15} /></button>
+                        <button onClick={() => { if (window.confirm(`Remove ${r.full_name} from this week?`)) removeRow(r.employee_id); }} disabled={locked} title={locked ? "This week is locked" : "Remove from this week"} style={{ background: "transparent", border: "none", color: locked ? t.textFaint : t.bad, cursor: locked ? "default" : "pointer", padding: 2, opacity: locked ? 0.5 : 1 }}><IconX size={15} /></button>
                       </td>
                     </tr>
                   );
@@ -4928,16 +4950,16 @@ function PayrollPage({ t }) {
                     <div style={{ background: t.surface, borderRadius: 10, padding: "8px 4px" }}><div style={{ color: t.textFaint, fontSize: 10 }}>NET</div><div style={{ color: t.good, fontWeight: 800, fontSize: 15 }}>{Math.round(c.net).toLocaleString("en-PH")}</div></div>
                   </div>
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 }}>
-                    <label style={{ fontSize: 11, color: t.textFaint }}>Working days<input type="number" step="0.5" min="0" max="7" value={r.att_present} onChange={(e) => setCell(r.employee_id, "att_present", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
-                    <label style={{ fontSize: 11, color: t.textFaint }}>OT hrs<input type="number" value={r.ot_hours} onChange={(e) => setCell(r.employee_id, "ot_hours", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
-                    <label style={{ fontSize: 11, color: t.textFaint }}>Day off<select value={r.day_off || "sun"} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3, cursor: "pointer" }}><option value="sun" style={{ background: t.surface, color: t.text }}>Sun Day Off</option><option value="sat" style={{ background: t.surface, color: t.text }}>Sat Day Off</option></select></label>
-                    <label style={{ fontSize: 11, color: t.textFaint }}>Incentive<input type="number" value={r.add_incentive} onChange={(e) => setCell(r.employee_id, "add_incentive", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
-                    <label style={{ fontSize: 11, color: t.textFaint, gridColumn: "1 / -1" }}>Manual deduction<input type="number" value={r.ded_manual} onChange={(e) => setCell(r.employee_id, "ded_manual", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} />{prNum(r.ded_manual) > 0 ? <input value={r.ded_manual_note} onChange={(e) => setCell(r.employee_id, "ded_manual_note", e.target.value)} placeholder="note" style={{ ...cellInp, width: "100%", textAlign: "left", fontSize: 11, marginTop: 4 }} /> : null}</label>
+                    <label style={{ fontSize: 11, color: t.textFaint }}>Working days<input type="number" step="0.5" min="0" max="7" value={r.att_present} disabled={locked} onChange={(e) => setCell(r.employee_id, "att_present", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
+                    <label style={{ fontSize: 11, color: t.textFaint }}>OT hrs<input type="number" value={r.ot_hours} disabled={locked} onChange={(e) => setCell(r.employee_id, "ot_hours", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
+                    <label style={{ fontSize: 11, color: t.textFaint }}>Day off<select value={r.day_off || "sun"} disabled={locked} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3, cursor: locked ? "default" : "pointer" }}><option value="sun" style={{ background: t.surface, color: t.text }}>Sun Day Off</option><option value="sat" style={{ background: t.surface, color: t.text }}>Sat Day Off</option></select></label>
+                    <label style={{ fontSize: 11, color: t.textFaint }}>Incentive<input type="number" value={r.add_incentive} disabled={locked} onChange={(e) => setCell(r.employee_id, "add_incentive", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
+                    <label style={{ fontSize: 11, color: t.textFaint, gridColumn: "1 / -1" }}>Manual deduction<input type="number" value={r.ded_manual} disabled={locked} onChange={(e) => setCell(r.employee_id, "ded_manual", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} />{prNum(r.ded_manual) > 0 ? <input value={r.ded_manual_note} disabled={locked} onChange={(e) => setCell(r.employee_id, "ded_manual_note", e.target.value)} placeholder="note" style={{ ...cellInp, width: "100%", textAlign: "left", fontSize: 11, marginTop: 4 }} /> : null}</label>
                   </div>
                   <div style={{ display: "flex", justifyContent: "flex-end", gap: 4, marginTop: 12, paddingTop: 10, borderTop: `1px solid ${t.borderSoft}` }}>
                     {r._id && <button onClick={() => downloadPayslipXLS(r.full_name, r.position, period, r)} title="Download payslip" style={{ background: "transparent", border: "none", color: t.textMuted, cursor: "pointer", padding: 4 }}><IconDownload size={17} /></button>}
                     {r._id && <button onClick={() => printPayslip(r.full_name, r.position, period, r)} title="Print payslip" style={{ background: "transparent", border: "none", color: t.textMuted, cursor: "pointer", padding: 4 }}><IconPrint size={17} /></button>}
-                    <button onClick={() => { if (window.confirm(`Remove ${r.full_name} from this week?`)) removeRow(r.employee_id); }} title="Remove from this week" style={{ background: "transparent", border: "none", color: t.bad, cursor: "pointer", padding: 4 }}><IconX size={17} /></button>
+                    <button onClick={() => { if (window.confirm(`Remove ${r.full_name} from this week?`)) removeRow(r.employee_id); }} disabled={locked} title={locked ? "This week is locked" : "Remove from this week"} style={{ background: "transparent", border: "none", color: locked ? t.textFaint : t.bad, cursor: locked ? "default" : "pointer", padding: 4, opacity: locked ? 0.5 : 1 }}><IconX size={17} /></button>
                   </div>
                 </div>
               );

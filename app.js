@@ -1751,6 +1751,28 @@ async function _supaSaveItems(payload) {
     ok: false,
     error: "Missing period_id"
   };
+  // A locked week is frozen for everyone, and this is where that is true. The grid disables
+  // its inputs as well, but that is only a courtesy to the officer: the buttons are the one
+  // layer a caller can skip, so the freeze has to live on the write path or it isn't a freeze.
+  // First check on purpose — nothing below may run for a locked period.
+  const {
+    data: per,
+    error: perErr
+  } = await sb.from("pr_periods").select("status").eq("id", periodId).maybeSingle();
+  if (perErr) return {
+    ok: false,
+    error: perErr.message
+  };
+  // No row: the week was deleted mid-edit, or the id is wrong. Either way the lock state is
+  // unknown, and unknown must not read as unlocked — that is the whole point of the guard.
+  if (!per) return {
+    ok: false,
+    error: "This payroll period no longer exists. Reload the page and try again."
+  };
+  if (per.status === "locked") return {
+    ok: false,
+    error: "This payroll period is locked and cannot be edited. Ask the superadmin to unlock it first."
+  };
   const items = payload && payload.items || [];
   if (!items.length) return {
     ok: true
@@ -14344,6 +14366,9 @@ function PayrollPage({
     })();
   }, []);
   const period = pr.periods.find(p => p.id === selId) || null;
+  // Same test the status chip already renders (app.jsx:4757). The real freeze is in
+  // _supaSaveItems; this only stops the officer typing into a week that cannot be saved.
+  const locked = !!period && period.status === "locked";
   const empMap = useMemo(() => {
     const m = {};
     pr.employees.forEach(e => {
@@ -14444,7 +14469,11 @@ function PayrollPage({
       }
     })();
   }, [selId, pr]);
-  const setCell = (eid, k, v) => setGrid(g => g.map(r => {
+
+  // The three grid mutators all refuse when the week is locked. The inputs are disabled too,
+  // but gating here means a control that gets added later and forgets `disabled` still cannot
+  // dirty a frozen week.
+  const setCell = (eid, k, v) => !locked && setGrid(g => g.map(r => {
     if (r.employee_id !== eid) return r;
     const total = r._working_days != null ? prNum(r._working_days) : 6; // scheduled working days (6)
     const restday = prSundayRest(r); // schedule A = has Sunday duty
@@ -14477,6 +14506,7 @@ function PayrollPage({
     };
   }));
   const setDayOff = (eid, val) => {
+    if (locked) return;
     setGrid(g => g.map(r => r.employee_id === eid ? {
       ...r,
       day_off: val
@@ -14486,7 +14516,7 @@ function PayrollPage({
       day_off: val
     }).catch(() => {});
   };
-  const removeRow = eid => setGrid(g => g.filter(r => r.employee_id !== eid));
+  const removeRow = eid => !locked && setGrid(g => g.filter(r => r.employee_id !== eid));
   const totals = grid.reduce((a, r) => {
     const c = prCalc(r);
     a.gross += c.gross;
@@ -15085,13 +15115,14 @@ function PayrollPage({
     onClick: () => {
       if (window.confirm("Save this week's payroll entries?")) saveGrid();
     },
-    disabled: busy,
+    disabled: busy || locked,
+    title: locked ? "This week is locked — unlock required to edit." : undefined,
     className: "inline-flex items-center gap-1.5 rounded-xl",
     style: {
-      background: t.good,
-      color: "#04222A",
-      border: "none",
-      cursor: busy ? "default" : "pointer",
+      background: locked ? t.surface2 : t.good,
+      color: locked ? t.textFaint : "#04222A",
+      border: locked ? `1px solid ${t.border}` : "none",
+      cursor: busy || locked ? "default" : "pointer",
       fontSize: 12.5,
       fontWeight: 700,
       padding: "8px 16px",
@@ -15099,7 +15130,18 @@ function PayrollPage({
     }
   }, /*#__PURE__*/React.createElement(CheckCircle2, {
     size: 15
-  }), busy ? "Saving…" : "Save")), (() => {
+  }), busy ? "Saving…" : "Save")), locked && /*#__PURE__*/React.createElement("div", {
+    className: "rounded-xl",
+    style: {
+      marginTop: 10,
+      background: t.surface2,
+      border: `1px solid ${t.border}`,
+      color: t.textMuted,
+      fontSize: 12.5,
+      fontWeight: 600,
+      padding: "8px 12px"
+    }
+  }, "Locked \u2014 unlock required to edit."), (() => {
     const fg = grid.filter(r => r.full_name.toLowerCase().includes(gq.trim().toLowerCase()));
     const gpg = prPaginate(fg, gsize, gpage);
     return /*#__PURE__*/React.createElement("div", {
@@ -15248,6 +15290,7 @@ function PayrollPage({
         min: "0",
         max: "7",
         value: r.att_present,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "att_present", e.target.value),
         style: {
           ...cellInp,
@@ -15276,6 +15319,7 @@ function PayrollPage({
       }, /*#__PURE__*/React.createElement("input", {
         type: "number",
         value: r.ot_hours,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "ot_hours", e.target.value),
         style: {
           ...cellInp,
@@ -15293,11 +15337,12 @@ function PayrollPage({
         }
       }, /*#__PURE__*/React.createElement("select", {
         value: r.day_off || "sun",
+        disabled: locked,
         onChange: e => setDayOff(r.employee_id, e.target.value),
         style: {
           ...cellInp,
           width: 92,
-          cursor: "pointer"
+          cursor: locked ? "default" : "pointer"
         },
         title: "Which day is this employee's day off"
       }, /*#__PURE__*/React.createElement("option", {
@@ -15319,6 +15364,7 @@ function PayrollPage({
       }, /*#__PURE__*/React.createElement("input", {
         type: "number",
         value: r.add_incentive,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "add_incentive", e.target.value),
         style: {
           ...cellInp,
@@ -15331,6 +15377,7 @@ function PayrollPage({
       }, /*#__PURE__*/React.createElement("input", {
         type: "number",
         value: r.ded_manual,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "ded_manual", e.target.value),
         style: {
           ...cellInp,
@@ -15338,6 +15385,7 @@ function PayrollPage({
         }
       }), prNum(r.ded_manual) > 0 ? /*#__PURE__*/React.createElement("input", {
         value: r.ded_manual_note,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "ded_manual_note", e.target.value),
         placeholder: "note",
         style: {
@@ -15421,13 +15469,15 @@ function PayrollPage({
         onClick: () => {
           if (window.confirm(`Remove ${r.full_name} from this week?`)) removeRow(r.employee_id);
         },
-        title: "Remove from this week",
+        disabled: locked,
+        title: locked ? "This week is locked" : "Remove from this week",
         style: {
           background: "transparent",
           border: "none",
-          color: t.bad,
-          cursor: "pointer",
-          padding: 2
+          color: locked ? t.textFaint : t.bad,
+          cursor: locked ? "default" : "pointer",
+          padding: 2,
+          opacity: locked ? 0.5 : 1
         }
       }, /*#__PURE__*/React.createElement(IconX, {
         size: 15
@@ -15617,6 +15667,7 @@ function PayrollPage({
         min: "0",
         max: "7",
         value: r.att_present,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "att_present", e.target.value),
         style: {
           ...cellInp,
@@ -15631,6 +15682,7 @@ function PayrollPage({
       }, "OT hrs", /*#__PURE__*/React.createElement("input", {
         type: "number",
         value: r.ot_hours,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "ot_hours", e.target.value),
         style: {
           ...cellInp,
@@ -15644,12 +15696,13 @@ function PayrollPage({
         }
       }, "Day off", /*#__PURE__*/React.createElement("select", {
         value: r.day_off || "sun",
+        disabled: locked,
         onChange: e => setDayOff(r.employee_id, e.target.value),
         style: {
           ...cellInp,
           width: "100%",
           marginTop: 3,
-          cursor: "pointer"
+          cursor: locked ? "default" : "pointer"
         }
       }, /*#__PURE__*/React.createElement("option", {
         value: "sun",
@@ -15671,6 +15724,7 @@ function PayrollPage({
       }, "Incentive", /*#__PURE__*/React.createElement("input", {
         type: "number",
         value: r.add_incentive,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "add_incentive", e.target.value),
         style: {
           ...cellInp,
@@ -15686,6 +15740,7 @@ function PayrollPage({
       }, "Manual deduction", /*#__PURE__*/React.createElement("input", {
         type: "number",
         value: r.ded_manual,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "ded_manual", e.target.value),
         style: {
           ...cellInp,
@@ -15694,6 +15749,7 @@ function PayrollPage({
         }
       }), prNum(r.ded_manual) > 0 ? /*#__PURE__*/React.createElement("input", {
         value: r.ded_manual_note,
+        disabled: locked,
         onChange: e => setCell(r.employee_id, "ded_manual_note", e.target.value),
         placeholder: "note",
         style: {
@@ -15740,13 +15796,15 @@ function PayrollPage({
         onClick: () => {
           if (window.confirm(`Remove ${r.full_name} from this week?`)) removeRow(r.employee_id);
         },
-        title: "Remove from this week",
+        disabled: locked,
+        title: locked ? "This week is locked" : "Remove from this week",
         style: {
           background: "transparent",
           border: "none",
-          color: t.bad,
-          cursor: "pointer",
-          padding: 4
+          color: locked ? t.textFaint : t.bad,
+          cursor: locked ? "default" : "pointer",
+          padding: 4,
+          opacity: locked ? 0.5 : 1
         }
       }, /*#__PURE__*/React.createElement(IconX, {
         size: 17

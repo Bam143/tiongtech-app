@@ -23,9 +23,13 @@ const gridItem = (over = {}) => ({
 // payload the screen actually sends, not a trimmed one.
 const savePayload = (periodId, items) => ({ period_id: periodId, items, keep_ids: items.map((i) => i.employee_id) });
 
-// `rows` is pr_items unless a test needs the roster too, in which case it passes a table map.
+// `rows` is pr_items unless a test needs other tables too, in which case it passes a table map.
+// Every save now checks the period's lock state before anything else, so the fake gets an
+// unlocked week by default — the lock tests below override pr_periods to say otherwise.
 const run = async (rows, payload) => {
-  const sb = makeFakeSB(rows);
+  const tables = Array.isArray(rows) ? { pr_items: rows } : { ...rows };
+  if (!tables.pr_periods) tables.pr_periods = [{ id: 3, status: "draft" }];
+  const sb = makeFakeSB(tables);
   window.SB = sb;
   const res = await API("pr_save_items", payload);
   return { sb, res };
@@ -40,8 +44,9 @@ await t.test("existing row UPDATEs pr_items by the id found for (period_id, empl
     savePayload(3, [gridItem()]),
   );
   t.eq(res.ok, true, "save ok");
-  const read = sb.calls.find((c) => c.op === "select");
-  t.eq(read.table, "pr_items", "reads pr_items to resolve ids");
+  // Not calls[0] — the lock check reads pr_periods first.
+  const read = sb.calls.find((c) => c.op === "select" && c.table === "pr_items");
+  t.ok(read, "reads pr_items to resolve ids");
   t.eq(read.filters.period_id, 3, "scoped to the period being saved");
   const w = writes(sb);
   t.eq(w.length, 1, "one write");
@@ -277,6 +282,74 @@ await t.test("a missing period_id is refused before any write", async () => {
   const { sb, res } = await run([], { items: [gridItem()], keep_ids: [5] });
   t.eq(res.ok, false, "refused");
   t.eq(sb.calls.length, 0, "nothing touched the database");
+});
+
+// ---- lock freeze ----
+// A locked week is frozen for everyone. The grid disables its inputs, but this is the layer
+// that actually enforces it, because a caller can always skip the buttons.
+
+await t.test("saving a LOCKED period is refused and writes NOTHING", async () => {
+  const { sb, res } = await run(
+    { pr_items: [{ id: 77, employee_id: 5, period_id: 3 }], pr_periods: [{ id: 3, status: "locked" }] },
+    savePayload(3, [gridItem()]),
+  );
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "This payroll period is locked and cannot be edited. Ask the superadmin to unlock it first.", "message");
+  t.eq(writes(sb).length, 0, "ZERO inserts or updates");
+  t.ok(!sb.calls.some((c) => c.table === "pr_items" && c.op !== "select"), "pr_items was never written");
+});
+
+await t.test("the lock check runs BEFORE anything reads or writes pr_items", async () => {
+  // Order matters: a locked week must cost one lookup and stop, not read the roster first.
+  const { sb } = await run(
+    { pr_items: [{ id: 77, employee_id: 5, period_id: 3 }], pr_periods: [{ id: 3, status: "locked" }] },
+    savePayload(3, [gridItem()]),
+  );
+  t.eq(sb.calls.length, 1, "exactly one call");
+  t.eq(sb.calls[0].table, "pr_periods", "and it is the lock lookup");
+  t.eq(sb.calls[0].filters.id, 3, "for the period being saved");
+});
+
+await t.test("a locked period refuses every row, not just the first", async () => {
+  const { sb, res } = await run(
+    { pr_items: [], pr_periods: [{ id: 3, status: "locked" }] },
+    savePayload(3, [gridItem({ employee_id: 5 }), gridItem({ employee_id: 9 }), gridItem({ employee_id: 12 })]),
+  );
+  t.eq(res.ok, false, "refused");
+  t.eq(writes(sb).length, 0, "no row slipped through");
+});
+
+await t.test("an unknown period is refused too — unknown must not read as unlocked", async () => {
+  const { sb, res } = await run(
+    { pr_items: [], pr_periods: [] },   // the week was deleted mid-edit, or the id is wrong
+    savePayload(3, [gridItem()]),
+  );
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(writes(sb).length, 0, "nothing written");
+});
+
+await t.test("a draft period still saves exactly as before (regression)", async () => {
+  const { sb, res } = await run(
+    { pr_items: [{ id: 77, employee_id: 5, period_id: 3 }], pr_periods: [{ id: 3, status: "draft" }] },
+    savePayload(3, [gridItem()]),
+  );
+  t.eq(res.ok, true, "saved");
+  t.eq(writes(sb).length, 1, "one write");
+  t.eq(writes(sb)[0].op, "update", "still an update");
+  t.eq(writes(sb)[0].filters.id, 77, "still by the resolved id");
+  t.eq(writes(sb)[0].row.gross, 3966, "still stores gross");
+});
+
+await t.test("a published (not locked) period still saves — only 'locked' freezes", async () => {
+  // Publishing does not freeze a week; only locking does. Guarding on "not draft" would
+  // silently break every post-publish correction.
+  const { sb, res } = await run(
+    { pr_items: [{ id: 77, employee_id: 5, period_id: 3 }], pr_periods: [{ id: 3, status: "published" }] },
+    savePayload(3, [gridItem()]),
+  );
+  t.eq(res.ok, true, "saved");
+  t.eq(writes(sb).length, 1, "one write");
 });
 
 // ---- the other payroll writes must still fall through ----

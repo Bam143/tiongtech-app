@@ -87,11 +87,15 @@ export function makeFakeSB(tables = {}) {
         insert(row) { q.op = "insert"; q.row = row; return b; },
         delete() { q.op = "delete"; return b; },
         upsert(row) { q.op = "upsert"; q.row = row; return b; },
+        // PostgREST semantics: one row or null, and no error when there is no match.
+        maybeSingle() { q.one = true; return b; },
         then(res, rej) {
           calls.push({ table: q.table, op: q.op, row: q.row, filters: { ...q.filters } });
-          const data = q.op === "select"
-            ? (db[q.table] || []).filter((r) => Object.entries(q.filters).every(([k, v]) => r[k] === v))
-            : null;
+          let data = null;
+          if (q.op === "select") {
+            const hits = (db[q.table] || []).filter((r) => Object.entries(q.filters).every(([k, v]) => r[k] === v));
+            data = q.one ? (hits[0] || null) : hits;
+          }
           return Promise.resolve({ data, error: null }).then(res, rej);
         },
       };
