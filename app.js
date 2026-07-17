@@ -2073,6 +2073,158 @@ async function _supaPublish(payload) {
     ok: true
   };
 }
+/* ---- The review pair (pr_item_approve / pr_item_contest) ----
+   The employee's two buttons on their own payslip (app.jsx:5162/5163), and — new — the officer's
+   single-row Approve on the grid. Approve sends { id }; Contest sends { id, remark }.
+
+   The two actions ask the SAME four questions of the same row in the same order and diverge only
+   on what they write, so the questions live in one place. Two copies of a permission check is how
+   one of them quietly loses a clause.
+
+   Guard order is deliberate: exists -> published -> pending -> permission. Permission last means
+   a stranger probing someone else's line learns its status before being refused — which sounds
+   like a leak and is not one here, because RLS already lets any signed-in user READ every pr_
+   table (app.jsx:671). They can read the row directly. When Piece C lands and that stops being
+   true, this order should be revisited.
+
+   PERMISSION IS AN APP-LEVEL GUARD AND NOTHING MORE — same as _supaUnlock (app.jsx:912) and
+   _supaPublish. RLS currently lets any authenticated user write any pr_items row on a non-locked
+   period, so this refuses the wrong button, not the intent. Anyone who can open a console can do
+   exactly what it stops:
+     window.SB.from('pr_items').update({ status: 'approved' }).eq('id', <someone else's line>)
+   Real own-row enforcement needs an RLS policy on pr_items keyed to the caller's own employee row
+   — Piece C, not this task. Until that lands, "you can only review your own payslip" is a
+   statement about this screen and not about the database, and an approval on a line is not
+   evidence that the employee named on it is who gave it. On payroll that distinction is the whole
+   point of asking for the approval, so it is worth saying plainly rather than trusting the check
+   below to mean more than it does. */
+// Same resolution _supaPayroll uses (app.jsx:706): bootstrap normally carries it, and the
+// fallback re-derives it for a session that signed in before the payroll link existed.
+async function _prMyEmployeeId(sb) {
+  if (ME && ME.pr_employee_id != null) return Number(ME.pr_employee_id);
+  if (!ME || !ME.uid) return null;
+  const {
+    data
+  } = await sb.from("pr_employees").select("id").eq("user_id", ME.uid).eq("active", 1).limit(1);
+  return data && data.length ? Number(data[0].id) : null;
+}
+async function _prReviewGate(sb, itemId) {
+  const id = Number(itemId || 0);
+  if (!id) return {
+    error: "Missing id"
+  };
+  const {
+    data: it,
+    error: readErr
+  } = await sb.from("pr_items").select("id,employee_id,status,period_id").eq("id", id).maybeSingle();
+  if (readErr) return {
+    error: readErr.message
+  };
+  if (!it) return {
+    error: "This payslip line no longer exists. Reload the page and try again."
+  };
+  const {
+    data: per,
+    error: perErr
+  } = await sb.from("pr_periods").select("status").eq("id", it.period_id).maybeSingle();
+  if (perErr) return {
+    error: perErr.message
+  };
+  if (!per) return {
+    error: "This payslip's week no longer exists. Reload the page and try again."
+  };
+  // Published only. Publishing is what puts a line up for review and locking is what ends it; a
+  // draft has not been shown to anyone yet. This has to live here because no screen enforced it:
+  // SalaryPage renders its buttons off the ITEM status alone, so before this guard a LOCKED
+  // week's un-approved line still offered an Approve that worked.
+  if (per.status !== "published") return {
+    error: "This week isn't open for review right now."
+  };
+  // Pending only, which is what makes an employee's decision one-way. An approved or contested
+  // line is decided; only the officer's reply (pr_item_reply, app.jsx:4897) resets it to pending.
+  if (it.status !== "pending") return {
+    error: "This line has already been reviewed."
+  };
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) {
+    const myId = await _prMyEmployeeId(sb);
+    if (myId == null || Number(it.employee_id) !== myId) return {
+      error: "You can only review your own payslip."
+    };
+  }
+  return {
+    item: it
+  };
+}
+async function _supaItemApprove(payload) {
+  const sb = window.SB;
+  const id = Number(payload && payload.id || 0);
+  const gate = await _prReviewGate(sb, id);
+  if (gate.error) return {
+    ok: false,
+    error: gate.error
+  };
+  // approved_at is not decoration: the card renders "Approved on <date>" from it (app.jsx:5214)
+  // and shows a bare "Approved" without it. toISOString and never _stamp() — the column is
+  // timestamptz, and _stamp() is the repo's local-time display string, which Postgres would read
+  // as UTC and land 8 hours off in PH.
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_items").update({
+    status: "approved",
+    approved_at: new Date().toISOString()
+  }).eq("id", id).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not approve this payslip: " + error.message
+  };
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Approving this payslip was refused by the database. Nothing changed."
+  };
+  return {
+    ok: true
+  };
+}
+async function _supaItemContest(payload) {
+  const sb = window.SB;
+  const id = Number(payload && payload.id || 0);
+  // The Contest UI sends `remark` (app.jsx:5163); the column is employee_remark, which the
+  // officer's grid reads back as _emp_remark (app.jsx:4844). The names differ, so the mapping is
+  // written down here rather than assumed by whoever reads the payload next.
+  const remark = String(payload && payload.remark || "").trim();
+  if (!remark) return {
+    ok: false,
+    error: "Please describe the discrepancy."
+  };
+  const gate = await _prReviewGate(sb, id);
+  if (gate.error) return {
+    ok: false,
+    error: gate.error
+  };
+  // approved_at is deliberately left alone: the pending guard means the row is not approved, and
+  // this action owns status and the employee's message and nothing else — the same whitelist
+  // discipline the save keeps (app.jsx:757).
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_items").update({
+    status: "contested",
+    employee_remark: remark
+  }).eq("id", id).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not send this to the payroll office: " + error.message
+  };
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "The database refused to record this discrepancy. Nothing changed."
+  };
+  return {
+    ok: true
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -2127,6 +2279,12 @@ const API = (action, payload) => {
         }
         if (action === "pr_publish") {
           return await _supaPublish(payload);
+        }
+        if (action === "pr_item_approve") {
+          return await _supaItemApprove(payload);
+        }
+        if (action === "pr_item_contest") {
+          return await _supaItemContest(payload);
         }
         if (action === "create_client") {
           const {
@@ -14879,6 +15037,21 @@ function PayrollPage({
       alert(e.message);
     }
   };
+  // The officer approving on an employee's behalf. Worth a confirm the other row actions don't
+  // get: it spends the employee's say-so for them, and _prReviewGate then refuses to let anyone
+  // undo it — an approved line only reopens through Reply / resolve.
+  const approveRow = async itemId => {
+    if (!window.confirm("Approve this line on the employee's behalf? They will not be asked to review it, and this cannot be undone here.")) return;
+    try {
+      await prWrite("pr_item_approve", {
+        id: itemId
+      });
+      await reload();
+      flashMsg("Line approved");
+    } catch (e) {
+      alert(e.message);
+    }
+  };
   const markPrinted = async itemId => {
     try {
       await prWrite("pr_mark_printed", {
@@ -14938,6 +15111,10 @@ function PayrollPage({
     fontSize: 10
   };
   const attention = grid.filter(r => r._status === "contested" || r._print_req && !r._printed);
+  // The officer's per-row Approve renders on exactly the conditions _prReviewGate enforces, so
+  // the control is never offered where the write would be refused. The row's own 'pending' test
+  // is applied per row at the call site.
+  const canOfficerApprove = !!period && period.status === "published" && (isOwner || isPayroll);
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-5"
   }, flash && /*#__PURE__*/React.createElement("div", {
@@ -15709,7 +15886,21 @@ function PayrollPage({
           padding: "5px 6px",
           whiteSpace: "nowrap"
         }
-      }, r._id && /*#__PURE__*/React.createElement("button", {
+      }, r._id && r._status === "pending" && canOfficerApprove && /*#__PURE__*/React.createElement("button", {
+        onClick: () => approveRow(r._id),
+        title: `Approve ${r.full_name}'s line on their behalf`,
+        className: "rounded-lg",
+        style: {
+          background: t.goodSoft,
+          color: t.good,
+          border: "none",
+          cursor: "pointer",
+          fontSize: 11,
+          fontWeight: 700,
+          padding: "3px 8px",
+          marginRight: 6
+        }
+      }, "Approve"), r._id && /*#__PURE__*/React.createElement("button", {
         onClick: () => downloadPayslipXLS(r.full_name, r.position, period, r),
         title: "Download payslip",
         style: {
@@ -15851,16 +16042,34 @@ function PayrollPage({
           fontSize: 11,
           fontWeight: awop > 0 ? 700 : 400
         }
-      }, "attendance ", prNum(r.att_present), "/", wdTotal, awop > 0 ? " · AWOP " + awop : "", " \xB7 \u20B1", Math.round(prNum(r.per_day)).toLocaleString("en-PH"), "/day")), r._status ? /*#__PURE__*/React.createElement(PrStatusChip, {
+      }, "attendance ", prNum(r.att_present), "/", wdTotal, awop > 0 ? " · AWOP " + awop : "", " \xB7 \u20B1", Math.round(prNum(r.per_day)).toLocaleString("en-PH"), "/day")), /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          alignItems: "center",
+          gap: 6,
+          flexShrink: 0
+        }
+      }, r._id && r._status === "pending" && canOfficerApprove && /*#__PURE__*/React.createElement("button", {
+        onClick: () => approveRow(r._id),
+        className: "rounded-lg",
+        style: {
+          background: t.goodSoft,
+          color: t.good,
+          border: "none",
+          cursor: "pointer",
+          fontSize: 11,
+          fontWeight: 700,
+          padding: "3px 8px"
+        }
+      }, "Approve"), r._status ? /*#__PURE__*/React.createElement(PrStatusChip, {
         t: t,
         status: r._status
       }) : /*#__PURE__*/React.createElement("span", {
         style: {
           color: t.textFaint,
-          fontSize: 11,
-          flexShrink: 0
+          fontSize: 11
         }
-      }, "\u2014")), /*#__PURE__*/React.createElement("div", {
+      }, "\u2014"))), /*#__PURE__*/React.createElement("div", {
         style: {
           display: "grid",
           gridTemplateColumns: "1fr 1fr 1fr",
@@ -16450,7 +16659,7 @@ function SalaryPage({
       style: {
         marginTop: 12
       }
-    }, it.status === "pending" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+    }, it.status === "pending" && period.status === "published" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
       onClick: () => approve(it.id),
       className: "inline-flex items-center gap-1.5 rounded-xl",
       style: {
@@ -16481,7 +16690,19 @@ function SalaryPage({
       }
     }, /*#__PURE__*/React.createElement(AlertTriangle, {
       size: 15
-    }), "Report a discrepancy")), it.status === "contested" && /*#__PURE__*/React.createElement("span", {
+    }), "Report a discrepancy")), it.status === "pending" && period.status !== "published" && /*#__PURE__*/React.createElement("span", {
+      style: {
+        color: t.textMuted,
+        fontSize: 12.5
+      }
+    }, /*#__PURE__*/React.createElement(Clock, {
+      size: 14,
+      style: {
+        display: "inline",
+        verticalAlign: "-2px",
+        marginRight: 4
+      }
+    }), "This week isn\u2019t open for review right now."), it.status === "contested" && /*#__PURE__*/React.createElement("span", {
       style: {
         color: t.textMuted,
         fontSize: 12.5

@@ -227,6 +227,83 @@ const MUTATIONS = [
 `,
     to: "",
   },
+  // ---- the review pair (pr_item_approve / pr_item_contest) ----
+  // The four guards live in _prReviewGate, which BOTH actions run, so each mutation here is a
+  // single edit that both handlers' tests get a shot at.
+  {
+    name: "drop-review-published-guard",
+    in: "_prReviewGate",
+    why: "a locked week's un-approved line can still be approved — the freeze the lock exists for does not reach the review buttons",
+    from: `  if (per.status !== "published") return {
+    error: "This week isn't open for review right now."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-review-pending-guard",
+    in: "_prReviewGate",
+    why: "an employee un-approves a decided line by approving it again, or re-contests one the officer already answered",
+    from: `  if (it.status !== "pending") return {
+    error: "This line has already been reviewed."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-review-ownrow-check",
+    // The app-level half of own-row. RLS does not enforce this yet (Piece C), so with this gone
+    // there is nothing at all between a technician and everyone else's payslip.
+    in: "_prReviewGate",
+    why: "any employee approves or contests anybody else's payslip — and RLS does not stop it either",
+    from: `  if (!officer) {
+    const myId = await _prMyEmployeeId(sb);
+    if (myId == null || Number(it.employee_id) !== myId) return {
+      error: "You can only review your own payslip."
+    };
+  }
+`,
+    to: "",
+  },
+  {
+    name: "drop-approve-zerorows",
+    in: "_supaItemApprove",
+    why: "a silently refused approve reports 'Payslip approved' over a write that never happened",
+    from: `  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Approving this payslip was refused by the database. Nothing changed."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-contest-zerorows",
+    in: "_supaItemContest",
+    why: "a silently refused contest reports 'Sent to the payroll office' and the discrepancy is never recorded",
+    from: `  if (!hit || !hit.length) return {
+    ok: false,
+    error: "The database refused to record this discrepancy. Nothing changed."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "approve-local-time-stamp",
+    // Same trap as updated_at on the save: the column is timestamptz and _stamp() is a local-time
+    // display string, so Postgres reads it as UTC and the payslip says it was approved 8 hours
+    // before it was.
+    in: "_supaItemApprove",
+    why: "approved_at is written as local time with no zone; the card then shows the wrong approval date",
+    from: `    approved_at: new Date().toISOString()`,
+    to: `    approved_at: _stamp()`,
+  },
+  {
+    name: "contest-writes-pending",
+    in: "_supaItemContest",
+    why: "a contested line reads as merely pending, so it never reaches the officer's 'Needs your attention' list and the discrepancy is silently dropped",
+    from: `    status: "contested",`,
+    to: `    status: "pending",`,
+  },
   // ---- money ----
   {
     name: "leave-type-null-to-zero",

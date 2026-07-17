@@ -695,12 +695,176 @@ await t.test("period flip refused SILENTLY (0 rows) — still a failure, never a
   t.ok(/already set to Awaiting Review/.test(res.error), `admits the lines moved, got: ${res.error}`);
 });
 
+/* ---------- pr_item_approve / pr_item_contest ---------- */
+// The employee's two buttons, and the officer's new single-row Approve. Both actions run the same
+// gate (_prReviewGate), so most of these bite on either handler; where a test names one, it is
+// because only that one writes the column in question.
+
+const REV_ITEMS = [
+  { id: 71, period_id: 9, employee_id: 5, status: "pending" },    // mine
+  { id: 72, period_id: 9, employee_id: 6, status: "pending" },    // somebody else's
+  { id: 73, period_id: 9, employee_id: 5, status: "approved" },   // mine, already decided
+  { id: 74, period_id: 9, employee_id: 5, status: "contested" },  // mine, already decided
+];
+const PUBLISHED = [{ id: 9, status: "published" }];
+// role + pr_employee_id together are the caller: employee 5 is "me" unless a test says otherwise.
+const review = async (action, payload, { role = "technician", empId = 5, periods = PUBLISHED, items = REV_ITEMS, opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role, pr_employee_id: empId });
+  try {
+    const sb = makeFakeSB({ pr_items: items, pr_periods: periods }, opts);
+    window.SB = sb;
+    const res = await API(action, payload);
+    return { sb, res };
+  } finally { setME(was); }   // ME is global; a leak here would silently re-role later tests
+};
+const revWrites = (sb) => sb.calls.filter((c) => c.op === "update");
+
+await t.test("an employee approves their OWN pending line on a published week", async () => {
+  const { sb, res } = await review("pr_item_approve", { id: 71 });
+  t.eq(res.ok, true, `approved, got: ${res.error}`);
+  const w = revWrites(sb);
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].table, "pr_items", "on pr_items");
+  t.eq(w[0].filters.id, 71, "the right line");
+  t.eq(w[0].row.status, "approved", "status");
+});
+
+await t.test("approve stamps approved_at as a real UTC instant", async () => {
+  // The card renders "Approved on <date>" by slicing this (app.jsx:5214); a local-time string
+  // would be read as UTC by Postgres and land the row 8 hours off in PH.
+  const { sb } = await review("pr_item_approve", { id: 71 });
+  const row = revWrites(sb)[0].row;
+  t.ok(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(row.approved_at), `ISO UTC, got: ${JSON.stringify(row.approved_at)}`);
+  t.eq(Object.keys(row).sort().join(","), "approved_at,status", "approve owns exactly these two columns");
+});
+
+await t.test("an employee contests their OWN pending line, and the message is stored", async () => {
+  const { sb, res } = await review("pr_item_contest", { id: 71, remark: "OT for Sunday 06/28 is missing." });
+  t.eq(res.ok, true, `contested, got: ${res.error}`);
+  const row = revWrites(sb)[0].row;
+  t.eq(row.status, "contested", "status — not 'pending'; the officer's grid keys off 'contested'");
+  // The UI sends `remark`; the column is employee_remark (app.jsx:4844 reads it back).
+  t.eq(row.employee_remark, "OT for Sunday 06/28 is missing.", "the message lands in employee_remark");
+  t.eq(Object.keys(row).sort().join(","), "employee_remark,status", "contest owns exactly these two — approved_at is left alone");
+});
+
+await t.test("contest with an empty message is refused before any lookup", async () => {
+  const { sb, res } = await review("pr_item_contest", { id: 71, remark: "   " });
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("an employee may NOT approve somebody else's line", async () => {
+  const { sb, res } = await review("pr_item_approve", { id: 72 });   // employee 6's row; I am 5
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "You can only review your own payslip.", "message");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("an employee may NOT contest somebody else's line either", async () => {
+  const { sb, res } = await review("pr_item_contest", { id: 72, remark: "not mine" });
+  t.eq(res.ok, false, "refused");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("an employee with no payroll link may not review anything", async () => {
+  const { sb, res } = await review("pr_item_approve", { id: 71 }, { empId: null });
+  t.eq(res.ok, false, "refused — a null employee id must never match a row");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("the owner and the payroll officer may approve ANY line", async () => {
+  for (const role of ["owner", "payroll"]) {
+    // empId null on purpose: the officer path must not depend on having a payroll row at all.
+    const { sb, res } = await review("pr_item_approve", { id: 72 }, { role, empId: null });
+    t.eq(res.ok, true, `${role} approved somebody else's line, got: ${res.error}`);
+    t.eq(revWrites(sb)[0].filters.id, 72, `${role} hit the right line`);
+  }
+});
+
+await t.test("nobody reviews a line on a DRAFT week", async () => {
+  for (const role of ["technician", "owner", "payroll"]) {
+    const { sb, res } = await review("pr_item_approve", { id: 71 }, { role, periods: [{ id: 9, status: "draft" }] });
+    t.eq(res.ok, false, `${role} refused`);
+    t.eq(res.error, "This week isn't open for review right now.", `${role} message`);
+    t.eq(revWrites(sb).length, 0, `${role} wrote nothing`);
+  }
+});
+
+await t.test("nobody reviews a line on a LOCKED week", async () => {
+  // The gap this closes: SalaryPage used to render Approve off the item status alone, so a locked
+  // week's un-approved line offered a button that worked.
+  const { sb, res } = await review("pr_item_approve", { id: 71 }, { periods: [{ id: 9, status: "locked" }] });
+  t.eq(res.ok, false, "refused");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("an employee cannot UN-approve — an approved line is decided", async () => {
+  const { sb, res } = await review("pr_item_approve", { id: 73 });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "This line has already been reviewed.", "message");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("a contested line cannot be re-contested or approved around", async () => {
+  for (const [action, payload] of [["pr_item_approve", { id: 74 }], ["pr_item_contest", { id: 74, remark: "again" }]]) {
+    const { sb, res } = await review(action, payload);
+    t.eq(res.ok, false, `${action} refused on a contested line`);
+    t.eq(revWrites(sb).length, 0, `${action} wrote nothing`);
+  }
+});
+
+await t.test("not even the officer can un-approve through this path", async () => {
+  // Single-row approve only, deliberately. Reversing an approval is the Reply / resolve flow.
+  const { sb, res } = await review("pr_item_approve", { id: 73 }, { role: "payroll", empId: null });
+  t.eq(res.ok, false, "refused");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("reviewing a line that no longer exists is refused", async () => {
+  const { sb, res } = await review("pr_item_approve", { id: 999 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("review with no id is refused before any lookup", async () => {
+  const { sb, res } = await review("pr_item_approve", {});
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("a silently refused approve (USING policy, 200 + []) is not a false success", async () => {
+  const { res } = await review("pr_item_approve", { id: 71 }, { opts: { blockWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused — never 'Payslip approved' over a write that never happened");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("an approve refused with 42501 surfaces what the database said", async () => {
+  const { res } = await review("pr_item_approve", { id: 71 }, { opts: { errorWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/new row violates/.test(res.error), `the database's own words reach the employee, got: ${res.error}`);
+});
+
+await t.test("a silently refused contest is not a false 'Sent to the payroll office'", async () => {
+  const { res } = await review("pr_item_contest", { id: 71, remark: "wrong OT" }, { opts: { blockWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("a contest refused with 42501 surfaces what the database said", async () => {
+  const { res } = await review("pr_item_contest", { id: 71, remark: "wrong OT" }, { opts: { errorWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/new row violates/.test(res.error), `got: ${res.error}`);
+});
+
 const FALLTHROUGH = ["pr_lock", "pr_delete_period", "pr_apply_plans", "pr_set_dayoff",
-  "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan", "pr_item_approve",
-  "pr_item_contest", "pr_item_reply", "pr_request_print", "pr_mark_printed", "pr_save_period"];
+  "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan",
+  "pr_item_reply", "pr_request_print", "pr_mark_printed", "pr_save_period"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 14, "14 actions still deferred — pr_publish is wired now");
+  t.eq(FALLTHROUGH.length, 12, "12 actions still deferred — approve and contest are wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;
