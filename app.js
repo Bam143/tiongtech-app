@@ -1559,6 +1559,100 @@ const _joRow = (p, withId) => {
   });
   return out;
 };
+/* ================= PAYROLL (read-only) =================
+   payroll_data mirrors api.php's response exactly: loadPayrollData() (app.jsx:245) and both
+   payroll screens consume that shape unchanged, so anything else here is a UI change. Reads
+   only — every payroll write still falls through to the "not connected" catch-all below.
+
+   Scope is this function's job, not RLS's. RLS lets any signed-in user read every pr_ table,
+   but SalaryPage takes employees[0] as "me" (app.jsx:4761) and turns EVERY item it is handed
+   into one of my payslips (app.jsx:4764) — give a technician the unscoped tables and their
+   Salary tab lists the whole company's pay. So a non-officer gets their own employee row and
+   their own items, nothing else. The officer test is can("payroll") — the same one the
+   screen's own edit buttons use (app.jsx:277). */
+const _prN = v => v == null ? null : Number(v);
+const _prNums = (row, cols) => {
+  const o = {
+    ...row
+  };
+  cols.forEach(c => {
+    if (o[c] !== undefined) o[c] = _prN(o[c]);
+  });
+  return o;
+};
+const _PR_EMP_COLS = "id,full_name,position,schedule_id,per_day,user_id,active,day_off";
+const _PR_PERIOD_COLS = "id,label,pay_date,status,notes,created_by,created_at,published_at";
+const _PR_ITEM_COLS = "id,period_id,employee_id,days_present,per_day,att_present,att_absent,att_leave,att_halfday,leave_type_id,leave_paid,ot_hours,add_ot,sun_days,add_sunday,add_incentive,add_other,ded_coop,ded_tshirt,ded_ca,ded_fines,ded_excess,ded_loan,ded_uniform,ded_gov,ded_manual,ded_manual_note,ded_notes,gross,net,remarks,snap_schedule_id,snap_working_days,snap_sunday_rest,status,employee_remark,officer_reply,print_requested,printed,approved_at,updated_at";
+const _PR_SCHED_COLS = "id,code,name,work_days,working_days_count,sunday_is_restday,pay_dow";
+const _PR_PLAN_COLS = "id,employee_id,kind,category,label,total_amount,per_week,start_date,terms_total,active,interest_rate,interest_only";
+const _PR_LEAVE_COLS = "id,name,is_paid,active";
+// Which columns must arrive as real numbers. selId is always Number() (app.jsx:4543) and both
+// the period lookup and the item filter compare with === (app.jsx:4427/4436), so an id that
+// came back as a string would pick a week and then render an empty grid. Coerce up front
+// rather than trust PostgREST's JSON types for numeric/int8.
+// _prN preserves null on purpose: snap_working_days / snap_sunday_rest are read raw against
+// `!= null` (app.jsx:4442/4451) to mean "this week is snapshotted — use these, not the
+// employee's live schedule", and Number(null) === 0 would silently rewrite every snapshotted
+// week's working-days total to zero. Everything else is read through prNum(), which maps a
+// null to 0 anyway.
+const _PR_EMP_N = ["id", "schedule_id", "per_day", "user_id", "active"];
+const _PR_ITEM_N = ["id", "period_id", "employee_id", "days_present", "per_day", "att_present", "att_absent", "att_leave", "att_halfday", "leave_type_id", "leave_paid", "ot_hours", "add_ot", "sun_days", "add_sunday", "add_incentive", "add_other", "ded_coop", "ded_tshirt", "ded_ca", "ded_fines", "ded_excess", "ded_loan", "ded_uniform", "ded_gov", "ded_manual", "gross", "net", "snap_schedule_id", "snap_working_days", "snap_sunday_rest"];
+const _PR_SCHED_N = ["id", "working_days_count", "sunday_is_restday", "pay_dow"];
+const _PR_PLAN_N = ["id", "employee_id", "total_amount", "per_week", "terms_total", "active", "interest_rate", "interest_only"];
+const _prByName = (a, b) => String(a.full_name || a.username || "").localeCompare(String(b.full_name || b.username || ""));
+async function _supaPayroll() {
+  const sb = window.SB;
+  const officer = can("payroll");
+  // bootstrap already resolved this the same way (app.jsx:447); re-derive only if it hasn't run.
+  let myId = ME && ME.pr_employee_id != null ? ME.pr_employee_id : null;
+  if (myId == null && ME && ME.uid) {
+    const {
+      data
+    } = await sb.from("pr_employees").select("id").eq("user_id", ME.uid).eq("active", 1).limit(1);
+    if (data && data.length) myId = data[0].id;
+  }
+  myId = _prN(myId);
+  let employees = (await _supaAll(sb, "pr_employees", _PR_EMP_COLS)).map(r => _prNums(r, _PR_EMP_N));
+  let items = (await _supaAll(sb, "pr_items", _PR_ITEM_COLS)).map(r => _prNums(r, _PR_ITEM_N));
+  let plans = (await _supaAll(sb, "pr_plans", _PR_PLAN_COLS)).map(r => _prNums(r, _PR_PLAN_N));
+  const periods = (await _supaAll(sb, "pr_periods", _PR_PERIOD_COLS)).map(r => _prNums(r, ["id"]));
+  const schedules = (await _supaAll(sb, "pr_schedules", _PR_SCHED_COLS)).map(r => _prNums(r, _PR_SCHED_N));
+  const leaveTypes = (await _supaAll(sb, "pr_leave_types", _PR_LEAVE_COLS)).map(r => _prNums(r, ["id", "is_paid", "active"]));
+  // RosterModal is the only reader of `users` (app.jsx:3984) and it is officer-only, so an
+  // employee has no reason to be handed the staff list.
+  const users = officer ? (await _supaAll(sb, "erp_users", "id,username,full_name")).map(r => _prNums(r, ["id"])).sort(_prByName) : [];
+  if (!officer) {
+    employees = myId == null ? [] : employees.filter(e => e.id === myId); // [0] is "me" (app.jsx:4761)
+    items = myId == null ? [] : items.filter(i => i.employee_id === myId); // my payslips only (app.jsx:4764)
+    plans = myId == null ? [] : plans.filter(p => p.employee_id === myId);
+  }
+  // The roster keeps inactive staff: PayrollPage filters to active itself (app.jsx:4435) and
+  // RosterModal is where `active` gets toggled back on, so filtering here would hide them.
+  employees.sort(_prByName);
+  periods.sort((a, b) => b.id - a.id); // newest first: periods[0] is the default week (app.jsx:4409/4425)
+  // The sidebar badge (app.jsx:7657 -> 7676/7710/7736). An officer reviews discrepancies; an
+  // employee reviews payslips waiting on them. The two never collide — the Salary tab is
+  // hidden from owner/payroll (app.jsx:7734). The employee half is exactly what SalaryPage
+  // counts for its own banner (app.jsx:4765). The officer half is a RECONSTRUCTION: api.php
+  // is not in this repo, and "contested" is inferred from the reply flow resetting a line to
+  // pending (app.jsx:4508). Confirm against the PHP before trusting the officer count.
+  const notifTotal = officer ? items.filter(i => i.status === "contested").length : myId == null ? 0 : items.filter(i => i.status === "pending").length;
+  return {
+    ok: true,
+    employees,
+    periods,
+    items,
+    users,
+    plans,
+    schedules,
+    leaveTypes,
+    isOfficer: !!officer,
+    myEmployeeId: myId,
+    notif: {
+      total: notifTotal
+    }
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1601,6 +1695,9 @@ const API = (action, payload) => {
         if (action === "bootstrap") {
           return await _supaBootstrap();
         }
+        if (action === "payroll_data") {
+          return await _supaPayroll();
+        } // read-only; every pr_* write still falls through
         if (action === "create_client") {
           const {
             data,
