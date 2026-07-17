@@ -10,8 +10,8 @@
 import { loadApp, makeFakeSB, makeSuite } from "./harness.mjs";
 
 const APP_JS = process.argv[2] || "app.js";   // relative to the repo root, where npm runs
-const { API, window, prCalc } = loadApp(APP_JS);
-const t = makeSuite("payroll / pr_save_items");
+const { API, window, prCalc, setME, getME } = loadApp(APP_JS);
+const t = makeSuite("payroll / pr_save_items + pr_unlock");
 
 // One grid row exactly as saveGrid builds it (app.jsx:4577-4580).
 const gridItem = (over = {}) => ({
@@ -350,6 +350,95 @@ await t.test("a published (not locked) period still saves — only 'locked' free
   );
   t.eq(res.ok, true, "saved");
   t.eq(writes(sb).length, 1, "one write");
+});
+
+// ---- pr_unlock (superadmin only) ----
+// NB: this gate is an affordance, not a security boundary. It runs in the browser and RLS
+// currently lets any signed-in user write pr_periods, so these tests prove the app behaves —
+// not that anyone is actually prevented. Real enforcement is an RLS policy on pr_periods.
+
+const unlock = async (periods, payload, role) => {
+  const was = getME();
+  if (role !== undefined) setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_periods: periods });
+    window.SB = sb;
+    const res = await API("pr_unlock", payload);
+    return { sb, res };
+  } finally { setME(was); }   // ME is global; a leak here would silently re-role later tests
+};
+
+await t.test("the owner unlocks a locked period back to 'published'", async () => {
+  const { sb, res } = await unlock([{ id: 3, status: "locked" }], { id: 3 }, "owner");
+  t.eq(res.ok, true, "unlocked");
+  const w = sb.calls.filter((c) => c.op === "update");
+  t.eq(w.length, 1, "one update");
+  t.eq(w[0].table, "pr_periods", "on pr_periods");
+  t.eq(w[0].filters.id, 3, "the right period");
+  t.eq(w[0].row.status, "published", "back to published — the state 'locked' came from");
+});
+
+await t.test("unlock does NOT return the week to 'draft'", async () => {
+  // 'draft' would bring back Publish & notify, and re-publishing would reset every approved
+  // line to pending — silently wiping the approvals the lock was protecting.
+  const { sb } = await unlock([{ id: 3, status: "locked" }], { id: 3 }, "owner");
+  t.ok(sb.calls.filter((c) => c.op === "update")[0].row.status !== "draft", "never draft");
+});
+
+await t.test("unlock touches status and nothing else", async () => {
+  // published_at records when the week was published; unlocking is not a re-publish.
+  const { sb } = await unlock([{ id: 3, status: "locked" }], { id: 3 }, "owner");
+  const row = sb.calls.filter((c) => c.op === "update")[0].row;
+  t.eq(Object.keys(row).join(","), "status", "only status is written");
+});
+
+await t.test("a NON-owner is refused and writes nothing", async () => {
+  for (const role of ["payroll", "admin", "technician", "cfo"]) {
+    const { sb, res } = await unlock([{ id: 3, status: "locked" }], { id: 3 }, role);
+    t.eq(res.ok, false, `${role} refused`);
+    t.eq(res.error, "Only the superadmin can unlock a payroll period.", `${role} message`);
+    t.eq(sb.calls.length, 0, `${role} touched nothing — refused before the lookup`);
+  }
+});
+
+await t.test("unlocking a DRAFT period is refused — it must not publish it", async () => {
+  // The dangerous case: writing 'published' blindly would notify employees about a week
+  // nobody has finished.
+  const { sb, res } = await unlock([{ id: 3, status: "draft" }], { id: 3 }, "owner");
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "This payroll period is not locked.", "message");
+  t.eq(sb.calls.filter((c) => c.op === "update").length, 0, "the draft was NOT published");
+});
+
+await t.test("unlocking an already-published period is refused", async () => {
+  const { sb, res } = await unlock([{ id: 3, status: "published" }], { id: 3 }, "owner");
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.filter((c) => c.op === "update").length, 0, "nothing written");
+});
+
+await t.test("unlocking an unknown period is refused", async () => {
+  const { sb, res } = await unlock([], { id: 3 }, "owner");
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op === "update").length, 0, "nothing written");
+});
+
+await t.test("unlock with no id is refused before any lookup", async () => {
+  const { sb, res } = await unlock([{ id: 3, status: "locked" }], {}, "owner");
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("an unlocked week can be saved again — the freeze lifts", async () => {
+  // The round trip that matters: unlock returns 'published', and 'published' saves.
+  const { res: unlockRes } = await unlock([{ id: 3, status: "locked" }], { id: 3 }, "owner");
+  t.eq(unlockRes.ok, true, "unlocked");
+  const { sb, res } = await run(
+    { pr_items: [{ id: 77, employee_id: 5, period_id: 3 }], pr_periods: [{ id: 3, status: "published" }] },
+    savePayload(3, [gridItem()]),
+  );
+  t.eq(res.ok, true, "and now the save goes through");
+  t.eq(writes(sb).length, 1, "one row written");
 });
 
 // ---- the other payroll writes must still fall through ----

@@ -1843,6 +1843,67 @@ async function _supaSaveItems(payload) {
     ok: true
   };
 }
+/* ---- Unlock a locked week (superadmin only) ----
+   The companion to the freeze in _supaSaveItems. 'locked' is only ever reached from
+   'published' — the Lock button renders for no other status (app.jsx:4782) — so unlocking
+   returns the week to 'published', the state it came from. Not 'draft': that would bring back
+   "Publish & notify", and publishing a week that employees have already approved would reset
+   their lines to pending and wipe those approvals. Unlock is meant to reopen a week for a
+   correction, not to un-publish it, so published_at is left alone as well.
+
+   THIS IS NOT A SECURITY BOUNDARY. It runs in the browser, and RLS currently lets any signed-in
+   user write pr_periods, so anyone who can open a console can do exactly what this refuses:
+     window.SB.from('pr_periods').update({ status: 'published' }).eq('id', 3)
+   The check below stops the wrong button being pressed; it cannot stop an intent. Restricting
+   unlock for real needs an RLS policy on pr_periods (and pr_items) that admits only the owner —
+   without it the lock freeze itself is bypassable the same way. That policy is the next task.
+
+   The owner test is ME.role === "owner", which is what the app already uses for every other
+   owner-only action, including the two other destructive ones — the "Delete all" buttons at
+   app.jsx:3293 and 6765. There is no username on ME to test instead (app.jsx:448), and the
+   superadmin is the only account holding that role. */
+async function _supaUnlock(payload) {
+  const sb = window.SB;
+  if (!ME || ME.role !== "owner") return {
+    ok: false,
+    error: "Only the superadmin can unlock a payroll period."
+  };
+  const periodId = Number(payload && payload.id || 0);
+  if (!periodId) return {
+    ok: false,
+    error: "Missing id"
+  };
+  const {
+    data: per,
+    error: readErr
+  } = await sb.from("pr_periods").select("status").eq("id", periodId).maybeSingle();
+  if (readErr) return {
+    ok: false,
+    error: readErr.message
+  };
+  if (!per) return {
+    ok: false,
+    error: "This payroll period no longer exists. Reload the page and try again."
+  };
+  // Refusing a week that isn't locked is the point, not a formality: writing 'published'
+  // blindly would PUBLISH a draft — notifying employees for a week nobody has finished.
+  if (per.status !== "locked") return {
+    ok: false,
+    error: "This payroll period is not locked."
+  };
+  const {
+    error
+  } = await sb.from("pr_periods").update({
+    status: "published"
+  }).eq("id", periodId);
+  if (error) return {
+    ok: false,
+    error: error.message
+  };
+  return {
+    ok: true
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1888,9 +1949,12 @@ const API = (action, payload) => {
         if (action === "payroll_data") {
           return await _supaPayroll();
         }
-        // The one wired payroll write. Every other pr_* action still falls through below.
+        // The wired payroll writes. Every other pr_* action still falls through below.
         if (action === "pr_save_items") {
           return await _supaSaveItems(payload);
+        }
+        if (action === "pr_unlock") {
+          return await _supaUnlock(payload);
         }
         if (action === "create_client") {
           const {
@@ -14369,6 +14433,9 @@ function PayrollPage({
   // Same test the status chip already renders (app.jsx:4757). The real freeze is in
   // _supaSaveItems; this only stops the officer typing into a week that cannot be saved.
   const locked = !!period && period.status === "locked";
+  // Who may unlock. Same gate as every other owner-only action (app.jsx:277/3293/6765), and
+  // like those it decides what renders, not what is permitted — see _supaUnlock.
+  const isOwner = !!ME && ME.role === "owner";
   const empMap = useMemo(() => {
     const m = {};
     pr.employees.forEach(e => {
@@ -14591,6 +14658,19 @@ function PayrollPage({
       });
       await reload();
       flashMsg("Week locked");
+    } catch (e) {
+      alert(e.message);
+    }
+  };
+  // Superadmin only, and only ever back to Published — see _supaUnlock for why not Draft.
+  const unlockWeek = async () => {
+    if (!window.confirm("Unlock this week so it can be edited again? It goes back to Published.")) return;
+    try {
+      await prWrite("pr_unlock", {
+        id: selId
+      });
+      await reload();
+      flashMsg("Week unlocked — editable again");
     } catch (e) {
       alert(e.message);
     }
@@ -14891,7 +14971,20 @@ function PayrollPage({
       fontWeight: 700,
       padding: "8px 14px"
     }
-  }, "Lock week"))), period && attention.length > 0 && /*#__PURE__*/React.createElement(Card, {
+  }, "Lock week"), period && locked && isOwner && /*#__PURE__*/React.createElement("button", {
+    onClick: unlockWeek,
+    title: "Superadmin only \u2014 reopens this week for editing",
+    className: "inline-flex items-center gap-1.5 rounded-xl",
+    style: {
+      background: t.warnSoft,
+      color: t.warn,
+      border: "none",
+      cursor: "pointer",
+      fontSize: 12.5,
+      fontWeight: 700,
+      padding: "8px 14px"
+    }
+  }, "Unlock week"))), period && attention.length > 0 && /*#__PURE__*/React.createElement(Card, {
     t: t,
     style: {
       padding: 18,

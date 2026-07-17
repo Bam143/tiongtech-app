@@ -34,7 +34,11 @@ export function loadApp(appJsPath) {
   src = src.slice(0, bootAt);
   // prCalc comes out too: it is what the SCREEN shows, so a test can compare the stored
   // gross/net against it instead of against a number copied out of the adapter.
-  src += "\n;globalThis.__TT = { API, _supaSaveItems, _prSaveRow, _prSaveCalc, _stamp, prCalc };\n";
+  // setME/getME exist because ME is a script-lexical `let` (app.jsx:239) — invisible from
+  // outside the VM. These arrows close over that binding, so a test can sign in as somebody
+  // else. Restore what getME returned; ME is global state and leaks across tests otherwise.
+  src += "\n;globalThis.__TT = { API, _supaSaveItems, _supaUnlock, _prSaveRow, _prSaveCalc, _stamp, prCalc,"
+      +  " setME: (v) => { ME = v; }, getME: () => ME };\n";
 
   const windowObj = { SB: null, __LIVE__: true, addEventListener() {}, location: { href: "" }, matchMedia: () => ({ matches: false, addEventListener() {} }) };
   const backing = {
