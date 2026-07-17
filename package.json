@@ -6,6 +6,7 @@
   "scripts": {
     "build": "node tests/build.mjs app.jsx app.js",
     "test": "node tests/test-payroll.mjs app.js",
+    "mutate": "node tests/mutate.mjs app.js",
     "test:rls": "node tests/rls-live.mjs"
   },
   "devDependencies": {

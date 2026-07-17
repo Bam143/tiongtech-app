@@ -4,7 +4,8 @@
 
 ```sh
 npm install     # once
-npm test        # 23 tests, ~1 second
+npm test        # 47 tests, ~1 second
+npm run mutate  # 14 mutations — proves the suite can actually fail (~20s)
 ```
 
 To rebuild `app.js` after editing `app.jsx`:
@@ -12,6 +13,9 @@ To rebuild `app.js` after editing `app.jsx`:
 ```sh
 npm run build
 ```
+
+There is also `npm run test:rls`, which is **not** part of `npm test` — it talks to the real
+Supabase project and needs credentials. See "The live RLS test" below.
 
 ## What this covers
 
@@ -62,13 +66,46 @@ and a blind delete would erase an approved payslip. So removal doesn't stick —
 on reload. A test pins this, so if you implement the delete, that test *should* fail. Change it
 deliberately.
 
+## The live RLS test — `npm run test:rls`
+
+Everything above runs against a fake, which proves the **app** behaves. It can prove nothing
+about RLS: the fake has no policies and says yes to everything. `rls-live.mjs` connects to the
+real project and asks the database directly whether it refuses a non-owner editing a locked week.
+
+```sh
+SB_OWNER_PW=... SB_STAFF_PW=... npm run test:rls
+```
+
+Passwords come from the environment and are never in the file; the project URL and anon key are
+read out of `index.html` (both public). It **writes one row** of production data and puts it back,
+verifying the restore, and prints the `pr_items.id` it touched.
+
+Its negative case asserts twice, and that is the point: **PostgREST does not error when RLS hides
+rows from an UPDATE** — it returns 200 with an empty array. So `if (error)` never fires and a
+naive test would report PASS whether the policy existed or not. Running it is what turned up the
+silent-write bug in the adapter.
+
 ## Adding tests
 
 No framework — `makeSuite()` in `harness.mjs` gives `test`, `eq`, and `ok`, which is enough. That
 keeps the suite dependency-free apart from Babel.
 
-Worth doing when you add one: **check it can fail.** Break the code on purpose and confirm the
-test goes red. Every test here was written that way — e.g. forcing `leave_type_id` through the
-numeric coercer turns exactly one test red, and dropping the installment deductions from the net
-calculation turns two red. A test that passes no matter what is worse than no test, because it
-reads like coverage.
+**Check it can fail.** A test that passes no matter what the code does reads exactly like
+coverage and is worse than no test, because it buys confidence it hasn't earned. `npm run mutate`
+does this for you: it breaks one guard at a time and asserts the suite goes red for each. A
+mutation reported **SURVIVED** is a hole — that behaviour is unprotected. Add a mutation whenever
+you add a guard worth keeping.
+
+Two things about that harness are worth knowing before you touch it:
+
+**It asserts each patch applied.** The first version used `sed`. Babel pretty-prints object
+literals across lines, so the single-line patterns matched nothing, the suite ran against
+untouched code, and it reported "29 passed" — indistinguishable from tests that don't bite. A
+mutation check that can't tell "didn't apply" from "didn't kill" gives false confidence *about*
+false confidence. A pattern that fails to match is a hard exit 2, never a pass.
+
+**Patterns are written against the built `app.js`**, in Babel's output shape (multi-line object
+literals), not the shape the code takes in `app.jsx`. When one stops applying it usually just
+means the code moved: `npm run build`, look at the compiled form, update the pattern. Where the
+same code exists in two functions, scope the mutation with `in: "_supaSaveItems"` rather than
+anchoring on a neighbouring comment, which is free to change.
