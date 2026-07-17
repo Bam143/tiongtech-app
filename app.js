@@ -1460,6 +1460,30 @@ async function _supaFinancials() {
     financeMonths: Array.from(months).sort().reverse()
   };
 }
+// Renewals. Two owners share the renewal_stages row: set_renewal_stage owns `stage`, and
+// set_renewal_followup owns the five follow-up columns. Each writes only its own, so an
+// upsert from one never blanks the other's. account_number is the row key, never a value.
+// Note that set_renewal_followup deliberately does NOT write `stage`: a client can sit on a
+// for_followup card with no row at all (renewalStageOf auto-places anyone whose
+// active_profile is Expired / Payment Reminder). Inserting a stage here would pin them
+// explicitly, and an explicit stage always wins — so editing a remark would quietly change
+// what the card means. Left NULL, the auto rule keeps working.
+function _followupPayload(p) {
+  return {
+    next_date: _cDate(p.next_date),
+    remarks: _cTxt(p.remarks),
+    promise_date: _cDate(p.promise_date),
+    amount_due: _cNum(p.amount_due),
+    payment_method: _cTxt(p.payment_method)
+  };
+}
+// api.php stamps notes and stage moves server-side; here it's the browser clock. Both the
+// note `at` and the log's `moved_at` render raw in the timeline, so keep them short.
+const _stamp = () => {
+  const d = new Date(),
+    p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+};
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1624,6 +1648,132 @@ const API = (action, payload) => {
           };
           return {
             ok: true
+          };
+        }
+        if (action === "add_renewal_note") {
+          if (!payload || !payload.id) return {
+            ok: false,
+            error: "Missing id"
+          };
+          const text = String(payload && payload.text || "").trim();
+          if (!text) return {
+            ok: false,
+            error: "Empty note"
+          };
+          // Read-append-write: the thread is a JSON array in clients.renewal_note, which is
+          // why _clientPayload leaves that column alone. rnThread() tolerates the older rows
+          // where the note was still plain text, so replying to one converts it in place.
+          const {
+            data: row,
+            error: readErr
+          } = await sb.from("clients").select("renewal_note").eq("id", payload.id).single();
+          if (readErr) return {
+            ok: false,
+            error: readErr.message
+          };
+          const thread = rnThread(row ? row.renewal_note : "");
+          thread.push({
+            by: ME && ME.name || "",
+            pos: ME && ME.position || "",
+            at: _stamp(),
+            text
+          });
+          const {
+            error
+          } = await sb.from("clients").update({
+            renewal_note: JSON.stringify(thread)
+          }).eq("id", payload.id);
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true,
+            thread
+          }; // the caller re-renders straight from this
+        }
+        if (action === "set_renewal_stage") {
+          if (!payload || !payload.account_number) return {
+            ok: false,
+            error: "Missing account_number"
+          };
+          const acct = payload.account_number,
+            stage = payload.stage || null;
+          // Read the stage being left first, so the log can record from \u2192 to. Settle `from`
+          // before the write, so it can't be read back out of a row the upsert has changed.
+          const {
+            data: prev
+          } = await sb.from("renewal_stages").select("stage").eq("account_number", acct).maybeSingle();
+          const from = prev && prev.stage || null;
+          const {
+            error
+          } = await sb.from("renewal_stages").upsert({
+            account_number: acct,
+            stage
+          }, {
+            onConflict: "account_number"
+          });
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          if (from !== stage) {
+            // Best effort, and deliberately so: the move is what the officer asked for, so a
+            // failure to log it must not fail or roll back the move. insert() resolves with
+            // an error rather than throwing, so this swallows both that and a network throw.
+            try {
+              await sb.from("renewal_stage_logs").insert({
+                account_number: acct,
+                from_stage: from,
+                to_stage: stage,
+                moved_at: _stamp(),
+                moved_by: ME && ME.name || null
+              });
+            } catch (e) {}
+          }
+          return {
+            ok: true
+          };
+        }
+        if (action === "set_renewal_followup") {
+          if (!payload || !payload.account_number) return {
+            ok: false,
+            error: "Missing account_number"
+          };
+          const {
+            error
+          } = await sb.from("renewal_stages").upsert({
+            account_number: payload.account_number,
+            ..._followupPayload(payload)
+          }, {
+            onConflict: "account_number"
+          });
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true
+          };
+        }
+        if (action === "renewal_history") {
+          if (!payload || !payload.account_number) return {
+            ok: false,
+            error: "Missing account_number"
+          };
+          const {
+            data,
+            error
+          } = await sb.from("renewal_stage_logs").select("from_stage,to_stage,moved_at,moved_by,remarks").eq("account_number", payload.account_number).order("moved_at", {
+            ascending: true
+          }); // oldest first: the timeline reads top-down
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true,
+            log: data || []
           };
         }
         return {
