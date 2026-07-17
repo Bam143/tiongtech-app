@@ -6,9 +6,13 @@
 //
 //   SB_OWNER_PW=... SB_STAFF_PW=... node tests/rls-live.mjs
 //
-// Two policies:
+// Two tables, three policies, fifteen cases:
 //
-//   pr_items    — a non-owner may not edit a row of a locked week; the owner may.
+//   pr_items    — Piece A + Piece C, one policy:
+//                   is_owner() OR (period NOT locked AND (is_payroll() OR item_is_mine(employee_id)))
+//                 So the owner writes anything; on a week that is NOT locked the payroll officer
+//                 writes any row and an ordinary employee writes only their OWN; and nobody but
+//                 the owner writes a locked week at all.
 //   pr_periods  — v2, three roles. The OWNER moves status in any direction. A PAYROLL officer may
 //                 publish and lock, but may not unlock a locked week and may not send one back to
 //                 draft. EVERYONE ELSE may edit a period's notes/label/pay_date and may not touch
@@ -20,10 +24,16 @@
 // (That sharing is itself a live problem — it means the payroll officer's rights below belong to
 // everyone who knows that password — but it is not what this file tests.)
 //
-// It signs in as real users and WRITES REAL ROWS of production data — one pr_items row, and the
-// pr_periods row's notes and status — then puts every one of them back and verifies the restore.
-// It prints the exact ids it touched. The writes will bump updated_at where a trigger exists;
-// that is accepted and not reset.
+// TWO PERIODS, and they are not interchangeable. The lock cases need a LOCKED week; the own-row
+// cases need one that is NOT locked, because on a locked week the freeze refuses everyone but the
+// owner and the ownership clause is never reached — a green run would prove nothing about
+// ownership. It finds both from the database and BAILS rather than manufacturing either: it will
+// not unlock the locked week to make itself a test bed.
+//
+// It signs in as real users and WRITES REAL ROWS of production data — pr_items rows on two weeks,
+// and the pr_periods row's notes and status — then puts every one of them back and verifies the
+// restore. It prints the exact ids it touched. The writes will bump updated_at where a trigger
+// exists; that is accepted and not reset.
 //
 // Passwords come from the environment and are never written down here. The project URL and the
 // publishable key are read out of index.html — both are public by design (that key ships to every
@@ -106,8 +116,10 @@ async function signIn(client, username, password, who) {
 // and a case built on it would test whatever that account happens to be today. An account also
 // needs an auth_uid or there is no login behind it to sign in to.
 
+// erp_users.id comes back too: Piece C's item_is_mine() walks it to pr_employees.user_id, and the
+// test has to walk the same chain to know which row is really the caller's.
 async function findByRole(owner, role) {
-  const { data, error } = await owner.from("erp_users").select("username,role,auth_uid")
+  const { data, error } = await owner.from("erp_users").select("id,username,role,auth_uid")
     .eq("role", role).not("auth_uid", "is", null).order("username").limit(1);
   if (error) bail(`listing erp_users for role '${role}': ${error.message}`);
   return (data || [])[0] || null;
@@ -118,10 +130,109 @@ async function findByRole(owner, role) {
 async function findOutsider(owner) {
   const tech = await findByRole(owner, "technician");
   if (tech) return tech;
-  const { data, error } = await owner.from("erp_users").select("username,role,auth_uid")
+  const { data, error } = await owner.from("erp_users").select("id,username,role,auth_uid")
     .neq("role", "owner").neq("role", "payroll").not("auth_uid", "is", null).order("username").limit(1);
   if (error) bail("listing erp_users for a non-owner non-payroll account: " + error.message);
   return (data || [])[0] || null;
+}
+
+/* ---------- Piece C discovery ---------- */
+//
+// The policy decides ownership by walking a chain, so the test walks the same one rather than
+// guessing which row belongs to whom:
+//
+//   erp_users.auth_uid = the caller          <- who is signed in
+//   erp_users.id       -> pr_employees.user_id
+//   pr_employees.id    =  pr_items.employee_id
+//
+// Getting this backwards would test nothing and say it passed: a row that is NOT the technician's
+// would make the own-row case a false failure, and a row that IS theirs would make the core
+// blocked case a false pass. Both read green.
+async function findOwnRowTargets(owner, outsiderUser) {
+  const { data: emps, error: empErr } = await owner.from("pr_employees").select("id,user_id").eq("user_id", outsiderUser.id).order("id");
+  if (empErr) bail(`reading pr_employees for ${outsiderUser.username}: ${empErr.message}`);
+  if (!emps || !emps.length) {
+    bail(`${outsiderUser.username} (erp_users.id ${outsiderUser.id}) has no pr_employees row, so they have no "own row" to write and item_is_mine() can never be true for them. Piece C cannot be tested with this account — link it to a payroll record, or give another technician one.`);
+  }
+  if (emps.length > 1) console.log(`  note     ${outsiderUser.username} maps to ${emps.length} pr_employees rows; using the lowest id`);
+  const myEmpId = Number(emps[0].id);
+
+  // A NON-LOCKED week, because on a locked one Piece A refuses everyone but the owner and the
+  // ownership clause is never reached — the case would pass for the wrong reason.
+  const { data: periods, error: perErr } = await owner.from("pr_periods").select("id,label,status").neq("status", "locked").order("id");
+  if (perErr) bail("listing non-locked periods: " + perErr.message);
+  for (const p of periods || []) {
+    const { data: items, error: itErr } = await owner.from("pr_items").select("id,employee_id,remarks").eq("period_id", p.id).order("id");
+    if (itErr) bail(`reading pr_items for period ${p.id}: ${itErr.message}`);
+    const mine = (items || []).find((r) => Number(r.employee_id) === myEmpId);
+    const theirs = (items || []).find((r) => Number(r.employee_id) !== myEmpId);
+    if (mine && theirs) return { period: p, mine, theirs, myEmpId };
+  }
+  bail(
+    `no NON-LOCKED period has pay lines for BOTH ${outsiderUser.username} (employee_id ${myEmpId}) and another employee.\n` +
+    "  Piece C is about who may write a row on a week that is not frozen, so it needs one to test on.\n" +
+    "  Create a draft week with at least two employees on it and press Save, or publish an existing draft.\n" +
+    "  This test will NOT unlock the locked week to manufacture one — that would change data you did not ask it to."
+  );
+}
+
+/* ---------- pr_items write helpers ---------- */
+// Same shape as the period helpers: attempt, judge the attempt, then ask the OWNER what the column
+// says. The owner is used for every re-read and every restore because the owner clause of the
+// policy is unconditional — so cleanup can never itself be refused by the policy under test.
+//
+// These poke `remarks`, not add_incentive like the locked-week cases below. Deliberate: this
+// section writes to a LIVE, non-locked week the officer may be editing right now, and
+// add_incentive feeds the denormalised gross/net that only _supaSaveItems recomputes — writing it
+// directly would leave the row internally inconsistent for the length of the test, and wrong on
+// disk if a restore ever failed. remarks carries no arithmetic. The policy is row-level and does
+// not care which column, so the safe one is free.
+
+async function readRemarks(owner, itemId) {
+  const { data, error } = await owner.from("pr_items").select("remarks").eq("id", itemId).maybeSingle();
+  if (error) bail("re-reading pr_items as owner: " + error.message);
+  if (!data) bail(`pr_items.id ${itemId} vanished mid-test`);
+  return data.remarks;
+}
+
+async function itemMustRefuse(owner, client, itemId, to, expect, who) {
+  const { data, error } = await client.from("pr_items").update({ remarks: to }).eq("id", itemId).select("id");
+  const rows = (data || []).length;
+  if (!error && rows > 0) {
+    fail(`${who} was NOT blocked`, `the update changed ${rows} row(s) — pr_items.id ${itemId} was written`);
+  } else if (error) {
+    pass("blocked with an error", `${error.code || "?"}: ${error.message}`);
+  } else {
+    pass("blocked silently (0 rows)", "no error — PostgREST returned 200 with an empty array, which is why the re-read decides it");
+  }
+  const now = await readRemarks(owner, itemId);
+  if (sameText(now, expect)) pass("value unchanged on disk", `pr_items.id ${itemId} remarks is still ${JSON.stringify(now)}`);
+  else fail("value CHANGED on disk", `expected ${JSON.stringify(expect)}, found ${JSON.stringify(now)} — the write got through`);
+}
+
+async function itemMustAllow(owner, client, itemId, to, who) {
+  const { data, error } = await client.from("pr_items").update({ remarks: to }).eq("id", itemId).select("id");
+  if (error) {
+    fail(`${who} was blocked`, `${error.code || "?"}: ${error.message} — the policy is stricter than it should be`);
+    return;
+  }
+  if ((data || []).length !== 1) {
+    fail(`${who}'s write moved no rows`, "no error, but 0 rows came back — silently blocked");
+    return;
+  }
+  const now = await readRemarks(owner, itemId);
+  if (sameText(now, to)) pass(`${who}'s write succeeded`, `pr_items.id ${itemId} remarks is now ${JSON.stringify(now)}`);
+  else fail(`${who}'s write reported success but did not land`, `expected ${JSON.stringify(to)}, found ${JSON.stringify(now)}`);
+}
+
+// A net, not bookkeeping: read what is there and put back only what moved, whichever case died.
+async function restoreRemarks(owner, itemId, original, label) {
+  const now = await readRemarks(owner, itemId);
+  if (sameText(now, original)) { pass(`${label} left exactly as found`, `pr_items.id ${itemId} remarks ${JSON.stringify(now)}`); return; }
+  const { error } = await owner.from("pr_items").update({ remarks: original }).eq("id", itemId);
+  const back = await readRemarks(owner, itemId);
+  if (!error && sameText(back, original)) pass(`${label} restored`, `pr_items.id ${itemId} remarks back to ${JSON.stringify(back)}`);
+  else fail(`${label} restore did not verify`, `pr_items.id ${itemId} now holds ${JSON.stringify(back)}, expected ${JSON.stringify(original)} — RESTORE BY HAND`);
 }
 
 /* ---------- status-change helpers ---------- */
@@ -171,9 +282,10 @@ const expectState = (actual, want, step) => {
   if (actual !== want) bail(`the sequence lost its place before case [${step}]: the period is '${actual}', expected '${want}'. No verdict can be drawn from here.`);
 };
 
-/* ---------- pr_items: the lock policy ---------- */
+/* ---------- pr_items: the lock policy (Piece A) + the owner override ---------- */
 
-async function itemsLockCases(owner, outsider, outsiderUser, period) {
+async function itemsLockCases(ctx, period) {
+  const { owner, payroll, payrollUser, outsider, outsiderUser } = ctx;
   const { data: items, error: itemErr } = await owner.from("pr_items").select("id,employee_id,add_incentive").eq("period_id", period.id).order("id").limit(1);
   if (itemErr) bail("reading pr_items: " + itemErr.message);
   if (!items || !items.length) bail(`locked period #${period.id} has no pr_items rows`);
@@ -213,8 +325,34 @@ async function itemsLockCases(owner, outsider, outsiderUser, period) {
       fail("value CHANGED on disk", `expected ${JSON.stringify(original)}, found ${JSON.stringify(after.add_incentive)} — the write got through`);
     }
 
+    /* ---- NEGATIVE: payroll is not the owner ---- */
+    // The case that separates payroll from the owner, and the one a sloppy policy edit would
+    // leak. Piece C admits is_payroll() only while the week is NOT locked, so on this week the
+    // officer has no more right than the technician above. Case [1] cannot catch that: a
+    // technician is refused by ownership as well as by the freeze, so it stays green even if the
+    // "not locked" condition falls out of the payroll clause entirely.
+    console.log(`\n  [2] payroll ${payrollUser.username} edits the same LOCKED row — must be blocked`);
+    const { data: payData, error: payErr } = await payroll.from("pr_items")
+      .update({ add_incentive: temp }).eq("id", item.id).select();
+    const payRows = (payData || []).length;
+    if (!payErr && payRows > 0) {
+      fail("RLS did NOT block the payroll officer", `the update changed ${payRows} row(s) — payroll can edit a locked week, so the freeze only holds for technicians`);
+    } else if (payErr) {
+      pass("blocked with an error", `${payErr.code || "?"}: ${payErr.message}`);
+    } else {
+      pass("blocked silently (0 rows)", "no error — PostgREST returned 200 with an empty array, which is why the re-read below matters");
+    }
+    const { data: afterPay, error: afterPayErr } = await owner.from("pr_items").select("add_incentive").eq("id", item.id).maybeSingle();
+    if (afterPayErr) bail("re-reading the row as owner: " + afterPayErr.message);
+    if (!afterPay) bail("the row vanished mid-test");
+    if (sameNum(afterPay.add_incentive, original)) {
+      pass("value unchanged on disk", `add_incentive is still ${JSON.stringify(afterPay.add_incentive)}`);
+    } else {
+      fail("value CHANGED on disk", `expected ${JSON.stringify(original)}, found ${JSON.stringify(afterPay.add_incentive)} — the officer's write got through`);
+    }
+
     /* ---- POSITIVE: the owner must get through ---- */
-    console.log(`\n  [2] owner (${OWNER_USERNAME}) edits the same LOCKED row — must succeed`);
+    console.log(`\n  [3] owner (${OWNER_USERNAME}) edits the same LOCKED row — must succeed`);
     const { data: okData, error: okErr } = await owner.from("pr_items")
       .update({ add_incentive: temp }).eq("id", item.id).select();
     if (okErr) {
@@ -243,6 +381,55 @@ async function itemsLockCases(owner, outsider, outsiderUser, period) {
     } else {
       console.log("\n  cleanup  pr_items — nothing to undo; the owner write never landed");
     }
+  }
+}
+
+/* ---------- pr_items: own-row writes (Piece C), on a NON-LOCKED week ---------- */
+//
+// The policy:  is_owner()  OR  (period NOT locked AND (is_payroll() OR item_is_mine(employee_id)))
+//
+// The cases above prove the first and the "NOT locked" half. These three prove the rest, and they
+// need a week that is NOT locked — on a locked one the freeze refuses everyone but the owner and
+// the ownership clause is never reached, so a green run would say nothing about ownership at all.
+//
+// WHY THIS IS THE PIECE THAT MATTERS. Until it landed, every guard on who may touch whose payslip
+// lived in JavaScript: _prReviewGate refuses the wrong button, and _supaPayroll narrows an
+// employee to their own rows with a .filter() in the browser. Neither survives a console. So an
+// approval on a line was not evidence that the employee named on it gave it — which is the entire
+// reason for asking. Case [4] is where that stops being true, or doesn't.
+async function ownRowCases(ctx, target) {
+  const { owner, payroll, payrollUser, outsider, outsiderUser } = ctx;
+  const { period, mine, theirs, myEmpId } = target;
+  const mineOriginal = mine.remarks;
+  const theirsOriginal = theirs.remarks;
+  const mineTemp = ((mineOriginal === null || mineOriginal === undefined) ? "" : String(mineOriginal)) + TEMP_NOTES_MARK;
+  const theirsTemp = ((theirsOriginal === null || theirsOriginal === undefined) ? "" : String(theirsOriginal)) + TEMP_NOTES_MARK;
+
+  console.log("\n─── pr_items — own-row writes (Piece C), on a NON-LOCKED week");
+  console.log(`  period   pr_periods.id ${period.id} "${period.label}" (status '${period.status}') — NOT the locked week`);
+  console.log(`  mine     pr_items.id ${mine.id} (employee_id ${myEmpId}) — ${outsiderUser.username}'s own line`);
+  console.log(`  theirs   pr_items.id ${theirs.id} (employee_id ${theirs.employee_id}) — somebody else's line`);
+  console.log("  column   remarks — text, no arithmetic; add_incentive would leave gross/net stale on a live week\n");
+
+  try {
+    /* ---- [4] THE CORE PIECE C PROOF ---- */
+    console.log(`  [4] technician ${outsiderUser.username} edits SOMEBODY ELSE'S line — must be blocked`);
+    console.log("      the week is not locked, so nothing but ownership stands between them and it");
+    await itemMustRefuse(owner, outsider, theirs.id, theirsTemp, theirsOriginal, `technician ${outsiderUser.username}`);
+
+    /* ---- [5] the other half: own-row must still work ---- */
+    console.log(`\n  [5] technician ${outsiderUser.username} edits HIS OWN line — must succeed`);
+    console.log("      a policy that refuses this refuses self-approval too, and the payslip flow stops working");
+    await itemMustAllow(owner, outsider, mine.id, mineTemp, `technician ${outsiderUser.username}`);
+
+    /* ---- [6] the regression that would hurt most ---- */
+    console.log(`\n  [6] payroll ${payrollUser.username} edits somebody else's line — must succeed`);
+    console.log("      Piece C must not lock the officer out of the grid: every Save writes rows they do not own");
+    await itemMustAllow(owner, payroll, theirs.id, theirsTemp, `payroll ${payrollUser.username}`);
+  } finally {
+    console.log("\n  cleanup  pr_items (Piece C)");
+    await restoreRemarks(owner, mine.id, mineOriginal, `${outsiderUser.username}'s own line`);
+    await restoreRemarks(owner, theirs.id, theirsOriginal, "the other employee's line");
   }
 }
 
@@ -298,10 +485,10 @@ async function periodStatusCases(ctx, period) {
   console.log(`  notes    original ${JSON.stringify(originalNotes)}, test value ${JSON.stringify(tempNotes)}\n`);
 
   try {
-    /* ---- [3] the outsider may still edit a NON-status field ---- */
+    /* ---- [7] the outsider may still edit a NON-status field ---- */
     // The policy freezes status, not the period. If this fails it is too blunt, and an officer
     // can no longer fix a typo in a label on a locked week.
-    console.log(`  [3] outsider ${outsiderUser.username} edits NOTES only, no status — must succeed`);
+    console.log(`  [7] outsider ${outsiderUser.username} edits NOTES only, no status — must succeed`);
     const { data: nd, error: nErr } = await outsider.from("pr_periods")
       .update({ notes: tempNotes }).eq("id", period.id).select();
     if (nErr) {
@@ -324,48 +511,48 @@ async function periodStatusCases(ctx, period) {
     }
 
     let state = await readStatus(owner, period);
-    expectState(state, "locked", 4);
-
-    /* ---- [4] the outsider may not touch status at all ---- */
-    console.log(`\n  [4] outsider ${outsiderUser.username} (${outsiderUser.role}) publishes a LOCKED period — must be blocked`);
-    state = await mustRefuse(owner, outsider, period, "published", "locked", `outsider ${outsiderUser.username}`);
-    expectState(state, "locked", 5);
-
-    /* ---- [5] THE v2 CHANGE: payroll may not unlock ---- */
-    console.log(`\n  [5] payroll ${payrollUser.username} UNLOCKS it (locked -> published) — must be blocked`);
-    console.log("      the one power v2 withholds from payroll: it may publish and lock, never unlock");
-    state = await mustRefuse(owner, payroll, period, "published", "locked", `payroll ${payrollUser.username}`);
-    expectState(state, "locked", 6);
-
-    /* ---- [6] the owner may unlock ---- */
-    console.log(`\n  [6] owner ${OWNER_USERNAME} UNLOCKS it (locked -> published) — must succeed`);
-    state = await mustAllow(owner, owner, period, "published", `owner ${OWNER_USERNAME}`);
-    expectState(state, "published", 7);
-
-    /* ---- [7] payroll may lock a week that is not locked ---- */
-    console.log(`\n  [7] payroll ${payrollUser.username} LOCKS it (published -> locked) — must succeed`);
-    state = await mustAllow(owner, payroll, period, "locked", `payroll ${payrollUser.username}`);
     expectState(state, "locked", 8);
 
-    /* ---- [8] setup for [9], not a policy question of its own ---- */
-    console.log(`\n  [8] owner ${OWNER_USERNAME} sends it back to DRAFT (locked -> draft) — must succeed`);
-    console.log("      setup: case 9 needs a real third state to publish FROM");
-    state = await mustAllow(owner, owner, period, "draft", `owner ${OWNER_USERNAME}`);
-    expectState(state, "draft", 9);
+    /* ---- [8] the outsider may not touch status at all ---- */
+    console.log(`\n  [8] outsider ${outsiderUser.username} (${outsiderUser.role}) publishes a LOCKED period — must be blocked`);
+    state = await mustRefuse(owner, outsider, period, "published", "locked", `outsider ${outsiderUser.username}`);
+    expectState(state, "locked", 9);
 
-    /* ---- [9] payroll may publish a week that is not locked ---- */
-    console.log(`\n  [9] payroll ${payrollUser.username} PUBLISHES it (draft -> published) — must succeed`);
-    state = await mustAllow(owner, payroll, period, "published", `payroll ${payrollUser.username}`);
-    expectState(state, "published", 10);
+    /* ---- [9] THE v2 CHANGE: payroll may not unlock ---- */
+    console.log(`\n  [9] payroll ${payrollUser.username} UNLOCKS it (locked -> published) — must be blocked`);
+    console.log("      the one power v2 withholds from payroll: it may publish and lock, never unlock");
+    state = await mustRefuse(owner, payroll, period, "published", "locked", `payroll ${payrollUser.username}`);
+    expectState(state, "locked", 10);
 
-    /* ---- [10] payroll's new status must be published or locked ---- */
-    console.log(`\n  [10] payroll ${payrollUser.username} sends it to DRAFT (published -> draft) — must be blocked`);
-    console.log("       the only case that tests the clause 'new status IN (published, locked)'");
-    state = await mustRefuse(owner, payroll, period, "draft", "published", `payroll ${payrollUser.username}`);
+    /* ---- [10] the owner may unlock ---- */
+    console.log(`\n  [10] owner ${OWNER_USERNAME} UNLOCKS it (locked -> published) — must succeed`);
+    state = await mustAllow(owner, owner, period, "published", `owner ${OWNER_USERNAME}`);
     expectState(state, "published", 11);
 
-    /* ---- [11] restore ---- */
-    console.log(`\n  [11] owner ${OWNER_USERNAME} LOCKS it again (published -> locked) — puts the week back`);
+    /* ---- [11] payroll may lock a week that is not locked ---- */
+    console.log(`\n  [11] payroll ${payrollUser.username} LOCKS it (published -> locked) — must succeed`);
+    state = await mustAllow(owner, payroll, period, "locked", `payroll ${payrollUser.username}`);
+    expectState(state, "locked", 12);
+
+    /* ---- [12] setup for [13], not a policy question of its own ---- */
+    console.log(`\n  [12] owner ${OWNER_USERNAME} sends it back to DRAFT (locked -> draft) — must succeed`);
+    console.log("      setup: case 9 needs a real third state to publish FROM");
+    state = await mustAllow(owner, owner, period, "draft", `owner ${OWNER_USERNAME}`);
+    expectState(state, "draft", 13);
+
+    /* ---- [13] payroll may publish a week that is not locked ---- */
+    console.log(`\n  [13] payroll ${payrollUser.username} PUBLISHES it (draft -> published) — must succeed`);
+    state = await mustAllow(owner, payroll, period, "published", `payroll ${payrollUser.username}`);
+    expectState(state, "published", 14);
+
+    /* ---- [14] payroll's new status must be published or locked ---- */
+    console.log(`\n  [14] payroll ${payrollUser.username} sends it to DRAFT (published -> draft) — must be blocked`);
+    console.log("       the only case that tests the clause 'new status IN (published, locked)'");
+    state = await mustRefuse(owner, payroll, period, "draft", "published", `payroll ${payrollUser.username}`);
+    expectState(state, "published", 15);
+
+    /* ---- [15] restore ---- */
+    console.log(`\n  [15] owner ${OWNER_USERNAME} LOCKS it again (published -> locked) — puts the week back`);
     await mustAllow(owner, owner, period, "locked", `owner ${OWNER_USERNAME}`);
   } finally {
     /* ---- CLEANUP: the period must end exactly as it started ---- */
@@ -401,7 +588,7 @@ async function periodStatusCases(ctx, period) {
 /* ---------- the test ---------- */
 
 async function main() {
-  console.log("\nLIVE RLS — pr_items lock policy + pr_periods status policy (v2)");
+  console.log("\nLIVE RLS — pr_items lock + own-row (Pieces A & C) + pr_periods status policy (v2)");
   console.log("  project " + url + "\n");
 
   // 1. owner
@@ -443,16 +630,25 @@ async function main() {
   if (!locked || !locked.length) bail("no period has status 'locked' — the sequence starts from a locked week and there is none");
   if (locked.length > 1) console.log(`  note     ${locked.length} locked periods; using the lowest id`);
   const period = locked[0];
-  console.log(`  period   #${period.id} "${period.label}" (status '${period.status}')`);
+  console.log(`  locked   #${period.id} "${period.label}" (status '${period.status}') — the freeze cases and the status walk use this one`);
+
+  // 5. a NON-LOCKED week with a line of the outsider's own and a line of somebody else's. Found,
+  //    never manufactured: bailing beats unlocking a real payroll week to make a test bed.
+  const target = await findOwnRowTargets(owner, outsiderUser);
+  console.log(`  open     #${target.period.id} "${target.period.label}" (status '${target.period.status}') — the own-row cases use this one`);
+  if (target.period.id === period.id) bail("the locked week and the open week resolved to the same period — impossible, and no verdict can be drawn");
 
   const payroll = await signIn(mkClient(), payrollUser.username, STAFF_PW, "the payroll officer");
   const outsider = await signIn(mkClient(), outsiderUser.username, STAFF_PW, "the outsider");
+  const ctx = { owner, payroll, payrollUser, outsider, outsiderUser };
 
   try {
-    // pr_items runs first and pr_periods second, on purpose: the pr_items cases are only
-    // meaningful while the period is locked, and the status sequence walks it away from that.
-    await itemsLockCases(owner, outsider, outsiderUser, period);
-    await periodStatusCases({ owner, payroll, payrollUser, outsider, outsiderUser }, period);
+    // Order matters. The lock cases need #{period} locked, and the status walk at the end moves it
+    // through draft/published before putting it back — so the freeze cases must run first. The
+    // own-row cases sit on a different week entirely and cannot collide with either.
+    await itemsLockCases(ctx, period);
+    await ownRowCases(ctx, target);
+    await periodStatusCases(ctx, period);
   } finally {
     await owner.auth.signOut().catch(() => {});
     await payroll.auth.signOut().catch(() => {});
