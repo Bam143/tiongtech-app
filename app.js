@@ -2073,6 +2073,107 @@ async function _supaPublish(payload) {
     ok: true
   };
 }
+/* ---- Lock a published week as final (pr_lock) ----
+   lockWeek (app.jsx:4986) sends { id }. One write, unlike _supaPublish — the lines do not move,
+   only the period does. What makes this handler interesting is the precondition, not the write.
+
+   EVERY LINE MUST BE APPROVED. Locking is the end of the week: _supaSaveItems refuses to edit a
+   locked period, so a line left 'pending' at lock time is frozen with nobody having agreed to it,
+   and the employee's Approve button is gone (the review gate is published-only, app.jsx:_prReviewGate).
+   A contested line is worse — it is an open dispute, and locking would freeze the disagreement
+   with no path to answer it except an owner unlock. So the count is the guard, and the message
+   names what is outstanding rather than saying "no".
+
+   THIS IS NOT A MIRROR OF _supaUnlock, and the asymmetry is deliberate rather than an oversight.
+   Unlock is owner-only in this app (app.jsx:925). Piece B v2 lets a PAYROLL officer lock — its
+   WITH CHECK admits is_payroll() for a status change to 'published' or 'locked' when the week is
+   not already locked. So payroll can lock a week it then cannot unlock. That is the policy working
+   as designed (tests/rls-live.mjs cases 5 and 7 prove both halves against the real database), and
+   the button gate follows the DATABASE rather than _supaUnlock's shape.
+
+   No role check here, and that is also deliberate. _supaPublish has one because its two writes are
+   not atomic and an ineligible caller would strand the lines at 'pending'. This writes once: a
+   refusal costs nothing, leaves nothing behind, and RLS is the thing that decides. The button gate
+   below stops the wrong button being offered; 42501 is what stops the intent. */
+async function _supaLock(payload) {
+  const sb = window.SB;
+  const periodId = Number(payload && payload.id || 0);
+  if (!periodId) return {
+    ok: false,
+    error: "Missing id"
+  };
+  const {
+    data: per,
+    error: readErr
+  } = await sb.from("pr_periods").select("status").eq("id", periodId).maybeSingle();
+  if (readErr) return {
+    ok: false,
+    error: readErr.message
+  };
+  if (!per) return {
+    ok: false,
+    error: "This payroll period no longer exists. Reload the page and try again."
+  };
+  // Published only. A draft has not been shown to anyone — locking it would freeze a week no
+  // employee has ever seen, with no way back except an owner unlock, which returns it to
+  // 'published' (app.jsx:907) and would publish it for the first time by accident.
+  if (per.status !== "published") {
+    return {
+      ok: false,
+      error: per.status === "locked" ? "This week is already locked." : "Only a published week can be locked. This one is " + per.status + "."
+    };
+  }
+  const {
+    data: items,
+    error: itemsErr
+  } = await sb.from("pr_items").select("id,status").eq("period_id", periodId);
+  if (itemsErr) return {
+    ok: false,
+    error: itemsErr.message
+  };
+  const rows = items || [];
+  if (!rows.length) return {
+    ok: false,
+    error: "This week has no pay lines to lock."
+  };
+  // Anything not 'approved' blocks the lock. Counting pending and contested separately because
+  // they need different things from the officer: pending is waiting on an employee, contested is
+  // waiting on the officer's own reply. "Some lines aren't approved" would send them hunting.
+  const pending = rows.filter(r => r.status === "pending").length;
+  const contested = rows.filter(r => r.status === "contested").length;
+  const other = rows.filter(r => r.status !== "approved" && r.status !== "pending" && r.status !== "contested").length;
+  if (pending || contested || other) {
+    const parts = [];
+    if (pending) parts.push(pending + " line" + (pending === 1 ? " is" : "s are") + " still awaiting review");
+    if (contested) parts.push(contested + (contested === 1 ? " is contested" : " are contested"));
+    // A line with no status at all is a published week whose lines never moved — worth naming
+    // rather than folding into "not approved", because it means something upstream went wrong.
+    if (other) parts.push(other + " ha" + (other === 1 ? "s" : "ve") + " no review status at all");
+    return {
+      ok: false,
+      error: "Can't lock yet — " + parts.join(" and ") + ". Every line must be approved first."
+    };
+  }
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_periods").update({
+    status: "locked"
+  }).eq("id", periodId).select("id");
+  if (error) {
+    return {
+      ok: false,
+      error: error.code === "42501" ? "You don't have permission to lock this week." : "Locking the week failed: " + error.message
+    };
+  }
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Locking the week was refused — your account may not have permission. The week is still published."
+  };
+  return {
+    ok: true
+  };
+}
 /* ---- The review pair (pr_item_approve / pr_item_contest) ----
    The employee's two buttons on their own payslip (app.jsx:5162/5163), and — new — the officer's
    single-row Approve on the grid. Approve sends { id }; Contest sends { id, remark }.
@@ -2279,6 +2380,9 @@ const API = (action, payload) => {
         }
         if (action === "pr_publish") {
           return await _supaPublish(payload);
+        }
+        if (action === "pr_lock") {
+          return await _supaLock(payload);
         }
         if (action === "pr_item_approve") {
           return await _supaItemApprove(payload);
@@ -15313,7 +15417,7 @@ function PayrollPage({
     }
   }, /*#__PURE__*/React.createElement(Send, {
     size: 15
-  }), "Publish & notify"), period && period.status === "published" && /*#__PURE__*/React.createElement("button", {
+  }), "Publish & notify"), period && period.status === "published" && (isOwner || isPayroll) && /*#__PURE__*/React.createElement("button", {
     onClick: lockWeek,
     className: "inline-flex items-center gap-1.5 rounded-xl",
     style: {

@@ -227,6 +227,53 @@ const MUTATIONS = [
 `,
     to: "",
   },
+  // ---- lock (pr_lock) ----
+  {
+    name: "drop-lock-published-guard",
+    in: "_supaLock",
+    why: "a draft week locks — frozen final before any employee has seen it, and unlockable only back to 'published', which would publish it by accident",
+    from: `  if (per.status !== "published") {`,
+    to: `  if (false) {`,
+  },
+  {
+    name: "drop-lock-all-approved-guard",
+    // The reason this handler exists. Without it Lock is just a status flip.
+    in: "_supaLock",
+    why: "a week locks with lines still pending or contested — frozen with nobody having agreed to them, and the employee's Approve button already gone",
+    from: `  if (pending || contested || other) {`,
+    to: `  if (false) {`,
+  },
+  {
+    name: "drop-lock-empty-guard",
+    in: "_supaLock",
+    why: "a week with no pay lines locks, because zero not-approved lines reads the same as zero lines",
+    from: `  if (!rows.length) return {
+    ok: false,
+    error: "This week has no pay lines to lock."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-lock-zerorows",
+    in: "_supaLock",
+    why: "a silently refused lock reports 'Week locked' while the week stays published",
+    from: `  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Locking the week was refused — your account may not have permission. The week is still published."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "lock-ignores-contested",
+    // The subtle version of dropping the guard: pending still blocks, so most of the suite stays
+    // green and only an open dispute slips through.
+    in: "_supaLock",
+    why: "a contested line no longer blocks the lock, freezing an open dispute with no way to answer it short of an owner unlock",
+    from: `  const contested = rows.filter(r => r.status === "contested").length;`,
+    to: `  const contested = 0;`,
+  },
   // ---- the review pair (pr_item_approve / pr_item_contest) ----
   // The four guards live in _prReviewGate, which BOTH actions run, so each mutation here is a
   // single edit that both handlers' tests get a shot at.

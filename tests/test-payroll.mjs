@@ -859,12 +859,127 @@ await t.test("a contest refused with 42501 surfaces what the database said", asy
   t.ok(/new row violates/.test(res.error), `got: ${res.error}`);
 });
 
-const FALLTHROUGH = ["pr_lock", "pr_delete_period", "pr_apply_plans", "pr_set_dayoff",
+/* ---------- pr_lock ---------- */
+// One write, and the interesting part is the precondition: a week only locks once every line is
+// approved. Locking is final — _supaSaveItems refuses to edit a locked period and the review gate
+// is published-only — so a line left pending at lock time is frozen with nobody having agreed to
+// it, and no button left to agree with.
+
+const lockPeriod = [{ id: 3, status: "published" }];
+const lockItems = (statuses) => statuses.map((s, i) => ({ id: 80 + i, period_id: 3, employee_id: 5 + i, status: s }));
+const doLock = async (periods, items, payload, role = "payroll", opts) => {
+  const was = getME();
+  setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_periods: periods, pr_items: items }, opts);
+    window.SB = sb;
+    const res = await API("pr_lock", payload);
+    return { sb, res };
+  } finally { setME(was); }   // ME is global; a leak here would silently re-role later tests
+};
+const lockWrites = (sb) => sb.calls.filter((c) => c.op === "update");
+
+await t.test("a published week with every line approved locks", async () => {
+  const { sb, res } = await doLock(lockPeriod, lockItems(["approved", "approved", "approved"]), { id: 3 });
+  t.eq(res.ok, true, `locked, got: ${res.error}`);
+  const w = lockWrites(sb);
+  t.eq(w.length, 1, "one write — the lines do not move, only the period");
+  t.eq(w[0].table, "pr_periods", "on pr_periods");
+  t.eq(w[0].filters.id, 3, "the right week");
+  t.eq(Object.keys(w[0].row).join(","), "status", "only status");
+  t.eq(w[0].row.status, "locked", "locked");
+});
+
+await t.test("the owner may lock too — not just payroll", async () => {
+  const { res } = await doLock(lockPeriod, lockItems(["approved"]), { id: 3 }, "owner");
+  t.eq(res.ok, true, `owner locked, got: ${res.error}`);
+});
+
+await t.test("a PENDING line blocks the lock, and the message counts it", async () => {
+  const { sb, res } = await doLock(lockPeriod, lockItems(["approved", "pending", "pending", "pending"]), { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/3 lines are still awaiting review/.test(res.error), `names the pending count, got: ${res.error}`);
+  t.eq(lockWrites(sb).length, 0, "the week did NOT lock");
+});
+
+await t.test("a CONTESTED line blocks the lock, and is counted separately from pending", async () => {
+  // Separately on purpose: pending waits on an employee, contested waits on the officer's own
+  // reply. Folding them into "not approved" would send the officer hunting for which.
+  const { sb, res } = await doLock(lockPeriod, lockItems(["approved", "contested"]), { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/1 is contested/.test(res.error), `names the contested count, got: ${res.error}`);
+  t.eq(lockWrites(sb).length, 0, "the week did NOT lock");
+});
+
+await t.test("pending AND contested together are both named", async () => {
+  const { res } = await doLock(lockPeriod, lockItems(["pending", "contested", "approved"]), { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/1 line is still awaiting review and 1 is contested/.test(res.error), `names both, got: ${res.error}`);
+});
+
+await t.test("a line with NO review status blocks the lock and says so", async () => {
+  // A published week whose lines never moved. Folding this into "not approved" would hide that
+  // something upstream went wrong.
+  const { sb, res } = await doLock(lockPeriod, lockItems(["approved", null]), { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/no review status at all/.test(res.error), `names it, got: ${res.error}`);
+  t.eq(lockWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("locking a DRAFT week is refused — it was never published", async () => {
+  const { sb, res } = await doLock([{ id: 3, status: "draft" }], lockItems(["approved"]), { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Only a published week can be locked/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(lockWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("locking an already-locked week is refused", async () => {
+  const { sb, res } = await doLock([{ id: 3, status: "locked" }], lockItems(["approved"]), { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/already locked/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(lockWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("a week with no pay lines is refused rather than locked empty", async () => {
+  const { sb, res } = await doLock(lockPeriod, [], { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/no pay lines/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(lockWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("locking an unknown week is refused", async () => {
+  const { sb, res } = await doLock([], lockItems(["approved"]), { id: 3 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(lockWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("lock with no id is refused before any lookup", async () => {
+  const { sb, res } = await doLock(lockPeriod, lockItems(["approved"]), {});
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("a silently refused lock (USING policy, 200 + []) is not a false 'Week locked'", async () => {
+  const { res } = await doLock(lockPeriod, lockItems(["approved"]), { id: 3 }, "payroll", { blockWrites: "pr_periods" });
+  t.eq(res.ok, false, "refused");
+  t.ok(/still published/.test(res.error), `says where the week actually is, got: ${res.error}`);
+});
+
+await t.test("a lock refused with 42501 is reported as permission", async () => {
+  // The live branch for pr_periods: Piece B v2 refuses via WITH CHECK, which RAISES rather than
+  // hiding the row (tests/rls-live.mjs case 5), so `error` fires and !hit.length never does.
+  const { res } = await doLock(lockPeriod, lockItems(["approved"]), { id: 3 }, "payroll", { errorWrites: "pr_periods" });
+  t.eq(res.ok, false, "refused");
+  t.ok(/don't have permission to lock/.test(res.error), `names the cause, got: ${res.error}`);
+});
+
+const FALLTHROUGH = ["pr_delete_period", "pr_apply_plans", "pr_set_dayoff",
   "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan",
   "pr_item_reply", "pr_request_print", "pr_mark_printed", "pr_save_period"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 12, "12 actions still deferred — approve and contest are wired now");
+  t.eq(FALLTHROUGH.length, 11, "11 actions still deferred — pr_lock is wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;
