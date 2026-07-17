@@ -70,20 +70,51 @@ deliberately.
 
 Everything above runs against a fake, which proves the **app** behaves. It can prove nothing
 about RLS: the fake has no policies and says yes to everything. `rls-live.mjs` connects to the
-real project and asks the database directly whether it refuses a non-owner editing a locked week.
+real project and asks the database directly what it refuses. It covers two policies:
+
+- **`pr_items`** — a non-owner may not edit a row of a locked week; the owner may.
+- **`pr_periods`** — three tiers. The **owner** moves `status` in any direction. A **payroll**
+  officer may publish and lock, but may not unlock a locked week and may not send one back to
+  draft. **Everyone else** may edit a period's `notes`/`label`/`pay_date` and may not touch
+  `status` at all.
 
 ```sh
 SB_OWNER_PW=... SB_STAFF_PW=... npm run test:rls
 ```
 
-Passwords come from the environment and are never in the file; the project URL and anon key are
-read out of `index.html` (both public). It **writes one row** of production data and puts it back,
-verifying the restore, and prints the `pr_items.id` it touched.
+Passwords come from the environment and are never in the file; the project URL and publishable key
+are read out of `index.html` (both public — that key ships to every browser, and RLS is what
+protects the data). It **writes real production rows** — one `pr_items` row, and the period's
+`notes` and `status` — puts every one back, verifies the restore, and prints the ids it touched.
 
-Its negative case asserts twice, and that is the point: **PostgREST does not error when RLS hides
-rows from an UPDATE** — it returns 200 with an empty array. So `if (error)` never fires and a
-naive test would report PASS whether the policy existed or not. Running it is what turned up the
+**Three accounts, discovered by role, never by name.** The owner, a `role='payroll'` officer and
+an outsider holding neither role, all read out of `erp_users`. "blen sounds like payroll" is not a
+fact, and a case built on it tests whatever that account happens to be today. With no payroll
+account it bails **exit 2** rather than running: the remaining cases would pass against a policy
+that granted payroll nothing, which is indistinguishable from a green run.
+
+**Every negative case asserts twice, and that is the point.** PostgREST does not error when RLS
+hides rows from an UPDATE — it returns 200 with an empty array. So `if (error)` never fires and a
+naive test reports PASS whether the policy exists or not. Running it is what turned up the
 silent-write bug in the adapter.
+
+**A refusal has two shapes, and they are not interchangeable.** A `USING` clause *hides* the row:
+200 + `[]`, no error. A `WITH CHECK` violation is an outright **42501**. `pr_items` refuses the
+first way and `pr_periods` the second — both visible in a single run. Asserting "zero rows" against
+a `WITH CHECK` policy reports FAIL against a policy that works perfectly. Assert that the value on
+disk did not move; that is the only check true for both.
+
+**The status cases are a sequence, not a set.** Each clause of the `pr_periods` policy needs a
+different starting state, so the test walks the period once around `draft → published → locked` and
+puts it back. Two consequences worth knowing before editing it: an owner step exists purely to set
+up the payroll-publish case (publishing from `published` would satisfy the *unchanged* clause and
+pass against a policy with no payroll rule at all), and cleanup is a **net** rather than
+bookkeeping — it re-reads the period and repairs whatever moved, so an assertion throwing mid-way
+cannot leave a production payroll week sitting in `draft`.
+
+**What it cannot see.** It proves the *database* separates the tiers. It says nothing about whether
+the accounts are separable at *login* — if every non-owner shares one password, the payroll
+officer's rights belong to everyone who knows it, and this test still passes.
 
 ## Adding tests
 
