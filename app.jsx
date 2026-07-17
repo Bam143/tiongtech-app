@@ -476,11 +476,11 @@ async function _supaBootstrap() {
   out.payroll = [];
   return out;
 }
-// Map an ERP client record to the clients table. Mirrors api.php's create_client /
-// update_client: the same 16 columns, and the same empty-string rules. Anything else the
-// form carries (olt / pon / napPort) isn't a column, and balance / billing_status /
-// renewal_note / bill_date / due_date / active_profile are owned by other actions — writing
-// them here would wipe them on every save.
+// Map an ERP client record to the clients table (PESOWiFi rows too — those are just clients
+// whose area starts with PESOWIFI, saved through these same actions). Mirrors api.php's
+// create_client / update_client: the same columns, and the same empty-string rules. olt/pon
+// aren't columns, and balance / billing_status / renewal_note / bill_date / due_date /
+// active_profile are owned by other actions — writing them here would wipe them on every save.
 const _cTxt = (v) => (v === undefined || v === null ? null : v);   // keeps "" as "" like api.php, so names never render as "null"
 const _cNum = (v) => { const n = Number(v); return v === "" || v === null || v === undefined || !isFinite(n) ? null : n; };
 function _clientPayload(c) {
@@ -489,8 +489,16 @@ function _clientPayload(c) {
     address: _cTxt(c.address), coordinates: _cTxt(c.coordinates), area: _cTxt(c.area),
     phone: _cTxt(c.phone), email: _cTxt(c.email),
     subscription_date: c.subscription_date ? c.subscription_date : null, // "" is not a valid date in Postgres
-    profile: _cTxt(c.profile), mrc: _cNum(c.mrc), port: _cTxt(c.port), nap: _cTxt(c.nap),
-    url_link: _cTxt(c.url_link), notes: _cTxt(c.notes), nap_port_id: _cNum(c.nap_port_id),
+    profile: _cTxt(c.profile), mrc: _cNum(c.mrc), nap: _cTxt(c.nap),
+    // `napPort` is the UI's name for the port column: loadLiveData renames it on the way in
+    // (napPort: c.port), and every form round-trips that spelling, so read it back the same
+    // way. Reading c.port here found undefined on every save and nulled a live column.
+    port: _cTxt(c.napPort !== undefined ? c.napPort : c.port),
+    url_link: _cTxt(c.url_link), notes: _cTxt(c.notes),
+    // nap_port_id has no UI source at all — loadLiveData never maps it in, so no form can
+    // carry it. Send it only if a caller genuinely has one; otherwise leave the column out
+    // of the write entirely, so an edit can't null the link it doesn't know about.
+    ...(c.nap_port_id !== undefined ? { nap_port_id: _cNum(c.nap_port_id) } : {}),
   };
 }
 // Money: the payments (income) and expenses tables. Same rules as _clientPayload — only
