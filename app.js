@@ -1484,6 +1484,23 @@ const _stamp = () => {
     p = n => String(n).padStart(2, "0");
   return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
 };
+// Job orders. Unlike clients / payments / renewals, the mapping already exists: every
+// caller sends _jobPayload(order), which is exactly the 16 job_orders columns with the SLA
+// badge split back out across sla24 / followup / warning, and blanks already nulled. That
+// object is what api.php receives and writes, so it passes straight through — re-deriving
+// it here would fork the mapping and the two paths would drift apart.
+// The whitelist only guards the column set. jo_id keys the row: the app allocates the
+// number, so it is sent on insert but is the WHERE on update, never part of the SET.
+const _JO_COLS = ["customer", "job_type", "tech", "issue", "solution", "start_date", "start_time", "finish_date", "finish_time", "status", "resolution_hours", "sla24", "sla48", "warning", "followup"];
+const _joRow = (p, withId) => {
+  const out = withId ? {
+    jo_id: p.jo_id
+  } : {};
+  _JO_COLS.forEach(c => {
+    if (p[c] !== undefined) out[c] = p[c];
+  });
+  return out;
+};
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1774,6 +1791,55 @@ const API = (action, payload) => {
           return {
             ok: true,
             log: data || []
+          };
+        }
+        if (action === "create_job") {
+          if (!payload || !payload.jo_id) return {
+            ok: false,
+            error: "Missing jo_id"
+          };
+          const {
+            error
+          } = await sb.from("job_orders").insert(_joRow(payload, true));
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true,
+            jo_id: payload.jo_id
+          }; // the app allocated it; echo it back like api.php
+        }
+        if (action === "save_job") {
+          if (!payload || !payload.jo_id) return {
+            ok: false,
+            error: "Missing jo_id"
+          };
+          const {
+            error
+          } = await sb.from("job_orders").update(_joRow(payload, false)).eq("jo_id", payload.jo_id);
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true
+          };
+        }
+        if (action === "delete_job") {
+          if (!payload || !payload.jo_id) return {
+            ok: false,
+            error: "Missing jo_id"
+          };
+          const {
+            error
+          } = await sb.from("job_orders").delete().eq("jo_id", payload.jo_id);
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true
           };
         }
         return {
