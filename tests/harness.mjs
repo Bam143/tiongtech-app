@@ -77,15 +77,35 @@ export function loadApp(appJsPath) {
 // {data,error}. Every awaited call is recorded so a test can assert what was written.
 // Tables are keyed by name — the save reads pr_items, pr_employees and pr_schedules, so a
 // single-table fake would hand pr_items rows back to a pr_employees select and quietly pass.
-export function makeFakeSB(tables = {}) {
+// opts.blockWrites simulates an RLS USING policy: the row is invisible to the write, so
+// PostgREST answers 200 with an EMPTY ARRAY and no error. That is the real behaviour the live
+// RLS test observed against the actual database, and it is the whole reason the adapter has to
+// ask for the affected rows back — `error` stays null on a write that never happened.
+//   true            block every write
+//   "pr_items"      block writes to that table
+//   (table, n) => … block by table and 1-based write number (n=2 blocks the second write)
+export function makeFakeSB(tables = {}, opts = {}) {
   const db = Array.isArray(tables) ? { pr_items: tables } : tables;
   const calls = [];
+  const WRITES = ["update", "insert", "upsert", "delete"];
+  let writeNo = 0, nextId = 9000;
+  const blocked = (table, n) => {
+    const b = opts.blockWrites;
+    if (!b) return false;
+    if (b === true) return true;
+    if (typeof b === "string") return b === table;
+    if (typeof b === "function") return !!b(table, n);
+    return false;
+  };
   return {
     calls,
     from(table) {
       const q = { table, filters: {} };
+      const hits = () => (db[q.table] || []).filter((r) => Object.entries(q.filters).every(([k, v]) => r[k] === v));
       const b = {
-        select(cols) { q.op = "select"; q.cols = cols; return b; },
+        // select() after a write is PostgREST's return=representation, NOT a read — it must not
+        // overwrite the op. Without a select(), a write resolves data:null, same as the real one.
+        select(cols) { q.cols = cols; if (q.op) q.returning = true; else q.op = "select"; return b; },
         eq(col, val) { q.filters[col] = val; return b; },
         update(row) { q.op = "update"; q.row = row; return b; },
         insert(row) { q.op = "insert"; q.row = row; return b; },
@@ -94,11 +114,18 @@ export function makeFakeSB(tables = {}) {
         // PostgREST semantics: one row or null, and no error when there is no match.
         maybeSingle() { q.one = true; return b; },
         then(res, rej) {
-          calls.push({ table: q.table, op: q.op, row: q.row, filters: { ...q.filters } });
+          calls.push({ table: q.table, op: q.op, row: q.row, filters: { ...q.filters }, cols: q.cols });
           let data = null;
           if (q.op === "select") {
-            const hits = (db[q.table] || []).filter((r) => Object.entries(q.filters).every(([k, v]) => r[k] === v));
-            data = q.one ? (hits[0] || null) : hits;
+            const h = hits();
+            data = q.one ? (h[0] || null) : h;
+          } else if (WRITES.includes(q.op)) {
+            const n = ++writeNo;
+            if (q.returning) {
+              data = blocked(q.table, n) ? []                                   // <- the silent refusal
+                : q.op === "insert" ? [{ id: nextId++, ...q.row }]
+                : hits().map((r) => ({ ...r, ...q.row }));
+            }
           }
           return Promise.resolve({ data, error: null }).then(res, rej);
         },

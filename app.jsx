@@ -821,6 +821,18 @@ const _prSaveCalc = (it, db, emp, schedById) => {
   });
   return { gross: c.gross, net: c.net };
 };
+// A save is a row-at-a-time loop with nothing transactional around it, so "the save failed" and
+// "nothing was written" are two different claims and only one of them is usually true. An
+// officer told a save stopped needs to know which line stopped it and whether the lines before
+// it already landed — "nothing was saved" would send them re-entering work that is already in
+// the database, and on payroll that is how a week gets paid twice.
+const _prSaveStopped = (eid, empById, written, why) => {
+  const who = (empById[eid] && empById[eid].full_name) || ("employee #" + eid);
+  const before = written === 0 ? " Nothing was saved."
+    : written === 1 ? " The line before it was already saved, so this week is now part-saved."
+    : " The " + written + " lines before it were already saved, so this week is now part-saved.";
+  return { ok: false, error: "Save stopped at " + who + " — " + why + before };
+};
 async function _supaSaveItems(payload) {
   const sb = window.SB;
   const periodId = Number((payload && payload.period_id) || 0);
@@ -848,7 +860,7 @@ async function _supaSaveItems(payload) {
   // Sunday duty for a row with no snapshot of its own falls back to the employee's schedule,
   // which is where the grid gets it (app.jsx:4520). Both tables are tiny.
   const [emps, scheds] = await Promise.all([
-    sb.from("pr_employees").select("id,schedule_id"),
+    sb.from("pr_employees").select("id,schedule_id,full_name"),   // full_name only so a refused row can name itself
     sb.from("pr_schedules").select("id,sunday_is_restday"),
   ]);
   if (emps.error) return { ok: false, error: emps.error.message };
@@ -864,6 +876,7 @@ async function _supaSaveItems(payload) {
   // could, so a failure halfway leaves the week half-written either way — and in that case the
   // officer needs to know WHICH row stopped it, which a parallel fan-out muddies. A week is one
   // row per employee, so this stays in the dozens of round trips.
+  let written = 0;
   for (const it of items) {
     const eid = Number(it.employee_id);
     if (!eid) continue;
@@ -872,10 +885,19 @@ async function _supaSaveItems(payload) {
     Object.assign(row, _prSaveCalc(it, db, empById[eid], schedById));
     row.updated_at = stamp;
     const id = db.id;
-    const { error } = id != null
-      ? await sb.from("pr_items").update(row).eq("id", id)
-      : await sb.from("pr_items").insert({ ...row, period_id: periodId, employee_id: eid });
-    if (error) return { ok: false, error: error.message };
+    // .select() is what turns a silent refusal into a reportable one. Postgres does not error
+    // when an RLS USING policy hides a row from an UPDATE — PostgREST answers 200 with an empty
+    // array — so `error` stays null and a write that never happened looks exactly like a write
+    // that did. Asking for the affected rows back is the only way to tell the two apart.
+    const { data: hit, error } = id != null
+      ? await sb.from("pr_items").update(row).eq("id", id).select("id")
+      : await sb.from("pr_items").insert({ ...row, period_id: periodId, employee_id: eid }).select("id");
+    if (error) return _prSaveStopped(eid, empById, written, error.message);
+    if (!hit || !hit.length) {
+      return _prSaveStopped(eid, empById, written,
+        "the database refused the write. The week may be locked, or your account may not have permission to edit it.");
+    }
+    written++;
   }
   return { ok: true };
 }
@@ -909,8 +931,13 @@ async function _supaUnlock(payload) {
   // Refusing a week that isn't locked is the point, not a formality: writing 'published'
   // blindly would PUBLISH a draft — notifying employees for a week nobody has finished.
   if (per.status !== "locked") return { ok: false, error: "This payroll period is not locked." };
-  const { error } = await sb.from("pr_periods").update({ status: "published" }).eq("id", periodId);
+  // Same reason as the save loop: an RLS USING policy hides the row rather than raising, so
+  // without asking for the affected rows back a refused unlock would report "Week unlocked"
+  // while the week stayed locked. That is the exact policy about to land on this table, so this
+  // is the one call site where the blind spot is not hypothetical.
+  const { data: hit, error } = await sb.from("pr_periods").update({ status: "published" }).eq("id", periodId).select("id");
   if (error) return { ok: false, error: error.message };
+  if (!hit || !hit.length) return { ok: false, error: "Unlock was blocked — the week is still locked. Your account may not have permission to unlock it." };
   return { ok: true };
 }
 const API = (action, payload) => {

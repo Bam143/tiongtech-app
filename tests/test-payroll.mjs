@@ -26,10 +26,10 @@ const savePayload = (periodId, items) => ({ period_id: periodId, items, keep_ids
 // `rows` is pr_items unless a test needs other tables too, in which case it passes a table map.
 // Every save now checks the period's lock state before anything else, so the fake gets an
 // unlocked week by default — the lock tests below override pr_periods to say otherwise.
-const run = async (rows, payload) => {
+const run = async (rows, payload, opts) => {
   const tables = Array.isArray(rows) ? { pr_items: rows } : { ...rows };
   if (!tables.pr_periods) tables.pr_periods = [{ id: 3, status: "draft" }];
-  const sb = makeFakeSB(tables);
+  const sb = makeFakeSB(tables, opts);
   window.SB = sb;
   const res = await API("pr_save_items", payload);
   return { sb, res };
@@ -357,11 +357,11 @@ await t.test("a published (not locked) period still saves — only 'locked' free
 // currently lets any signed-in user write pr_periods, so these tests prove the app behaves —
 // not that anyone is actually prevented. Real enforcement is an RLS policy on pr_periods.
 
-const unlock = async (periods, payload, role) => {
+const unlock = async (periods, payload, role, opts) => {
   const was = getME();
   if (role !== undefined) setME({ ...was, role });
   try {
-    const sb = makeFakeSB({ pr_periods: periods });
+    const sb = makeFakeSB({ pr_periods: periods }, opts);
     window.SB = sb;
     const res = await API("pr_unlock", payload);
     return { sb, res };
@@ -439,6 +439,104 @@ await t.test("an unlocked week can be saved again — the freeze lifts", async (
   );
   t.eq(res.ok, true, "and now the save goes through");
   t.eq(writes(sb).length, 1, "one row written");
+});
+
+// ---- a blocked write must never report success ----
+// An RLS USING policy hides the row instead of raising: PostgREST answers 200 with an empty
+// array and no error. The live RLS test confirmed that is exactly what the real database does.
+// So `if (error)` alone would flash "Saved ✓" over a write that never landed.
+
+await t.test("a silently blocked UPDATE fails the save — no false 'Saved'", async () => {
+  const { res } = await run(
+    { pr_items: [{ id: 77, employee_id: 5, period_id: 3 }], pr_employees: [{ id: 5, full_name: "Ana Cruz" }] },
+    savePayload(3, [gridItem()]),
+    { blockWrites: "pr_items" },
+  );
+  t.eq(res.ok, false, "the save reports failure");
+  t.ok(/Ana Cruz/.test(res.error), `names the row that stopped it, got: ${res.error}`);
+  t.ok(/refused|permission|locked/i.test(res.error), "explains why it might have been refused");
+});
+
+await t.test("a silently blocked INSERT fails the save too", async () => {
+  const { res } = await run(
+    { pr_items: [], pr_employees: [{ id: 9, full_name: "Ben Reyes" }] },
+    savePayload(3, [gridItem({ employee_id: 9 })]),
+    { blockWrites: "pr_items" },
+  );
+  t.eq(res.ok, false, "the save reports failure");
+  t.ok(/Ben Reyes/.test(res.error), `names the row, got: ${res.error}`);
+});
+
+await t.test("the writes ask for the affected rows back", async () => {
+  // The mechanism, pinned: without a select() on the write there is nothing to count, and the
+  // block is undetectable no matter what the caller checks.
+  const { sb } = await run([{ id: 77, employee_id: 5, period_id: 3 }], savePayload(3, [gridItem()]));
+  t.eq(writes(sb)[0].cols, "id", "the update selects the affected rows back");
+  const { sb: sb2 } = await run([], savePayload(3, [gridItem({ employee_id: 9 })]));
+  t.eq(writes(sb2)[0].cols, "id", "so does the insert");
+});
+
+await t.test("a block on the FIRST row says nothing was saved", async () => {
+  const { res } = await run(
+    { pr_items: [], pr_employees: [{ id: 5, full_name: "Ana Cruz" }, { id: 9, full_name: "Ben Reyes" }] },
+    savePayload(3, [gridItem({ employee_id: 5 }), gridItem({ employee_id: 9 })]),
+    { blockWrites: (table, n) => n === 1 },
+  );
+  t.eq(res.ok, false, "refused");
+  t.ok(/Ana Cruz/.test(res.error), "names the first row");
+  t.ok(/Nothing was saved/.test(res.error), `and says so, got: ${res.error}`);
+});
+
+await t.test("a block MID-loop admits the week is part-saved", async () => {
+  // There is no transaction around the loop, so the rows before the block really are in the
+  // database. Telling the officer "nothing was saved" would send them re-entering work that is
+  // already there — on payroll that is how a week gets paid twice.
+  const { sb, res } = await run(
+    { pr_items: [], pr_employees: [{ id: 5, full_name: "Ana Cruz" }, { id: 9, full_name: "Ben Reyes" }, { id: 12, full_name: "Cy Dizon" }] },
+    savePayload(3, [gridItem({ employee_id: 5 }), gridItem({ employee_id: 9 }), gridItem({ employee_id: 12 })]),
+    { blockWrites: (table, n) => n === 2 },
+  );
+  t.eq(res.ok, false, "refused");
+  t.ok(/Ben Reyes/.test(res.error), `names the row that stopped it, got: ${res.error}`);
+  t.ok(/part-saved/.test(res.error), "admits the week is part-saved");
+  t.ok(!/Nothing was saved/.test(res.error), "does NOT claim nothing was saved");
+  t.eq(writes(sb).length, 2, "and it stopped there — the third row was never attempted");
+});
+
+await t.test("a row with no full_name still names itself", async () => {
+  const { res } = await run(
+    { pr_items: [], pr_employees: [] },
+    savePayload(3, [gridItem({ employee_id: 9 })]),
+    { blockWrites: "pr_items" },
+  );
+  t.ok(/employee #9/.test(res.error), `falls back to the id, got: ${res.error}`);
+});
+
+await t.test("a normal save is unaffected — still ok:true, all rows written", async () => {
+  // The regression that matters: the new check must not turn working saves into failures.
+  const { sb, res } = await run(
+    { pr_items: [{ id: 77, employee_id: 5, period_id: 3 }] },
+    savePayload(3, [gridItem({ employee_id: 5 }), gridItem({ employee_id: 9 })]),
+  );
+  t.eq(res.ok, true, "still succeeds");
+  t.eq(res.error, undefined, "no error");
+  t.eq(writes(sb).length, 2, "both rows written");
+  t.eq(writes(sb)[0].op, "update", "update still an update");
+  t.eq(writes(sb)[1].op, "insert", "insert still an insert");
+  t.eq(writes(sb)[0].row.gross, 3966, "gross still computed and stored");
+});
+
+await t.test("a silently blocked UNLOCK reports failure, not 'Week unlocked'", async () => {
+  // Not hypothetical: the owner-only policy about to land on pr_periods is exactly the shape
+  // that would hide this row from a non-owner's update.
+  const { res } = await unlock([{ id: 3, status: "locked" }], { id: 3 }, "owner", { blockWrites: "pr_periods" });
+  t.eq(res.ok, false, "reports failure");
+  t.ok(/still locked/.test(res.error), `says the week is still locked, got: ${res.error}`);
+});
+
+await t.test("a normal unlock is unaffected — still ok:true", async () => {
+  const { res } = await unlock([{ id: 3, status: "locked" }], { id: 3 }, "owner");
+  t.eq(res.ok, true, "still succeeds");
 });
 
 // ---- the other payroll writes must still fall through ----
