@@ -1329,6 +1329,28 @@ function _napPortId(napName, portNo) {
   const row = (napPorts || []).find(p => String(p.nap_device_id) === String(dev.id) && String(p.port_number) === no);
   return row ? row.id : undefined;
 }
+// Display-only: what NapCascade should show when an edit form opens on an existing row.
+// olt/pon aren't client columns, so a reopened form had nothing to select in the first two
+// dropdowns -- and since the NAP list is filtered by the chosen OLT, an unset OLT blanked the
+// NAP dropdown too, even on a row that has one. Only NAP Port, whose options come off the
+// device the NAP name names, survived.
+// The row records its NAP by name, and that name is exactly what _napPortId() walks through
+// napPorts to reach clients.nap_port_id -- so the device it names IS the one the saved link
+// points at, and loadLiveData already resolved that device's pon_port -> olt into the olt/pon
+// names below. The port number adds nothing to the walk: it picks a port *within* the device,
+// not the device, so a row whose port is blank still places its OLT/PON.
+// Hands back olt/pon only -- the two fields _clientPayload never writes -- so opening a form
+// cannot change what saving it sends. It deliberately does not carry nap_port_id onto the
+// form: _napPortIdPatch() lets an explicit id beat the lookup, so a seeded one would outvote
+// the NAP the user picks next and save the old link.
+function _napChainOpen(c) {
+  const name = String(c.nap == null ? "" : c.nap).trim();
+  const dev = name ? (napDevices || []).find(n => String(n.name || "").trim() === name) : null;
+  return dev ? {
+    olt: dev.olt || "",
+    pon: dev.pon || ""
+  } : {};
+}
 // Decide nap_port_id for a save. `port` and nap_port_id are two records of the same fact, so
 // they move together — except when we genuinely cannot tell, where leaving the column out of
 // the write beats guessing at it.
@@ -19285,10 +19307,13 @@ function ClientsView({
     setEditing(null);
     setTimeout(() => setFlash(""), 3000);
   };
+  // _napChainOpen last: it fills the olt/pon the row cannot carry, so the cascade opens on the
+  // saved chain instead of "Select...". Display only — neither field reaches a save.
   const startEdit = c => {
     setForm({
       ...blankForm,
-      ...c
+      ...c,
+      ..._napChainOpen(c)
     });
     setEditing(c);
     setShowForm(true);
