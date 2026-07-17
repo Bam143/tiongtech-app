@@ -1309,6 +1309,157 @@ function _clientPayload(c) {
     nap_port_id: _cNum(c.nap_port_id)
   };
 }
+// Money: the payments (income) and expenses tables. Same rules as _clientPayload — only
+// the columns api.php's create_/update_ actions write, id excluded (it selects the row, it
+// isn't a value), blank dates NULL, blank text kept as "".
+// The MoneyModal form carries six fields per kind, and those are the six written here.
+// payments.type / payments.receipt / created_by are not on the form: writing them would
+// null them out on every edit, so they keep their DB default on insert and are left
+// untouched on update.
+const _pCols = "id,paid_at,account,source,amount,reference,user_name";
+const _eCols = "id,spent_at,supplier,description,amount,invoice,user_name";
+const _cDate = v => {
+  const s = v ? String(v).slice(0, 10) : "";
+  return s || null;
+};
+function _paymentPayload(p) {
+  return {
+    paid_at: _cDate(p.paid_at),
+    account: _cTxt(p.account),
+    source: _cTxt(p.source),
+    amount: _cNum(p.amount),
+    reference: _cTxt(p.reference),
+    user_name: _cTxt(p.user_name)
+  };
+}
+function _expensePayload(e) {
+  return {
+    spent_at: _cDate(e.spent_at),
+    supplier: _cTxt(e.supplier),
+    description: _cTxt(e.description),
+    amount: _cNum(e.amount),
+    invoice: _cTxt(e.invoice),
+    user_name: _cTxt(e.user_name)
+  };
+}
+// Read direction. The tables render `date` / `user`; the edit form reads back `paid_at` /
+// `spent_at`, so both spellings of the date go out — same as api.php's rows.
+const _payRow = r => ({
+  id: r.id,
+  date: _cDate(r.paid_at) || "",
+  paid_at: _cDate(r.paid_at) || "",
+  account: r.account || "",
+  source: r.source || "",
+  amount: r.amount != null ? Number(r.amount) : 0,
+  user: r.user_name || "",
+  reference: r.reference || ""
+});
+const _expRow = r => ({
+  id: r.id,
+  date: _cDate(r.spent_at) || "",
+  spent_at: _cDate(r.spent_at) || "",
+  supplier: r.supplier || "",
+  description: r.description || "",
+  amount: r.amount != null ? Number(r.amount) : 0,
+  user: r.user_name || "",
+  invoice: r.invoice || ""
+});
+const _ym = d => String(d.getFullYear()) + "-" + String(d.getMonth() + 1).padStart(2, "0");
+// PostgREST has no GROUP BY, so every total below is summed here from the full tables.
+// That's also why the lists aren't capped to a "recent" slice the way api.php's SQL can
+// afford to be: the KPIs need every row loaded anyway, so sending them all costs nothing
+// and lets search / Download / the date filter see the whole history.
+async function _supaFinancials() {
+  const sb = window.SB;
+  const pays = (await _supaAll(sb, "payments", _pCols)).map(_payRow);
+  const exps = (await _supaAll(sb, "expenses", _eCols)).map(_expRow);
+  const newestFirst = (a, b) => (b.date || "").localeCompare(a.date || "");
+  pays.sort(newestFirst);
+  exps.sort(newestFirst);
+  const sum = rows => rows.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  const inMonth = (rows, k) => sum(rows.filter(r => (r.date || "").slice(0, 7) === k));
+  const inYear = (rows, y) => sum(rows.filter(r => (r.date || "").slice(0, 4) === y));
+  const now = new Date();
+  const thisK = _ym(now),
+    lastK = _ym(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+  const mLabel = k => new Date(k + "-01T00:00:00").toLocaleString("en-US", {
+    month: "short",
+    year: "numeric"
+  });
+  const collThis = inMonth(pays, thisK),
+    collLast = inMonth(pays, lastK);
+  const expThis = inMonth(exps, thisK),
+    expLast = inMonth(exps, lastK);
+  const yr = String(now.getFullYear());
+  const yIn = inYear(pays, yr),
+    yOut = inYear(exps, yr);
+  const aIn = sum(pays),
+    aOut = sum(exps);
+  // group: [{ [key]: name, amt }] biggest first — feeds the income + expense charts
+  const group = (rows, field, keyName) => {
+    const by = {};
+    rows.forEach(r => {
+      const k = (r[field] || "").trim() || "Other";
+      by[k] = (by[k] || 0) + (Number(r.amount) || 0);
+    });
+    return Object.keys(by).map(k => ({
+      [keyName]: k,
+      amt: by[k]
+    })).sort((a, b) => b.amt - a.amt);
+  };
+  const cashFlow = []; // last 7 months, in ₱ thousands — the chart is labelled "₱ thousands"
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1),
+      k = _ym(d);
+    cashFlow.push({
+      m: d.toLocaleString("en-US", {
+        month: "short"
+      }),
+      inflow: Math.round(inMonth(pays, k) / 1000),
+      outflow: Math.round(inMonth(exps, k) / 1000)
+    });
+  }
+  const months = new Set();
+  pays.concat(exps).forEach(r => {
+    const k = (r.date || "").slice(0, 7);
+    if (k) months.add(k);
+  });
+  return {
+    ok: true,
+    recentPayments: pays,
+    recentExpenses: exps,
+    incomeBySource: group(pays, "source", "src"),
+    expensesByCategory: group(exps, "supplier", "cat"),
+    cashFlow,
+    kpi: {
+      mtdIncome: collThis,
+      paymentCount: pays.length,
+      expenseCount: exps.length
+    },
+    monthKpi: {
+      collThis,
+      collLast,
+      expThis,
+      expLast,
+      netThis: collThis - expThis,
+      netLast: collLast - expLast,
+      thisLabel: mLabel(thisK),
+      lastLabel: mLabel(lastK)
+    },
+    year: {
+      income: yIn,
+      expense: yOut,
+      net: yIn - yOut,
+      label: now.getFullYear()
+    },
+    allTime: {
+      income: aIn,
+      expense: aOut,
+      net: aIn - aOut
+    },
+    financeMonths: Array.from(months).sort().reverse()
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1389,6 +1540,84 @@ const API = (action, payload) => {
           const {
             error
           } = await sb.from("clients").delete().eq("id", payload.id);
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true
+          };
+        }
+        if (action === "financials") {
+          return await _supaFinancials();
+        }
+        if (action === "fin_range") {
+          const inc = (payload && payload.kind || "income") === "income";
+          const col = inc ? "paid_at" : "spent_at";
+          let q = sb.from(inc ? "payments" : "expenses").select(inc ? _pCols : _eCols);
+          if (payload && payload.from) q = q.gte(col, payload.from);
+          // "to" is inclusive: filter to < the next day so it also holds if the column is a
+          // timestamp, where lte("2026-07-17") would drop everything logged during that day.
+          if (payload && payload.to) {
+            const d = new Date(payload.to + "T00:00:00");
+            d.setDate(d.getDate() + 1);
+            q = q.lt(col, d.toISOString().slice(0, 10));
+          }
+          const {
+            data,
+            error
+          } = await q.order(col, {
+            ascending: false
+          });
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true,
+            rows: (data || []).map(inc ? _payRow : _expRow)
+          };
+        }
+        if (action === "create_payment" || action === "create_expense") {
+          const inc = action === "create_payment";
+          const {
+            data,
+            error
+          } = await sb.from(inc ? "payments" : "expenses").insert(inc ? _paymentPayload(payload || {}) : _expensePayload(payload || {})).select("id").single();
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true,
+            id: data ? data.id : null
+          };
+        }
+        if (action === "update_payment" || action === "update_expense") {
+          if (!payload || !payload.id) return {
+            ok: false,
+            error: "Missing id"
+          };
+          const inc = action === "update_payment";
+          const {
+            error
+          } = await sb.from(inc ? "payments" : "expenses").update(inc ? _paymentPayload(payload) : _expensePayload(payload)).eq("id", payload.id);
+          if (error) return {
+            ok: false,
+            error: error.message
+          };
+          return {
+            ok: true
+          };
+        }
+        if (action === "delete_payment" || action === "delete_expense") {
+          if (!payload || !payload.id) return {
+            ok: false,
+            error: "Missing id"
+          };
+          const {
+            error
+          } = await sb.from(action === "delete_payment" ? "payments" : "expenses").delete().eq("id", payload.id);
           if (error) return {
             ok: false,
             error: error.message
