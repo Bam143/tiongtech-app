@@ -1,0 +1,15 @@
+# Dependencies — installed with `npm install`, never committed.
+node_modules/
+
+# Scratch builds. NOTE: app.js is deliberately NOT ignored — it is the shipped
+# bundle, index.html loads it directly, and the site breaks if it stops being
+# committed. Only throwaway copies belong here.
+*.tmp.js
+*.mutant.js
+tests/app.baseline.*
+tests/app.committed.*
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.log
