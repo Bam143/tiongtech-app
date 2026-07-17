@@ -662,10 +662,11 @@ const _joRow = (p, withId) => {
   _JO_COLS.forEach((c) => { if (p[c] !== undefined) out[c] = p[c]; });
   return out;
 };
-/* ================= PAYROLL (read-only) =================
+/* ================= PAYROLL =================
    payroll_data mirrors api.php's response exactly: loadPayrollData() (app.jsx:245) and both
-   payroll screens consume that shape unchanged, so anything else here is a UI change. Reads
-   only — every payroll write still falls through to the "not connected" catch-all below.
+   payroll screens consume that shape unchanged, so anything else here is a UI change.
+   payroll_data (read) and pr_save_items (the Save button) are the wired pair; every other
+   payroll write still falls through to the "not connected" catch-all below.
 
    Scope is this function's job, not RLS's. RLS lets any signed-in user read every pr_ table,
    but SalaryPage takes employees[0] as "me" (app.jsx:4761) and turns EVERY item it is handed
@@ -740,6 +741,134 @@ async function _supaPayroll() {
     isOfficer: !!officer, myEmployeeId: myId, notif: { total: notifTotal },
   };
 }
+/* ---- The Save button (pr_save_items) ----
+   api.php is not in this repo, so the contract reproduced here is the one the SCREEN states:
+   saveGrid (app.jsx:4575) is the only caller, and what it sends is all that is known for sure.
+   Three properties of that payload shape this code.
+
+   1. Save sends the WHOLE grid, every time — one item per employee on screen, not just the
+      edited row. So this is always a bulk save, and "no rows changed" is a normal outcome.
+   2. It sends NO pr_items.id. The grid HAS the id (as _id, app.jsx:4540) and withholds it, so
+      (period_id, employee_id) is the only key an item carries and insert-vs-update has to be
+      decided here: read the period's rows once, match on employee_id, update those and insert
+      the rest. This is an upsert in behaviour but not in SQL — a real .upsert() would need a
+      unique index on (period_id, employee_id), and the confirmed schema only promises id as a
+      key. Resolving the ids by hand costs a read and assumes nothing about the constraint.
+   3. It sends 13 columns. pr_items has 41. The ones it withholds belong to other flows —
+      ded_loan/ded_uniform/ded_gov/ded_notes to pr_apply_plans, status/approved_at/
+      employee_remark/officer_reply to approval, printed/print_requested to printing, and the
+      snap_* trio to whatever snapshots a week. A Save that wrote those would quietly undo the
+      flow that owns them, so the list below is a whitelist, not a shorthand. Save must never
+      approve a line it is only meant to store.
+
+   gross/net are the one deliberate exception: not sent, but written anyway, because they are
+   denormalised money and nothing else in the Supabase path recomputes them — left alone they
+   would sit stale for any report reading the columns directly. The screen never notices (it
+   renders prCalc of the live row, app.jsx:4573), which is exactly why a stale column could rot
+   unseen. They are computed by CALLING prCalc (app.jsx:3893) rather than restating it, so the
+   stored value cannot drift from the displayed one.
+   That call needs four inputs Save does not send: ded_loan/ded_uniform/ded_gov (pr_apply_plans
+   owns them) and snap_sunday_rest. The grid reads those off the DB row and the employee's
+   schedule (app.jsx:4520/4530/4537), so _prSaveCalc reads them the same way — from the row
+   being updated, falling back to the employee's schedule for Sunday duty. Skipping that would
+   not be a rounding error: net would silently omit every installment deduction, and a
+   schedule-B employee (no Sunday rest day) would bank a Sunday that the screen shows as ₱0.
+
+   keep_ids — the employee_ids still on screen — is received and deliberately NOT acted on.
+   Its only plausible meaning is "delete this period's rows for anyone not in this list":
+   removeRow (app.jsx:4572) drops a row from the grid with no API call of its own, and Save
+   reloads (app.jsx:4581) into an effect that rebuilds every employee holding a row for the
+   period (app.jsx:4516), so a save is the only thing that could persist a removal. But that
+   is an inference about a DELETE, and the guards are exactly the part that can't be inferred:
+   whether api.php refuses to drop an approved, locked or printed line is unknowable from here,
+   and a blind delete would erase an approved payslip on the next Save. So removal does not
+   stick yet — the row returns on reload. That is a visible, recoverable wrong; deleting a pay
+   line api.php would have kept is not. Deletion lands as its own change, once the rule is known. */
+const _PR_SAVE_NUM = ["per_day", "att_present", "att_absent", "att_leave", "att_halfday",
+  "ot_hours", "sun_days", "add_incentive", "ded_manual"];
+// prNum (app.jsx:3878) is every number the grid renders, so a value has to land in the column
+// the same way the screen will read it back out. It sits ~3000 lines below this one, which is
+// fine: nothing here runs until API() is called and the whole script has evaluated. prCalc
+// below is reached across the same gap for the same reason — one rule, one copy.
+const _prSaveRow = (it) => {
+  const out = {};
+  _PR_SAVE_NUM.forEach((c) => { if (it[c] !== undefined) out[c] = prNum(it[c]); });
+  // leave_type_id arrives as a literal null (app.jsx:4579): null is the VALUE, not a missing
+  // field. prNum would turn it into 0 and point the row at leave type #0.
+  if (it.leave_type_id !== undefined) out.leave_type_id = it.leave_type_id == null ? null : Number(it.leave_type_id);
+  // The grid guarantees both of these are strings (app.jsx:4538/4539); the null check is for a
+  // caller that isn't the grid, so a text column never takes the string "null".
+  if (it.ded_manual_note !== undefined) out.ded_manual_note = it.ded_manual_note == null ? "" : String(it.ded_manual_note);
+  if (it.remarks !== undefined) out.remarks = it.remarks == null ? "" : String(it.remarks);
+  return out;
+};
+// gross/net exactly as the screen shows them: rebuild the row prCalc would have seen, then let
+// prCalc do the arithmetic. `db` is the pr_items row being updated ({} for a draft, which is
+// what the grid does too — app.jsx:4537 defaults a draft's deductions to 0).
+const _prSaveCalc = (it, db, emp, schedById) => {
+  const sched = (emp && schedById[Number(emp.schedule_id)]) || {};
+  // Same precedence as the grid (app.jsx:4530) and prSundayRest (app.jsx:3888): the row's own
+  // snapshot wins, else the employee's schedule, else 1 (has Sunday duty).
+  const sundayRest = db.snap_sunday_rest != null ? db.snap_sunday_rest
+    : (sched.sunday_is_restday != null ? sched.sunday_is_restday : 1);
+  const c = prCalc({
+    per_day: it.per_day, att_present: it.att_present, att_halfday: it.att_halfday,
+    att_leave: it.att_leave, leave_paid: db.leave_paid,
+    ot_hours: it.ot_hours, sun_days: it.sun_days, add_incentive: it.add_incentive,
+    ded_manual: it.ded_manual,
+    ded_loan: db.ded_loan, ded_uniform: db.ded_uniform, ded_gov: db.ded_gov,
+    snap_sunday_rest: sundayRest,   // already resolved, so prSundayRest takes it as-is
+  });
+  return { gross: c.gross, net: c.net };
+};
+async function _supaSaveItems(payload) {
+  const sb = window.SB;
+  const periodId = Number((payload && payload.period_id) || 0);
+  if (!periodId) return { ok: false, error: "Missing period_id" };
+  const items = (payload && payload.items) || [];
+  if (!items.length) return { ok: true };
+  // This read does double duty: it resolves the ids Save doesn't send, and it supplies the
+  // prCalc inputs Save doesn't send either (the deductions pr_apply_plans owns, and the
+  // Sunday-rest snapshot).
+  const { data: existing, error: readErr } = await sb.from("pr_items")
+    .select("id,employee_id,leave_paid,ded_loan,ded_uniform,ded_gov,snap_sunday_rest").eq("period_id", periodId);
+  if (readErr) return { ok: false, error: readErr.message };
+  const dbByEmp = {};
+  (existing || []).forEach((r) => { dbByEmp[Number(r.employee_id)] = r; });
+  // Sunday duty for a row with no snapshot of its own falls back to the employee's schedule,
+  // which is where the grid gets it (app.jsx:4520). Both tables are tiny.
+  const [emps, scheds] = await Promise.all([
+    sb.from("pr_employees").select("id,schedule_id"),
+    sb.from("pr_schedules").select("id,sunday_is_restday"),
+  ]);
+  if (emps.error) return { ok: false, error: emps.error.message };
+  if (scheds.error) return { ok: false, error: scheds.error.message };
+  const empById = {}, schedById = {};
+  (emps.data || []).forEach((e) => { empById[Number(e.id)] = e; });
+  (scheds.data || []).forEach((s) => { schedById[Number(s.id)] = s; });
+  // updated_at is timestamptz, so it takes a real UTC instant. _stamp() is the repo's
+  // display-string helper (local time, no zone) — Postgres would read that as UTC and land the
+  // row 8 hours off in PH.
+  const stamp = new Date().toISOString();
+  // Sequential on purpose. Nothing here spans a transaction the way api.php's single request
+  // could, so a failure halfway leaves the week half-written either way — and in that case the
+  // officer needs to know WHICH row stopped it, which a parallel fan-out muddies. A week is one
+  // row per employee, so this stays in the dozens of round trips.
+  for (const it of items) {
+    const eid = Number(it.employee_id);
+    if (!eid) continue;
+    const db = dbByEmp[eid] || {};
+    const row = _prSaveRow(it);
+    Object.assign(row, _prSaveCalc(it, db, empById[eid], schedById));
+    row.updated_at = stamp;
+    const id = db.id;
+    const { error } = id != null
+      ? await sb.from("pr_items").update(row).eq("id", id)
+      : await sb.from("pr_items").insert({ ...row, period_id: periodId, employee_id: eid });
+    if (error) return { ok: false, error: error.message };
+  }
+  return { ok: true };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -754,7 +883,9 @@ const API = (action, payload) => {
         }
         if (action === "logout") { await sb.auth.signOut(); return { ok: true }; }
         if (action === "bootstrap") { return await _supaBootstrap(); }
-        if (action === "payroll_data") { return await _supaPayroll(); }   // read-only; every pr_* write still falls through
+        if (action === "payroll_data") { return await _supaPayroll(); }
+        // The one wired payroll write. Every other pr_* action still falls through below.
+        if (action === "pr_save_items") { return await _supaSaveItems(payload); }
         if (action === "create_client") {
           const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
           if (error) return { ok: false, error: error.message };
