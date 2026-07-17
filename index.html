@@ -15,12 +15,13 @@
 <div id="boot"><div><div class="ring"></div>Loading TIONGTECH (Supabase)…</div></div>
 <div id="root"></div>
 <script>
-  // Your Supabase project. The anon key below is safe to be public
-  // (your data is protected by Row Level Security). Never put the
-  // service_role key or database password here.
+  // Your Supabase project. The publishable key below is meant to be public — it ships to every
+  // browser that loads this page and is committed to the repo. Row Level Security is what
+  // protects the data, not the secrecy of this key.
+  // Never put the secret key (sb_secret_...) or the database password here.
   window.SB = window.supabase.createClient(
     "https://mgwrjynhbebjtneuahmq.supabase.co",
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1nd3JqeW5oYmVianRuZXVhaG1xIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQxMTExNzMsImV4cCI6MjA5OTY4NzE3M30.bBG_M-S0DKpUUEQ_dLP3DwfScX54pOlhxdirQworJbc"
+    "sb_publishable_Pkf-EbuCxP4ETf5HpfNg9w_3GgUECga"
   );
 </script>
 <script src="app.js"></script>
