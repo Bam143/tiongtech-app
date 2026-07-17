@@ -406,6 +406,10 @@ let napDevices = [
   { name: "SI-NAP2", olt: "SAN ISIDRO HW", pon: "PON 1", total_ports: 8, used: 4, coordinates: "8.4488, 125.7958", description: "San Isidro Plaza" },
   { name: "SR-NAP1", olt: "SAN ISIDRO HW", pon: "PON 2", total_ports: 16, used: 5, coordinates: "8.4450, 125.7740", description: "San Roque proper" },
 ];
+// The physical nap_port rows { id, nap_device_id, port_number }. The bootstrap already
+// loaded these to count ports per device and then dropped them; they're kept now because
+// they are the only place the clients.nap_port_id FK can be looked up — see _napPortId().
+let napPorts = [];
 
 /* ------------------------------------------------------------------ */
 /*  LIVE DATA  —  loads real records from api.php (bootstrap).         */
@@ -495,11 +499,31 @@ function _clientPayload(c) {
     // way. Reading c.port here found undefined on every save and nulled a live column.
     port: _cTxt(c.napPort !== undefined ? c.napPort : c.port),
     url_link: _cTxt(c.url_link), notes: _cTxt(c.notes),
-    // nap_port_id has no UI source at all — loadLiveData never maps it in, so no form can
-    // carry it. Send it only if a caller genuinely has one; otherwise leave the column out
-    // of the write entirely, so an edit can't null the link it doesn't know about.
-    ...(c.nap_port_id !== undefined ? { nap_port_id: _cNum(c.nap_port_id) } : {}),
+    ..._napPortIdPatch(c),
   };
+}
+// clients.nap_port_id is the FK to the physical nap_port row. No form carries it: NapCascade
+// picks a NAP device by *name* and a port by *number* (its options are counted off
+// total_ports, so they're plain numbers, not row ids), and the PESOWiFi form takes both as
+// free text. So derive the id from the pair the forms do carry. Undefined = can't tell.
+function _napPortId(napName, portNo) {
+  const name = String(napName == null ? "" : napName).trim();
+  const no = String(portNo == null ? "" : portNo).trim();
+  if (!name || !no) return undefined;
+  const dev = (napDevices || []).find((n) => String(n.name || "").trim() === name);
+  if (!dev || dev.id == null) return undefined; // unknown device, or sample data with no id
+  const row = (napPorts || []).find((p) => String(p.nap_device_id) === String(dev.id) && String(p.port_number) === no);
+  return row ? row.id : undefined;
+}
+// Decide nap_port_id for a save. `port` and nap_port_id are two records of the same fact, so
+// they move together — except when we genuinely cannot tell, where leaving the column out of
+// the write beats guessing at it.
+function _napPortIdPatch(c) {
+  if (c.nap_port_id !== undefined) return { nap_port_id: _cNum(c.nap_port_id) }; // an explicit caller wins
+  if (!("napPort" in c)) return {};                     // no NAP fields at all: don't touch the link
+  if (!String(c.napPort == null ? "" : c.napPort).trim()) return { nap_port_id: null }; // cleared: `port` is going blank too
+  const id = _napPortId(c.nap, c.napPort);
+  return id === undefined ? {} : { nap_port_id: id };   // unresolvable: keep whatever is there rather than destroy it
 }
 // Money: the payments (income) and expenses tables. Same rules as _clientPayload — only
 // the columns api.php's create_/update_ actions write, id excluded (it selects the row, it
@@ -836,6 +860,7 @@ async function loadLiveData() {
       id: o.id, name: o.name || "", standard: o.standard || "", total_pon_ports: Number(o.total_pon_ports) || 16,
       description: o.description || "", areas_served: o.areas_served || "",
     }));
+    if (Array.isArray(d.napPorts)) napPorts = d.napPorts; // keep them: _napPortId() resolves the FK from these
     if (Array.isArray(d.napDevices)) {
       const ponById = {}; (d.ponPorts || []).forEach((p) => { ponById[p.id] = p; });
       const oltById = {}; (d.olts || []).forEach((o) => { oltById[o.id] = o; });
