@@ -27,8 +27,11 @@
 // TWO PERIODS, and they are not interchangeable. The lock cases need a LOCKED week; the own-row
 // cases need one that is NOT locked, because on a locked week the freeze refuses everyone but the
 // owner and the ownership clause is never reached — a green run would prove nothing about
-// ownership. It finds both from the database and BAILS rather than manufacturing either: it will
-// not unlock the locked week to make itself a test bed.
+// ownership. Each bed is found from the database, never manufactured: it will not unlock the
+// locked week to make itself a test bed. The two beds are INDEPENDENT — if one is absent the
+// cases that need it are SKIPPED (a clearly-printed notice, not a failure) and the rest still run.
+// Only when BOTH beds are missing is there nothing left to test, and that alone is a setup problem
+// (exit 2). A skipped group never fails the run; only an actual assertion FAILURE does.
 //
 // It signs in as real users and WRITES REAL ROWS of production data — pr_items rows on two weeks,
 // and the pr_periods row's notes and status — then puts every one of them back and verifies the
@@ -148,11 +151,16 @@ async function findOutsider(owner) {
 // Getting this backwards would test nothing and say it passed: a row that is NOT the technician's
 // would make the own-row case a false failure, and a row that IS theirs would make the core
 // blocked case a false pass. Both read green.
+// Returns { period, mine, theirs, myEmpId } when a suitable bed exists, or { skip: <reason> } when
+// the DATA to build the Piece C cases is not present (the account has no pay line of its own, or no
+// non-locked week carries both it and someone else). A skip is not a bail: Piece C is set aside and
+// the run continues. Genuine DATABASE errors still bail — those are not "data absent", they are the
+// query itself failing, and no group could trust its reads past one.
 async function findOwnRowTargets(owner, outsiderUser) {
   const { data: emps, error: empErr } = await owner.from("pr_employees").select("id,user_id").eq("user_id", outsiderUser.id).order("id");
   if (empErr) bail(`reading pr_employees for ${outsiderUser.username}: ${empErr.message}`);
   if (!emps || !emps.length) {
-    bail(`${outsiderUser.username} (erp_users.id ${outsiderUser.id}) has no pr_employees row, so they have no "own row" to write and item_is_mine() can never be true for them. Piece C cannot be tested with this account — link it to a payroll record, or give another technician one.`);
+    return { skip: `${outsiderUser.username} (erp_users.id ${outsiderUser.id}) has no pr_employees row, so item_is_mine() can never be true for them and there is no "own row" to write. Link the account to a payroll record, or give another technician one.` };
   }
   if (emps.length > 1) console.log(`  note     ${outsiderUser.username} maps to ${emps.length} pr_employees rows; using the lowest id`);
   const myEmpId = Number(emps[0].id);
@@ -168,12 +176,12 @@ async function findOwnRowTargets(owner, outsiderUser) {
     const theirs = (items || []).find((r) => Number(r.employee_id) !== myEmpId);
     if (mine && theirs) return { period: p, mine, theirs, myEmpId };
   }
-  bail(
-    `no NON-LOCKED period has pay lines for BOTH ${outsiderUser.username} (employee_id ${myEmpId}) and another employee.\n` +
-    "  Piece C is about who may write a row on a week that is not frozen, so it needs one to test on.\n" +
-    "  Create a draft week with at least two employees on it and press Save, or publish an existing draft.\n" +
-    "  This test will NOT unlock the locked week to manufacture one — that would change data you did not ask it to."
-  );
+  return {
+    skip:
+      `no NON-LOCKED period has pay lines for BOTH ${outsiderUser.username} (employee_id ${myEmpId}) and another employee.\n` +
+      "        Create a draft week with at least two employees on it and press Save, or publish an existing draft.\n" +
+      "        This test will NOT unlock the locked week to manufacture one — that would change data you did not ask it to.",
+  };
 }
 
 /* ---------- pr_items write helpers ---------- */
@@ -624,41 +632,98 @@ async function main() {
   if (outsiderUser.username === payrollUser.username) bail("the payroll officer and the outsider resolved to the same account — the boundary between them cannot be tested");
   console.log(`  outsider ${outsiderUser.username} (role '${outsiderUser.role}')`);
 
-  // 4. the locked week
+  // 4. the LOCKED-week bed — Piece A (freeze) and Piece B (status walk). A missing locked week is
+  //    not a setup failure any more: those two groups are simply SKIPPED. A query that ERRORS still
+  //    bails — that is the read failing, not the week being absent.
+  let lockedPeriod = null;
+  let lockedSkip = null;
   const { data: locked, error: perErr } = await owner.from("pr_periods").select("id,label,status,notes,published_at").eq("status", "locked").order("id");
   if (perErr) bail("reading pr_periods: " + perErr.message);
-  if (!locked || !locked.length) bail("no period has status 'locked' — the sequence starts from a locked week and there is none");
-  if (locked.length > 1) console.log(`  note     ${locked.length} locked periods; using the lowest id`);
-  const period = locked[0];
-  console.log(`  locked   #${period.id} "${period.label}" (status '${period.status}') — the freeze cases and the status walk use this one`);
+  if (!locked || !locked.length) {
+    lockedSkip = "no locked period present; Piece A/B cases need one";
+    console.log(`  locked   none — Piece A (freeze) and Piece B (status walk) will be SKIPPED`);
+  } else {
+    if (locked.length > 1) console.log(`  note     ${locked.length} locked periods; using the lowest id`);
+    lockedPeriod = locked[0];
+    console.log(`  locked   #${lockedPeriod.id} "${lockedPeriod.label}" (status '${lockedPeriod.status}') — the freeze cases and the status walk use this one`);
+  }
 
-  // 5. a NON-LOCKED week with a line of the outsider's own and a line of somebody else's. Found,
-  //    never manufactured: bailing beats unlocking a real payroll week to make a test bed.
+  // 5. the NON-LOCKED-week bed — Piece C (own-row). Found, never manufactured. A missing bed is a
+  //    SKIP, not a bail; only a genuine DB error inside findOwnRowTargets bails.
+  let ownTarget = null;
+  let ownSkip = null;
   const target = await findOwnRowTargets(owner, outsiderUser);
-  console.log(`  open     #${target.period.id} "${target.period.label}" (status '${target.period.status}') — the own-row cases use this one`);
-  if (target.period.id === period.id) bail("the locked week and the open week resolved to the same period — impossible, and no verdict can be drawn");
+  if (target.skip) {
+    ownSkip = target.skip;
+    console.log(`  open     none suitable — Piece C (own-row) will be SKIPPED`);
+  } else {
+    ownTarget = target;
+    console.log(`  open     #${ownTarget.period.id} "${ownTarget.period.label}" (status '${ownTarget.period.status}') — the own-row cases use this one`);
+  }
+
+  // Both beds present and the same row is impossible — a locked week cannot also be the non-locked
+  // one — so if that ever happens no verdict can be trusted.
+  if (lockedPeriod && ownTarget && ownTarget.period.id === lockedPeriod.id) {
+    bail("the locked week and the open week resolved to the same period — impossible, and no verdict can be drawn");
+  }
+
+  // 6. If NEITHER bed exists there is genuinely nothing to test — THIS is the setup failure (exit
+  //    2), and only this. Skipping one group is fine; skipping both means the database is not set
+  //    up to prove anything.
+  if (!lockedPeriod && !ownTarget) {
+    bail(
+      "no test bed exists — both groups skipped.\n" +
+      `  Piece A/B: ${lockedSkip}\n` +
+      "  Piece C: " + ownSkip + "\n" +
+      "  Provide EITHER a period with status 'locked' (for the freeze + status-walk cases) OR a\n" +
+      "  non-locked period (draft/published) carrying both the outsider's pay line and another\n" +
+      "  employee's (for the own-row cases). One is enough to run; this run has neither."
+    );
+  }
 
   const payroll = await signIn(mkClient(), payrollUser.username, STAFF_PW, "the payroll officer");
   const outsider = await signIn(mkClient(), outsiderUser.username, STAFF_PW, "the outsider");
   const ctx = { owner, payroll, payrollUser, outsider, outsiderUser };
 
+  const ran = [];
+  const skipped = [];
   try {
-    // Order matters. The lock cases need #{period} locked, and the status walk at the end moves it
-    // through draft/published before putting it back — so the freeze cases must run first. The
-    // own-row cases sit on a different week entirely and cannot collide with either.
-    await itemsLockCases(ctx, period);
-    await ownRowCases(ctx, target);
-    await periodStatusCases(ctx, period);
+    // Order matters within the locked bed. The lock cases need the week locked, and the status walk
+    // moves it through draft/published before putting it back — so the freeze cases must run first.
+    // The own-row cases sit on a different week entirely and cannot collide with either.
+    if (lockedPeriod) {
+      await itemsLockCases(ctx, lockedPeriod);
+      await periodStatusCases(ctx, lockedPeriod);
+      ran.push("Piece A — pr_items freeze", "Piece B — pr_periods status walk");
+    } else {
+      console.log(`\n─── Piece A & B  SKIPPED — ${lockedSkip}`);
+      skipped.push(["Piece A & B", lockedSkip]);
+    }
+
+    if (ownTarget) {
+      await ownRowCases(ctx, ownTarget);
+      ran.push("Piece C — pr_items own-row");
+    } else {
+      console.log(`\n─── Piece C  SKIPPED — ${ownSkip}`);
+      skipped.push(["Piece C", ownSkip]);
+    }
   } finally {
     await owner.auth.signOut().catch(() => {});
     await payroll.auth.signOut().catch(() => {});
     await outsider.auth.signOut().catch(() => {});
   }
+
+  return { ran, skipped };
 }
 
-main().then(() => {
+main().then(({ ran, skipped }) => {
   const failed = results.filter((r) => !r).length;
-  console.log(`\n${results.length - failed} passed, ${failed} failed\n`);
+  console.log("\n─── summary");
+  if (ran.length) for (const g of ran) console.log(`  RAN      ${g}`);
+  for (const [g, why] of skipped) console.log(`  SKIPPED  ${g} — ${why.split("\n")[0].trim()}`);
+  // Only what actually ran feeds the tally. A skipped group contributes no PASS and no FAIL, so it
+  // can neither prop the run up nor drag it down — the exit code is a verdict on tested policy only.
+  console.log(`\n${results.length - failed} passed, ${failed} failed (across the groups that ran)\n`);
   process.exit(failed ? 1 : 0);
 }).catch((e) => {
   // Setup problems exit 2, never 1 — an unlocked database or a missing account must never look
