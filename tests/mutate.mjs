@@ -71,6 +71,10 @@ const MUTATIONS = [
   // ---- lock freeze ----
   {
     name: "drop-locked-guard",
+    // Scoped since _supaApplyPlans was wired: it refuses a locked week in the identical words,
+    // deliberately, so the two now match the same text and the harness rightly refuses to guess.
+    // Its own guard has its own mutation (drop-applyplans-locked-guard).
+    in: "_supaSaveItems",
     why: "a locked week is editable again — the original bug",
     from: `if (per.status === "locked") return {
     ok: false,
@@ -633,6 +637,77 @@ const MUTATIONS = [
     to: `.update({
     active: false
   })`,
+  },
+  // ---- pr_apply_plans (the deductions themselves; every pattern scoped, the guards repeat) ----
+  {
+    name: "drop-applyplans-permission",
+    why: "any employee can run the deduction pass over any week — and since it rewrites ded_* and net on every pay line, that is a stranger moving other people's money",
+    in: "_supaApplyPlans",
+    from: `if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can apply installment plans."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-applyplans-locked-guard",
+    why: "a locked week's deductions and net get rewritten — the freeze that protects a signed-off payroll is the whole point of locking it",
+    in: "_supaApplyPlans",
+    from: `if (per.status === "locked") return {
+    ok: false,
+    error: "This payroll period is locked and cannot be edited. Ask the superadmin to unlock it first."
+  };`,
+    to: "",
+  },
+  {
+    name: "flatten-last-term-remainder",
+    why: "every term becomes a flat per_week, so a loan collects per_week x terms instead of its actual total — a 2000 loan over 3 weeks takes 2000.01, and every borrower is overcharged the rounding drift for the life of the debt",
+    in: "_supaApplyPlans",
+    from: `const principal = termNo === termsTotal ? _prR2(totalAmount - pw * (termsTotal - 1)) : pw;`,
+    to: `const principal = pw;`,
+  },
+  {
+    name: "drop-ledger-onconflict",
+    why: "the ledger upsert loses its conflict target, so the second press of Apply plans raises a duplicate key against the real unique index — the idempotency the ledger exists to provide is gone",
+    in: "_supaApplyPlans",
+    from: `}, {
+      onConflict: "plan_id,period_id"
+    }).select("id");`,
+    to: `}).select("id");`,
+  },
+  {
+    name: "drop-ledger-zerorows",
+    why: "a ledger write refused by RLS (200 + []) reports success, so the pay lines are then written from a term the database never recorded — next week recomputes the same term and deducts it twice",
+    in: "_supaApplyPlans",
+    from: `if (!ledHit || !ledHit.length) return {
+      ok: false,
+      error: "Recording this loan's payment was refused by the database. Nothing changed."
+    };`,
+    to: "",
+  },
+  {
+    name: "applyplans-net-rounds-like-prcalc",
+    why: "net is rounded per-deduction instead of once at the end, so the stored figure drifts a peso from what api.php writes for the same week — two systems disagreeing about one payslip",
+    in: "_supaApplyPlans",
+    from: `const net = Math.round(prNum(it.gross) - (b.ded_loan + b.ded_uniform + b.ded_gov + Math.round(prNum(it.ded_manual))));`,
+    to: `const net = prNum(it.gross) - (Math.round(b.ded_loan) + Math.round(b.ded_uniform) + Math.round(b.ded_gov) + Math.round(prNum(it.ded_manual)));`,
+  },
+  {
+    name: "drop-published-approval-reset",
+    why: "a published week's pay changes under an employee who already approved it, and their approval stands — they are recorded as having agreed to a number they were never shown",
+    in: "_supaApplyPlans",
+    from: `if (published && net !== prNum(it.net)) {
+      row.status = "pending";
+      row.approved_at = null;
+    }`,
+    to: "",
+  },
+  {
+    name: "drop-applyplans-item-zerorows",
+    why: "a pay-line write the database silently refused reports 'applied' — the officer sees deductions on screen that never reached the database, and the ledger says they were collected",
+    in: "_supaApplyPlans",
+    from: `if (!hit || !hit.length) return _prApplyStopped(eid, empById, written, "the database refused the write. The week may be locked, or your account may not have permission to edit it.");`,
+    to: "",
   },
   {
     name: "saveplan-create-honours-active",

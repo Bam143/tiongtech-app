@@ -1618,17 +1618,298 @@ await t.test("delete plan: a silently blocked delete (200 + []) is an honest fai
   t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
 });
 
-const FALLTHROUGH = ["pr_apply_plans"];
+/* ---------- pr_apply_plans (turn loan plans into this week's deductions) ---------- */
+// The ledger (pr_plan_applied) is what makes this idempotent: one row per (plan, period) holding
+// which term it was, so "terms already paid" is a count over OTHER periods and re-pressing the
+// button recomputes the same term rather than advancing the loan again.
+const AP_PERIOD = { id: 3, status: "draft", pay_date: "2026-07-20" };
+const AP_EMPS = [{ id: 5, full_name: "Ana Cruz", per_day: 500, active: 1 }];
+const AP_ITEM = { id: 100, period_id: 3, employee_id: 5, gross: 3000, ded_loan: 0, ded_uniform: 0, ded_gov: 0, ded_manual: 0, ded_notes: "", net: 3000, status: "pending", approved_at: null };
+const AP_PLAN = { id: 12, employee_id: 5, kind: "ca", category: "loan", label: "Cash advance", total_amount: 2000, terms_total: 10, per_week: 200, interest_rate: 0, interest_only: 0, start_date: "2026-07-01", active: 1 };
+const applyT = async ({ role = "owner", period = AP_PERIOD, emps = AP_EMPS, items = [{ ...AP_ITEM }], plans = [{ ...AP_PLAN }], ledger = [], opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({
+      pr_periods: period ? [period] : [], pr_employees: emps,
+      pr_items: items, pr_plans: plans, pr_plan_applied: ledger,
+    }, opts);
+    window.SB = sb;
+    const res = await API("pr_apply_plans", { period_id: 3 });
+    return { sb, res };
+  } finally { setME(was); }
+};
+const ledgerWrites = (sb) => sb.calls.filter((c) => c.table === "pr_plan_applied" && c.op === "upsert");
+const itemWrites = (sb) => sb.calls.filter((c) => c.table === "pr_items" && c.op === "update");
 
-await t.test(`the other ${FALLTHROUGH.length} payroll write still falls through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 1, "1 action still deferred — the plan save/delete pair is wired now");
-  for (const action of FALLTHROUGH) {
-    const sb = makeFakeSB([]);
+await t.test("apply: a plain loan deducts its weekly share, labels it, and lowers net", async () => {
+  const { sb, res } = await applyT({});
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(res.applied, 1, "one employee had something applied");
+  const led = ledgerWrites(sb);
+  t.eq(led.length, 1, "one ledger row");
+  t.eq(led[0].row.term_no, 1, "first term");
+  t.eq(led[0].row.amount, 200, "2000 over 10 weeks = 200");
+  t.eq(led[0].row.plan_id, 12, "against the plan");
+  t.eq(led[0].row.period_id, 3, "in this period");
+  const w = itemWrites(sb);
+  t.eq(w.length, 1, "one pay line written");
+  t.eq(w[0].filters.id, 100, "the right row");
+  t.eq(w[0].row.ded_loan, 200, "lands in ded_loan");
+  t.eq(w[0].row.ded_notes, "Cash advance 1/10", "labelled <label> n/N");
+  t.eq(w[0].row.net, 2800, "net drops by the deduction");
+});
+
+await t.test("apply: the ledger upsert names its conflict target", async () => {
+  const { sb } = await applyT({});
+  const led = ledgerWrites(sb)[0];
+  t.ok(led.opts && led.opts.onConflict === "plan_id,period_id",
+    `onConflict must be sent or the second press raises a duplicate key, got: ${JSON.stringify(led.opts)}`);
+});
+
+await t.test("apply: the payroll officer may apply too", async () => {
+  const { res } = await applyT({ role: "payroll" });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+});
+
+await t.test("apply: a plain employee is refused before any I/O", async () => {
+  const { sb, res } = await applyT({ role: "technician" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can apply installment plans.", "message");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("apply: a LOCKED week is refused and nothing is written", async () => {
+  const { sb, res } = await applyT({ period: { id: 3, status: "locked", pay_date: "2026-07-20" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/locked/.test(res.error), `says locked, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op !== "select").length, 0, "no writes at all");
+});
+
+await t.test("apply: a missing week is refused", async () => {
+  const { res } = await applyT({ period: null });
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `message, got: ${res.error}`);
+});
+
+await t.test("apply: a missing period_id is refused before any lookup", async () => {
+  const was = getME();
+  setME({ ...was, role: "owner" });
+  try {
+    const sb = makeFakeSB({});
+    window.SB = sb;
+    const res = await API("pr_apply_plans", {});
+    t.eq(res.ok, false, "refused");
+    t.eq(sb.calls.length, 0, "nothing touched");
+  } finally { setME(was); }
+});
+
+await t.test("apply: a plan starting AFTER this week's pay date takes nothing", async () => {
+  const { sb, res } = await applyT({ plans: [{ ...AP_PLAN, start_date: "2026-08-01" }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(res.applied, 0, "nobody had anything applied");
+  t.eq(ledgerWrites(sb).length, 0, "no ledger row");
+  t.eq(itemWrites(sb)[0].row.ded_loan, 0, "no deduction");
+  t.eq(itemWrites(sb)[0].row.ded_notes, "", "no label");
+});
+
+await t.test("apply: a not-yet-started plan CLEARS a stale ledger row from this period", async () => {
+  const { sb, res } = await applyT({
+    plans: [{ ...AP_PLAN, start_date: "2026-08-01" }],
+    ledger: [{ id: 1, plan_id: 12, period_id: 3, term_no: 1, amount: 200 }],
+  });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const del = sb.calls.filter((c) => c.table === "pr_plan_applied" && c.op === "delete");
+  t.eq(del.length, 1, "the stale row is dropped");
+  t.eq(del[0].filters.period_id, 3, "only this period's row");
+  t.eq(del[0].filters.plan_id, 12, "only this plan's row");
+});
+
+await t.test("apply: interest-only takes the interest, writes term 0, and advances nothing", async () => {
+  const { sb, res } = await applyT({ plans: [{ ...AP_PLAN, interest_only: 1, interest_rate: 5 }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const led = ledgerWrites(sb)[0];
+  t.eq(led.row.amount, 100, "5% of 2000 = 100, interest only");
+  t.eq(led.row.term_no, 0, "term 0 — kept OUT of the prior count so the principal stands still");
+  t.eq(itemWrites(sb)[0].row.ded_notes, "Cash advance interest only", "labelled as interest only");
+});
+
+await t.test("apply: interest-only with no interest rate takes nothing", async () => {
+  const { sb, res } = await applyT({ plans: [{ ...AP_PLAN, interest_only: 1, interest_rate: 0 }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(ledgerWrites(sb).length, 0, "no ledger row — nothing to take");
+  t.eq(itemWrites(sb)[0].row.ded_loan, 0, "no deduction");
+});
+
+await t.test("apply: a fully-paid loan stops deducting", async () => {
+  const ledger = [];
+  for (let i = 1; i <= 10; i++) ledger.push({ id: i, plan_id: 12, period_id: 100 + i, term_no: i, amount: 200 });
+  const { sb, res } = await applyT({ ledger });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(ledgerWrites(sb).length, 0, "term 11 of 10 is never written");
+  t.eq(itemWrites(sb)[0].row.ded_loan, 0, "nothing more is taken");
+  t.eq(itemWrites(sb)[0].row.net, 3000, "the employee keeps their full pay");
+});
+
+await t.test("apply: the LAST term absorbs the rounding remainder, so the loan sums exactly", async () => {
+  const plan = { ...AP_PLAN, total_amount: 2000, terms_total: 3, per_week: 666.67 };
+  const ledger = [
+    { id: 1, plan_id: 12, period_id: 1, term_no: 1, amount: 666.67 },
+    { id: 2, plan_id: 12, period_id: 2, term_no: 2, amount: 666.67 },
+  ];
+  const { sb, res } = await applyT({ plans: [plan], ledger });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const led = ledgerWrites(sb)[0];
+  t.eq(led.row.term_no, 3, "the final term");
+  t.eq(led.row.amount, 666.66, "666.66, NOT another 666.67 — the remainder lands here");
+  t.eq(666.67 + 666.67 + led.row.amount, 2000, "the three terms sum to exactly the loan");
+});
+
+await t.test("apply: per_week is derived when the plan has none stored", async () => {
+  // _supaSavePlan does not write per_week, so every plan created since it was wired has none.
+  const { sb, res } = await applyT({ plans: [{ ...AP_PLAN, per_week: null }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(ledgerWrites(sb)[0].row.amount, 200, "2000/10 derived rather than priced at zero");
+});
+
+await t.test("apply: category decides the column — uniform, government, and fines beside loans", async () => {
+  const plans = [
+    { ...AP_PLAN, id: 12, category: "loan", label: "Cash advance", total_amount: 1000, terms_total: 10, per_week: 100 },
+    { ...AP_PLAN, id: 13, category: "uniform", label: "T-shirt", total_amount: 250, terms_total: 5, per_week: 50 },
+    { ...AP_PLAN, id: 14, category: "government", label: "SSS", total_amount: 600, terms_total: 6, per_week: 100 },
+    { ...AP_PLAN, id: 15, category: "other", label: "Fines", total_amount: 300, terms_total: 6, per_week: 50 },
+  ];
+  const { sb, res } = await applyT({ plans });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const row = itemWrites(sb)[0].row;
+  t.eq(row.ded_uniform, 50, "uniform -> ded_uniform");
+  t.eq(row.ded_gov, 100, "government -> ded_gov");
+  t.eq(row.ded_loan, 150, "loan 100 + fines 50 share ded_loan — 'other' has no column of its own");
+  t.eq(row.ded_notes, "Cash advance 1/10;T-shirt 1/5;SSS 1/6;Fines 1/6",
+    "semicolon-joined, and the ONLY thing telling the fine apart from the cash advance");
+});
+
+await t.test("apply: net rounds ONCE at the end, matching api.php and not prCalc", async () => {
+  // Two fractional deductions. Rounding each then summing gives 251+101=352 -> net 2648.
+  // Rounding the sum gives round(3000-351) -> 2649. api.php does the latter; so does this.
+  const plans = [
+    { ...AP_PLAN, id: 12, category: "loan", label: "Cash advance", total_amount: 2505, terms_total: 10, per_week: 250.50 },
+    { ...AP_PLAN, id: 13, category: "uniform", label: "T-shirt", total_amount: 1005, terms_total: 10, per_week: 100.50 },
+  ];
+  const { sb, res } = await applyT({ plans });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const row = itemWrites(sb)[0].row;
+  t.eq(row.ded_loan, 250.50, "centavos kept on the column");
+  t.eq(row.ded_uniform, 100.50, "centavos kept on the column");
+  t.eq(row.net, 2649, "round(3000 - 351) = 2649 — NOT prCalc's 251+101 = 352 -> 2648");
+});
+
+await t.test("apply: an employee with no plans has last week's deduction CLEARED", async () => {
+  const items = [{ ...AP_ITEM, ded_loan: 500, ded_notes: "Cash advance 4/10", net: 2500 }];
+  const { sb, res } = await applyT({ items, plans: [] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const row = itemWrites(sb)[0].row;
+  t.eq(row.ded_loan, 0, "cleared — a deleted plan must stop deducting");
+  t.eq(row.ded_notes, "", "and its label goes too");
+  t.eq(row.net, 3000, "the pay comes back");
+});
+
+await t.test("apply: on a PUBLISHED week, changed pay resets the approval", async () => {
+  const { sb, res } = await applyT({ period: { id: 3, status: "published", pay_date: "2026-07-20" },
+    items: [{ ...AP_ITEM, status: "approved", approved_at: "2026-07-19T02:00:00Z" }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const row = itemWrites(sb)[0].row;
+  t.eq(row.net, 2800, "the pay moved");
+  t.eq(row.status, "pending", "so the approval is withdrawn — it was given for a different number");
+  t.eq(row.approved_at, null, "and its timestamp cleared");
+});
+
+await t.test("apply: on a published week, UNCHANGED pay keeps its approval", async () => {
+  // Already carries this week's deduction, so net does not move.
+  const { sb, res } = await applyT({ period: { id: 3, status: "published", pay_date: "2026-07-20" },
+    items: [{ ...AP_ITEM, ded_loan: 200, net: 2800, status: "approved", approved_at: "2026-07-19T02:00:00Z" }],
+    ledger: [{ id: 1, plan_id: 12, period_id: 3, term_no: 1, amount: 200 }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  const row = itemWrites(sb)[0].row;
+  t.eq(row.net, 2800, "net unchanged");
+  t.ok(!("status" in row), "status is left alone — re-pressing must not wipe sign-offs for nothing");
+  t.ok(!("approved_at" in row), "and neither is the approval timestamp");
+});
+
+await t.test("apply: a DRAFT week never touches status, even when pay changes", async () => {
+  const { sb } = await applyT({});
+  const row = itemWrites(sb)[0].row;
+  t.ok(!("status" in row), "nothing to withdraw — a draft was never shown to anyone");
+});
+
+await t.test("apply: pressing it twice is idempotent — same term, same money", async () => {
+  const first = await applyT({});
+  const second = await applyT({ ledger: [{ id: 1, plan_id: 12, period_id: 3, term_no: 1, amount: 200 }] });
+  t.eq(second.res.ok, true, `applied, got: ${second.res.error}`);
+  const a = ledgerWrites(first.sb)[0].row, b = ledgerWrites(second.sb)[0].row;
+  t.eq(b.term_no, a.term_no, "still term 1 — this period's own row is excluded from the prior count");
+  t.eq(b.amount, a.amount, "and the same money");
+  t.eq(itemWrites(second.sb)[0].row.ded_loan, itemWrites(first.sb)[0].row.ded_loan, "the pay line is unchanged");
+});
+
+await t.test("apply: a plan whose employee has no pay line is skipped, ledger included", async () => {
+  // Writing a ledger row here would record a term as collected with nowhere for the money to land.
+  const { sb, res } = await applyT({ plans: [{ ...AP_PLAN, employee_id: 99 }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(ledgerWrites(sb).length, 0, "no ledger row for a deduction that cannot land");
+});
+
+await t.test("apply: an inactive employee's plan is skipped", async () => {
+  const { sb, res } = await applyT({ emps: [{ id: 5, full_name: "Ana Cruz", per_day: 500, active: 0 }] });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(ledgerWrites(sb).length, 0, "a deactivated employee stops being deducted");
+});
+
+await t.test("apply: a blocked pay-line write (200 + []) names the employee and stops", async () => {
+  const { res } = await applyT({ opts: { blockWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused — never a false 'applied'");
+  t.ok(/Ana Cruz/.test(res.error), `names who it stopped at, got: ${res.error}`);
+  t.ok(/No pay lines were changed/.test(res.error), `says nothing landed, got: ${res.error}`);
+});
+
+await t.test("apply: a 42501 on the pay line is an honest failure too", async () => {
+  const { res } = await applyT({ opts: { errorWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Apply stopped at/.test(res.error), `same shape, got: ${res.error}`);
+});
+
+await t.test("apply: a blocked LEDGER write stops before any pay line is touched", async () => {
+  const { sb, res } = await applyT({ opts: { blockWrites: "pr_plan_applied" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Nothing changed/.test(res.error), `honest, got: ${res.error}`);
+  t.eq(itemWrites(sb).length, 0, "no pay line was written — the ledger goes first and it failed");
+});
+
+await t.test("apply: 'applied' counts only employees who actually got a deduction", async () => {
+  const emps = [{ id: 5, full_name: "Ana Cruz", per_day: 500, active: 1 }, { id: 6, full_name: "Ben Lim", per_day: 400, active: 1 }];
+  const items = [{ ...AP_ITEM }, { ...AP_ITEM, id: 101, employee_id: 6 }];
+  const { sb, res } = await applyT({ emps, items });
+  t.eq(res.ok, true, `applied, got: ${res.error}`);
+  t.eq(res.applied, 1, "Ana has a plan, Ben does not");
+  t.eq(itemWrites(sb).length, 2, "but BOTH pay lines are written — Ben's has to be cleared");
+});
+
+const FALLTHROUGH = [];
+
+await t.test("every payroll write is wired — nothing falls through to \"not connected\" any more", async () => {
+  t.eq(FALLTHROUGH.length, 0, "the list is empty: pr_apply_plans was the last one");
+  // The guard is worth keeping now that it is empty — it fails loudly if an unwired pr_* action
+  // is ever added back, which is otherwise only noticed when a button errors in production.
+  const PR_ACTIONS = ["pr_save_items", "pr_unlock", "pr_publish", "pr_lock", "pr_save_period",
+    "pr_delete_period", "pr_item_approve", "pr_item_contest", "pr_item_reply", "pr_request_print",
+    "pr_mark_printed", "pr_set_dayoff", "pr_save_employee", "pr_delete_employee", "pr_save_plan",
+    "pr_delete_plan", "pr_apply_plans"];
+  for (const action of PR_ACTIONS) {
+    const sb = makeFakeSB({});
     window.SB = sb;
     const res = await API(action, { id: 1, period_id: 3, employee_id: 5 });
-    t.eq(res.ok, false, `${action} is refused`);
-    t.ok(/is not connected to Supabase yet/.test(res.error), `${action} gives the not-connected error, got: ${res.error}`);
-    t.eq(sb.calls.length, 0, `${action} touched no table`);
+    t.ok(!(res && res.error && /is not connected to Supabase yet/.test(res.error)),
+      `${action} must not fall through, got: ${res && res.error}`);
   }
 });
 

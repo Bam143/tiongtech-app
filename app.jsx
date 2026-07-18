@@ -1568,6 +1568,197 @@ async function _supaDeletePlan(payload) {
   if (!hit || !hit.length) return { ok: false, error: "Deactivating this loan was refused by the database — your account may not have permission. Nothing changed." };
   return { ok: true };
 }
+/* ---- Apply installment plans to a week (pr_apply_plans) ----
+   The Apply plans button (app.jsx:5483), which saves the grid FIRST and reloads after, so the
+   pr_items rows already exist and already hold this week's attendance when this runs.
+
+   This is the handler that turns a debt INSTRUCTION into money actually leaving a payslip.
+   pr_save_plan only records what is owed; nothing deducted anything until this existed.
+
+   pr_plan_applied is the ledger that makes it idempotent: one row per (plan, period), carrying
+   which term this was. "How many terms has this loan already paid" is a COUNT over that ledger
+   excluding the current period, so re-running the button recomputes the same term number and
+   rewrites the same figures rather than advancing the loan a second time.
+
+   LEDGER FIRST, PAY LINES SECOND, and the order is a choice about which half-finished state is
+   survivable. Nothing here spans a transaction. If the ledger lands and the pay lines do not,
+   the term is recorded as collected while no money moved — the borrower underpays by a term and
+   the company carries it. If the pay lines land and the ledger does not, the next week counts a
+   prior term short and deducts the SAME term again — the borrower is charged twice. Overcharging
+   an employee is the worse failure, so the ledger goes first. Either residue is repaired by
+   pressing the button again, because both writes are absolute rather than additive. */
+const _PR_APPLIED_COLS = "id,plan_id,period_id,term_no,amount";
+// Centavos. The weekly share of a debt divides unevenly far more often than not, so every money
+// value here is rounded to two places at the point it is computed, not on the way out.
+const _prR2 = (n) => Math.round(n * 100) / 100;
+/* A plan's category decides which pr_items column it deducts into. This mapping exists nowhere
+   else — the client had kind -> category (PR_KIND_CAT, app.jsx:5005) and category -> a display
+   label (PR_CATS), and nothing that reached a column. It keys off CATEGORY rather than kind
+   because category is a stored field the officer can override in the plan form (app.jsx:5001),
+   so it is the field of record; a kind-keyed mapping would silently ignore that override.
+   Everything unmatched falls to ded_loan, which is what carries `other` — the category `fines`
+   becomes, and the one with no column of its own. That means a fine and a cash advance share a
+   payslip line and ded_notes is the ONLY thing telling them apart, which is what makes the label
+   below load-bearing rather than decorative. ded_manual is deliberately not reachable here: it
+   is in _PR_SAVE_NUM (app.jsx:787), so the next grid Save would overwrite anything left in it. */
+const _PR_CAT_DED = { uniform: "ded_uniform", government: "ded_gov" };
+const _prDedCol = (cat) => _PR_CAT_DED[String(cat == null ? "" : cat).toLowerCase()] || "ded_loan";
+// Same shape as _prSaveStopped (app.jsx:829) and for the same reason — a loop with nothing
+// transactional around it makes "it failed" and "nothing was written" two different claims. The
+// wording is its own because "Save stopped at…" would name the wrong button.
+const _prApplyStopped = (eid, empById, written, why) => {
+  const who = (empById[eid] && empById[eid].full_name) || ("employee #" + eid);
+  const before = written === 0 ? " No pay lines were changed."
+    : written === 1 ? " The pay line before it was already updated, so this week is now part-applied."
+    : " The " + written + " pay lines before it were already updated, so this week is now part-applied.";
+  return { ok: false, error: "Apply stopped at " + who + " — " + why + before };
+};
+async function _supaApplyPlans(payload) {
+  const sb = window.SB;
+  const periodId = Number((payload && payload.period_id) || 0);
+  if (!periodId) return { ok: false, error: "Missing period_id" };
+  // pr_plans and pr_plan_applied are permissive at the database level (verified 2026-07-18), so
+  // this check is the access control, not a nicety on top of a policy. pr_items is the one table
+  // here RLS really does guard.
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return { ok: false, error: "Only the payroll office can apply installment plans." };
+  const { data: per, error: perErr } = await sb.from("pr_periods").select("status,pay_date").eq("id", periodId).maybeSingle();
+  if (perErr) return { ok: false, error: perErr.message };
+  if (!per) return { ok: false, error: "This payroll period no longer exists. Reload the page and try again." };
+  // Same freeze, same words as every other write path (app.jsx:849). First check on purpose.
+  if (per.status === "locked") return { ok: false, error: "This payroll period is locked and cannot be edited. Ask the superadmin to unlock it first." };
+  const published = per.status !== "draft";
+  const payDate = per.pay_date || null;
+  // Three independent reads. The plans/employees pairing is a JOIN in the source SQL; it is two
+  // reads here because a nested select cannot be verified by the fake — a test would pass against
+  // a handler that never joined at all — so the tables are read apart and matched by id, exactly
+  // as _supaSaveItems does (app.jsx:862).
+  const [plansRes, empsRes, itemsRes] = await Promise.all([
+    sb.from("pr_plans").select(_PR_PLAN_COLS).eq("active", 1),
+    sb.from("pr_employees").select("id,full_name,per_day,active"),
+    sb.from("pr_items").select("id,employee_id,gross,ded_loan,ded_uniform,ded_gov,ded_manual,ded_notes,net,status,approved_at").eq("period_id", periodId),
+  ]);
+  if (plansRes.error) return { ok: false, error: "Could not read the loan plans: " + plansRes.error.message };
+  if (empsRes.error) return { ok: false, error: "Could not read the roster: " + empsRes.error.message };
+  if (itemsRes.error) return { ok: false, error: "Could not read this week's pay lines: " + itemsRes.error.message };
+  const empById = {};
+  (empsRes.data || []).forEach((e) => { empById[e.id] = e; });
+  const items = itemsRes.data || [];
+  // Keyed by employee so a plan can be matched to the row it will deduct from. A plan whose
+  // employee has NO pay line this week is skipped entirely, ledger included: writing a ledger row
+  // for a deduction that has nowhere to land would record a term as collected while no money ever
+  // moved, and the ledger-first ordering above makes that permanent rather than self-repairing.
+  const itemByEmp = {};
+  items.forEach((it) => { itemByEmp[it.employee_id] = it; });
+  // employee_id -> { ded_loan, ded_uniform, ded_gov, notes[] }
+  const acc = {};
+  const bucket = (eid) => (acc[eid] || (acc[eid] = { ded_loan: 0, ded_uniform: 0, ded_gov: 0, notes: [] }));
+  for (const p of (plansRes.data || [])) {
+    const eid = Number(p.employee_id);
+    const emp = empById[eid];
+    if (!emp || !prNum(emp.active)) continue;          // WHERE e.active = 1
+    if (!itemByEmp[eid]) continue;                      // no pay line to deduct from
+    const termsTotal = Math.trunc(prNum(p.terms_total));
+    const totalAmount = prNum(p.total_amount);
+    if (termsTotal < 1 || !(totalAmount > 0)) continue; // unusable plan; nothing to divide
+    // This plan's whole ledger history. The prior-term count wants "every period but this one",
+    // which is a .neq() the fake has no word for, so the filtering and the counting both happen
+    // here in JS over the rows the read already returned.
+    const { data: applied, error: appErr } = await sb.from("pr_plan_applied").select(_PR_APPLIED_COLS).eq("plan_id", p.id);
+    if (appErr) return { ok: false, error: "Could not read this loan's payment history: " + appErr.message };
+    const history = applied || [];
+    const mine = history.find((r) => Number(r.period_id) === periodId) || null;
+    // A row that exists for this period but should not — the plan has not started yet, is fully
+    // paid, or is interest-only with no interest to take. Dropping it is what lets a week be
+    // re-applied after a plan changes underneath it. Nothing to drop is the normal case, so the
+    // delete only runs when the read above actually found a row, which also keeps a legitimate
+    // zero-rows result from being mistaken for a refusal.
+    const dropMine = async () => {
+      if (!mine) return null;
+      const { error } = await sb.from("pr_plan_applied").delete().eq("plan_id", p.id).eq("period_id", periodId).select("id");
+      return error ? { ok: false, error: "Could not clear a stale loan entry: " + error.message } : null;
+    };
+    // Not started: a plan dated after this week's pay date takes nothing yet.
+    if (p.start_date && payDate && String(p.start_date) > String(payDate)) {
+      const bad = await dropMine(); if (bad) return bad;
+      continue;
+    }
+    // Flat weekly interest on the ORIGINAL principal — it does not amortise down as the loan is
+    // paid off, which is what makes interest-only below a real extension rather than a pause.
+    const interest = _prR2(totalAmount * prNum(p.interest_rate) / 100);
+    const prior = history.filter((r) => Number(r.period_id) !== periodId && prNum(r.term_no) > 0).length;
+    let termNo, amount, note;
+    if (prNum(p.interest_only) === 1) {
+      // Interest only: take the interest, advance nothing. term_no 0 is what keeps it out of the
+      // prior count above, so the principal schedule stands still while this is switched on and
+      // the term the borrower is on is exactly where they left it.
+      if (!(interest > 0)) { const bad = await dropMine(); if (bad) return bad; continue; }
+      termNo = 0; amount = interest; note = "interest only";
+    } else {
+      termNo = prior + 1;
+      if (termNo > termsTotal) { const bad = await dropMine(); if (bad) return bad; continue; }   // fully paid
+      // The last term absorbs the rounding remainder. A flat per_week every week would have the
+      // terms sum to per_week * terms_total, not to total_amount — ₱2000 over 3 weeks would
+      // collect ₱2000.01 — so the final term is whatever is actually left rather than another
+      // even share. This is the one line where the obvious simplification quietly overcharges
+      // every borrower, which is why it has a test of its own.
+      //
+      // per_week is READ when the row carries one and DERIVED when it does not. _supaSavePlan
+      // (app.jsx:1520) deliberately does not write per_week — it is total/terms by definition and
+      // a stored copy drifts the moment either changes — so every plan created since that handler
+      // was wired has none, and taking the column at face value would price those at zero for
+      // every term but the last. Preferring the stored value keeps rows written by api.php
+      // deducting exactly what they always did.
+      const stored = prNum(p.per_week);
+      const pw = _prR2(stored > 0 ? stored : totalAmount / termsTotal);
+      const principal = termNo === termsTotal ? _prR2(totalAmount - pw * (termsTotal - 1)) : pw;
+      amount = _prR2(principal + interest);
+      note = termNo + "/" + termsTotal;
+    }
+    // The ledger, on its unique (plan_id, period_id). A real upsert, unlike pr_items (app.jsx:753)
+    // — this table actually carries the constraint, so the conflict target is named rather than
+    // resolved by hand. Without onConflict this would raise a duplicate key the second time the
+    // button is pressed, which is precisely the case the whole ledger exists to survive.
+    const { data: ledHit, error: ledErr } = await sb.from("pr_plan_applied")
+      .upsert({ plan_id: p.id, period_id: periodId, term_no: termNo, amount }, { onConflict: "plan_id,period_id" })
+      .select("id");
+    if (ledErr) return { ok: false, error: "Could not record this loan's payment: " + ledErr.message };
+    if (!ledHit || !ledHit.length) return { ok: false, error: "Recording this loan's payment was refused by the database. Nothing changed." };
+    const b = bucket(eid);
+    b[_prDedCol(p.category)] = _prR2(b[_prDedCol(p.category)] + amount);
+    b.notes.push(String(p.label || "").trim() + " " + note);
+  }
+  // Every pay line in the week, not only the ones a plan touched. A plan that was deleted or ran
+  // out since the last press has to have its deduction CLEARED, and the only way to clear a row
+  // is to write it — skipping the untouched ones would leave last press's figures behind forever.
+  let written = 0, applied = 0;
+  for (const it of items) {
+    const eid = Number(it.employee_id);
+    const b = acc[eid] || { ded_loan: 0, ded_uniform: 0, ded_gov: 0, notes: [] };
+    // Semicolon-delimited: prCleanNotes (app.jsx:4724) splits on ";" and is the only reader.
+    const notes = b.notes.join(";");
+    // Rounds ONCE, at the end. prCalc (app.jsx:4744) rounds each deduction and then sums them,
+    // which is not the same arithmetic — with two deductions of .50 the two disagree by ₱1, and
+    // the screen renders prCalc while this column holds the figure below. That split is inherited
+    // from api.php, which has always rounded this way, and is reproduced here deliberately: a
+    // Supabase path that quietly disagreed with the live system would be the worse bug. Unifying
+    // the two is a real fix and a separate one — it moves figures on weeks already published,
+    // locked and approved, so it needs the owner to say yes.
+    const net = Math.round(prNum(it.gross) - (b.ded_loan + b.ded_uniform + b.ded_gov + Math.round(prNum(it.ded_manual))));
+    const row = { ded_loan: b.ded_loan, ded_uniform: b.ded_uniform, ded_gov: b.ded_gov, ded_notes: notes, net };
+    // A published week has already been shown to employees and may already be approved. If the
+    // money changed, that approval was given for a different number, so it goes back to pending
+    // and the employee is asked again. Unchanged pay keeps its approval — re-pressing the button
+    // must not wipe a week's sign-offs for nothing.
+    if (published && net !== prNum(it.net)) { row.status = "pending"; row.approved_at = null; }
+    const { data: hit, error } = await sb.from("pr_items").update(row).eq("id", it.id).select("id");
+    if (error) return _prApplyStopped(eid, empById, written, "the database refused the write: " + error.message);
+    if (!hit || !hit.length) return _prApplyStopped(eid, empById, written, "the database refused the write. The week may be locked, or your account may not have permission to edit it.");
+    written++;
+    if (b.notes.length) applied++;
+  }
+  return { ok: true, applied };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1600,6 +1791,7 @@ const API = (action, payload) => {
         if (action === "pr_delete_employee") { return await _supaDeleteEmployee(payload); }
         if (action === "pr_save_plan") { return await _supaSavePlan(payload); }
         if (action === "pr_delete_plan") { return await _supaDeletePlan(payload); }
+        if (action === "pr_apply_plans") { return await _supaApplyPlans(payload); }
         if (action === "create_client") {
           const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
           if (error) return { ok: false, error: error.message };
