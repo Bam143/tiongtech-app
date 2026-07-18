@@ -38,6 +38,12 @@ export function loadApp(appJsPath) {
   // outside the VM. These arrows close over that binding, so a test can sign in as somebody
   // else. Restore what getME returned; ME is global state and leaks across tests otherwise.
   src += "\n;globalThis.__TT = { API, _supaSaveItems, _supaUnlock, _supaPublish, _prSaveRow, _prSaveCalc, _stamp, prCalc,"
+      // A missing global does not raise in here — `has: () => true` turns it into a plausible-
+      // looking stub instead — so the only way to know the VM is honest is to ask it. Each of these
+      // is a BEHAVIOURAL check rather than a typeof: the stub would satisfy `typeof x === "function"`
+      // for Set just as the real constructor does. L is app.jsx's icon lookup, built with Proxy at
+      // module scope, so it doubles as proof that Proxy was real while app.js was still evaluating.
+      +  " __globals: () => ({ set: new Set([1, 1, 2]).size === 2, map: (() => { const m = new Map(); m.set(\"k\", 7); return m.get(\"k\") === 7; })(), proxy: Object.prototype.toString.call(L) === \"[object Object]\", isFinite: isFinite(0 / 0) === false, isNaN: isNaN(\"x\") === true, nan: typeof NaN === \"number\", undef: (function (a) { return a === undefined; })() }),"
       +  " setME: (v) => { ME = v; }, getME: () => ME };\n";
 
   const windowObj = { SB: null, __LIVE__: true, addEventListener() {}, location: { href: "" }, matchMedia: () => ({ matches: false, addEventListener() {} }) };
@@ -60,6 +66,25 @@ export function loadApp(appJsPath) {
     // `has: () => true` guarantees it silently becomes something plausible — so anything app.jsx
     // relies on has to be listed explicitly.
     isNaN, isFinite, parseInt, parseFloat, setTimeout, clearTimeout, setInterval, clearInterval,
+    // Set, Map and Proxy for the same reason as isFinite, and Set is the one that bites. The stub's
+    // construct trap returns the stub, so `new Set()` was a stub: .add() did nothing, Array.from()
+    // of it yielded [], and every Set-based dedup silently produced an EMPTY list rather than
+    // failing. _supaBootstrap's technician roll-up (app.jsx:475) and _supaFinancials' financeMonths
+    // (614) both work that way, so a test written against either would have asserted against
+    // nothing and passed. An empty array is a plausible-looking answer, which is exactly what makes
+    // it dangerous — unlike a thrown ReferenceError, it never asks to be looked at.
+    //
+    // Proxy is the load-bearing one at evaluation time: app.jsx:68 builds the icon lookup with it
+    // at module scope, so this changes what happens while app.js is still being evaluated, not just
+    // what a handler does later.
+    Set, Map, Proxy,
+    // NaN and Infinity are VALUES rather than functions, and were stubbed too — `typeof NaN` came
+    // back "function". app.jsx only names NaN in comments, so nothing was actually wrong, but the
+    // stub coerces to "" and therefore to 0, which makes `isFinite(NaN)` return TRUE inside the VM.
+    // A future check written the obvious way would quietly assert the opposite of what it meant.
+    // (`undefined` was measured and is NOT affected — it resolves correctly through the Proxy, so
+    // _cTxt's `v === undefined` has always behaved.)
+    NaN, Infinity,
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     navigator: { userAgent: "node", clipboard: { writeText: () => Promise.resolve() } },
     fetch: () => Promise.reject(new Error("network disabled in tests")),

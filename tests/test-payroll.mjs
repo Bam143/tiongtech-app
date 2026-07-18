@@ -10,7 +10,7 @@
 import { loadApp, makeFakeSB, makeSuite } from "./harness.mjs";
 
 const APP_JS = process.argv[2] || "app.js";   // relative to the repo root, where npm runs
-const { API, window, prCalc, setME, getME } = loadApp(APP_JS);
+const { API, window, prCalc, setME, getME, __globals } = loadApp(APP_JS);
 const t = makeSuite("payroll / pr_save_items + pr_unlock");
 
 // One grid row exactly as saveGrid builds it (app.jsx:4577-4580).
@@ -2014,6 +2014,30 @@ await t.test("client payments: a missing account is refused before any read", as
 await t.test("client payments: is wired — it no longer falls through", async () => {
   const { res } = await clientPays({ account: "ACC-001" });
   t.ok(!/is not connected to Supabase yet/.test(res.error || ""), "reaches the handler, not the fallthrough");
+});
+
+/* ---------- the harness itself: is the VM honest? ---------- */
+// This exists because the same bug landed twice, silently, and neither time did anything fail.
+// loadApp runs app.js in a vm whose Proxy answers has() with true for every identifier, so a global
+// missing from the backing object becomes a stub instead of a ReferenceError — and the stub is
+// plausible: calling it returns something truthy, constructing it returns something Array.from()
+// reads as empty. isFinite was absent, so _cNum returned NaN where it should return null and every
+// money-coercion test was asserting against the stub. Set was absent, so `new Set()` deduped to an
+// EMPTY list and any test of _supaBootstrap's technician roll-up would have passed against nothing.
+//
+// A green suite cannot tell you the VM is real. Only asking it can.
+await t.test("harness: the test VM has the real globals app.jsx depends on, not stubs", async () => {
+  const g = __globals();
+  t.eq(g.set, true, "Set constructs and dedupes — a stub yields an empty Array.from()");
+  t.eq(g.map, true, "Map stores and retrieves — a stub returns itself from get()");
+  t.eq(g.proxy, true, "Proxy is real: app.jsx's icon lookup (L) is an object, not the stub function");
+  t.eq(g.isFinite, true, "isFinite(0/0) is false — a stub returns truthy, which is what made _cNum lie");
+  t.eq(g.isNaN, true, "isNaN is real too");
+  // Found BY this test on its first run: NaN is a value, not a function, and it was stubbed. The
+  // stub coerces to "" and so to 0, which makes isFinite(NaN) come back TRUE — so the obvious way
+  // to write the assertion above would have quietly asserted the opposite of what it meant.
+  t.eq(g.nan, true, "NaN is a number, not the stub function");
+  t.eq(g.undef, true, "undefined resolves correctly through the Proxy — _cTxt's v === undefined depends on it");
 });
 
 /* ---------- the four live finance writes: edit / delete of a payment or an expense ---------- */
