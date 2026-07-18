@@ -974,12 +974,158 @@ await t.test("a lock refused with 42501 is reported as permission", async () => 
   t.ok(/don't have permission to lock/.test(res.error), `names the cause, got: ${res.error}`);
 });
 
-const FALLTHROUGH = ["pr_delete_period", "pr_apply_plans", "pr_set_dayoff",
+/* ---------- pr_save_period (create + edit) ---------- */
+// One action, two jobs: no id inserts a draft, an id updates the three text columns. The thing to
+// pin is that status never comes from the client on either path.
+
+const savePeriod = async (payload, { periods = [{ id: 3, status: "published" }], role = "payroll", opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_periods: periods }, opts);
+    window.SB = sb;
+    const res = await API("pr_save_period", payload);
+    return { sb, res };
+  } finally { setME(was); }
+};
+const pWrites = (sb) => sb.calls.filter((c) => c.op === "insert" || c.op === "update");
+
+await t.test("create: a no-id payload inserts a draft with label/pay_date/notes and returns the new id", async () => {
+  const { sb, res } = await savePeriod({ label: "Jul 18–25, 2026", pay_date: "2026-07-25", notes: "second half" });
+  t.eq(res.ok, true, `created, got: ${res.error}`);
+  t.ok(res.id != null, "returns the new id the modal needs to select the week");
+  const w = pWrites(sb);
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].op, "insert", "insert, not update");
+  t.eq(w[0].table, "pr_periods", "on pr_periods");
+  t.eq(w[0].row.label, "Jul 18–25, 2026", "label");
+  t.eq(w[0].row.pay_date, "2026-07-25", "pay_date");
+  t.eq(w[0].row.notes, "second half", "notes");
+  t.eq(w[0].row.status, "draft", "status forced to draft");
+});
+
+await t.test("create IGNORES a client-supplied status — always draft", async () => {
+  // The dangerous input: a crafted payload asking to be born 'published' would skip the
+  // every-line-approved gate. status is forced, never read from the client.
+  const { sb, res } = await savePeriod({ label: "W", pay_date: "2026-07-25", notes: "", status: "published" });
+  t.eq(res.ok, true, "created");
+  t.eq(pWrites(sb)[0].row.status, "draft", "still draft, not the 'published' the payload asked for");
+});
+
+await t.test("edit: an id payload UPDATEs label/pay_date/notes and never status", async () => {
+  const { sb, res } = await savePeriod({ id: 3, label: "renamed", pay_date: "2026-08-01", notes: "fixed" }, { periods: [{ id: 3, status: "published" }] });
+  t.eq(res.ok, true, `edited, got: ${res.error}`);
+  const w = pWrites(sb);
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].op, "update", "update, not insert");
+  t.eq(w[0].filters.id, 3, "the right period");
+  t.ok(!("status" in w[0].row), "status is NOT written — the lifecycle owns it");
+  t.eq(Object.keys(w[0].row).sort().join(","), "label,notes,pay_date", "only the three text columns");
+});
+
+await t.test("a blocked create (0 rows) is an honest failure, not a false success", async () => {
+  const { res } = await savePeriod({ label: "W", pay_date: "", notes: "" }, { opts: { blockWrites: "pr_periods" } });
+  t.eq(res.ok, false, "refused — no fake id handed back over a write that never happened");
+});
+
+await t.test("a blocked edit (0 rows) is an honest failure", async () => {
+  const { res } = await savePeriod({ id: 3, label: "x", pay_date: "", notes: "" }, { opts: { blockWrites: "pr_periods" } });
+  t.eq(res.ok, false, "refused");
+});
+
+/* ---------- pr_delete_period (destructive; items first) ---------- */
+// No FK cascade, so the handler deletes pr_items before the period. Order is the whole safety
+// story: a refused items delete must abort before the period is touched, or the lines orphan.
+
+const delItems = [
+  { id: 61, period_id: 4, employee_id: 5 },
+  { id: 62, period_id: 4, employee_id: 6 },
+  { id: 63, period_id: 7, employee_id: 5 },   // a different week — must never be touched
+];
+const delPeriodT = async (periods, items, payload, { role = "payroll", opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_periods: periods, pr_items: items }, opts);
+    window.SB = sb;
+    const res = await API("pr_delete_period", payload);
+    return { sb, res };
+  } finally { setME(was); }
+};
+const deletes = (sb) => sb.calls.filter((c) => c.op === "delete");
+
+await t.test("delete removes the pay lines FIRST, then the period", async () => {
+  const { sb, res } = await delPeriodT([{ id: 4, status: "draft" }], delItems, { id: 4 });
+  t.eq(res.ok, true, `deleted, got: ${res.error}`);
+  const d = deletes(sb);
+  t.eq(d.length, 2, "two deletes");
+  t.eq(d[0].table, "pr_items", "pr_items first");
+  t.eq(d[0].filters.period_id, 4, "scoped to this week's lines");
+  t.eq(d[1].table, "pr_periods", "pr_periods second");
+  t.eq(d[1].filters.id, 4, "the right period");
+});
+
+await t.test("an empty draft (zero items) deletes cleanly — only the period", async () => {
+  const { sb, res } = await delPeriodT([{ id: 4, status: "draft" }], [{ id: 63, period_id: 7, employee_id: 5 }], { id: 4 });
+  t.eq(res.ok, true, `deleted, got: ${res.error}`);
+  const d = deletes(sb);
+  t.eq(d.length, 1, "just the period — nothing to delete on pr_items");
+  t.eq(d[0].table, "pr_periods", "the period");
+});
+
+await t.test("delete refuses a LOCKED week and removes NOTHING — not even the lines", async () => {
+  // The order that matters most: the locked check must precede the items delete, or a locked
+  // week loses its approved payslips on the way to being refused.
+  const { sb, res } = await delPeriodT([{ id: 4, status: "locked" }], delItems, { id: 4 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/locked week can't be deleted/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(deletes(sb).length, 0, "no delete of any kind");
+});
+
+await t.test("delete refuses a missing week", async () => {
+  const { sb, res } = await delPeriodT([], delItems, { id: 4 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(deletes(sb).length, 0, "nothing deleted");
+});
+
+await t.test("delete with no id is refused before any lookup", async () => {
+  const { sb, res } = await delPeriodT([{ id: 4, status: "draft" }], delItems, {});
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("items-delete blocked (0 rows) → the period is NOT deleted, lines are not orphaned", async () => {
+  const { sb, res } = await delPeriodT([{ id: 4, status: "draft" }], delItems, { id: 4 }, { opts: { blockWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  // "nothing changed" — the TOTAL-refusal wording, not the partial "N of M removed before the
+  // rest". Every line was hidden, so nothing moved, and the message has to read that way or a
+  // total refusal masquerades as a half-done delete.
+  t.ok(/nothing changed/.test(res.error), `reads as total, not partial, got: ${res.error}`);
+  t.eq(deletes(sb).filter((c) => c.table === "pr_periods").length, 0, "the period delete never ran");
+});
+
+await t.test("items-delete blocked with 42501 → the period is NOT deleted", async () => {
+  const { sb, res } = await delPeriodT([{ id: 4, status: "draft" }], delItems, { id: 4 }, { opts: { errorWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  t.eq(deletes(sb).filter((c) => c.table === "pr_periods").length, 0, "the period delete never ran");
+});
+
+await t.test("period-delete blocked AFTER lines removed → honest 'lines removed, week remains'", async () => {
+  // The stranded case: the lines are gone but the period delete is refused. Reporting success
+  // would hide a half-deleted week; reporting a plain failure would imply nothing happened.
+  const { sb, res } = await delPeriodT([{ id: 4, status: "draft" }], delItems, { id: 4 }, { opts: { blockWrites: "pr_periods" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/pay lines were already removed/.test(res.error), `admits the lines are gone, got: ${res.error}`);
+  t.eq(deletes(sb).filter((c) => c.table === "pr_items").length, 1, "the lines really were removed first");
+});
+
+const FALLTHROUGH = ["pr_apply_plans", "pr_set_dayoff",
   "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan",
-  "pr_item_reply", "pr_request_print", "pr_mark_printed", "pr_save_period"];
+  "pr_item_reply", "pr_request_print", "pr_mark_printed"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 11, "11 actions still deferred — pr_lock is wired now");
+  t.eq(FALLTHROUGH.length, 9, "9 actions still deferred — save/delete period are wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;

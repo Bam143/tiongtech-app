@@ -2174,6 +2174,176 @@ async function _supaLock(payload) {
     ok: true
   };
 }
+/* ---- Create or edit a period (pr_save_period) ----
+   PeriodModal.save (app.jsx:4569) sends { id, label, pay_date, notes }. The id is undefined for a
+   New week and set for an Edit, so the same action does both — and the caller already reads the id
+   back (`if (r && r.id) id = r.id`, app.jsx:4574) to select the week it just made.
+
+   status is not in the payload and must never be taken from one. A new week is always 'draft', and
+   an edit leaves status exactly where it is — the lifecycle transitions (publish / lock / unlock)
+   are the only things that move it, each with its own policy. Accepting a client status here would
+   let the create form publish a week, skipping the every-line-approved gate that _supaLock exists
+   to enforce. The column list is a whitelist for the same reason _supaSaveItems keeps one
+   (app.jsx:757): the three fields the form owns, and nothing it doesn't.
+
+   RLS: pr_periods_insert admits any authenticated user and the button gates by role; an edit is a
+   non-status UPDATE, which pr_periods_update allows for anyone precisely because status is
+   untouched, so its WITH CHECK passes. */
+const _PR_PERIOD_SAVE_COLS = ["label", "pay_date", "notes"];
+function _prPeriodFields(payload) {
+  const out = {};
+  for (const c of _PR_PERIOD_SAVE_COLS) {
+    if (payload[c] !== undefined) out[c] = payload[c] == null ? null : String(payload[c]);
+  }
+  return out;
+}
+async function _supaSavePeriod(payload) {
+  const sb = window.SB;
+  const p = payload || {};
+  const fields = _prPeriodFields(p);
+  const id = Number(p.id || 0);
+  if (id) {
+    // Edit: the three columns only. status stays put, so this is the "new status equals the old"
+    // path through pr_periods_update's WITH CHECK.
+    const {
+      data: hit,
+      error
+    } = await sb.from("pr_periods").update(fields).eq("id", id).select("id");
+    if (error) return {
+      ok: false,
+      error: "Could not save the week: " + error.message
+    };
+    if (!hit || !hit.length) return {
+      ok: false,
+      error: "Saving the week was refused, or it no longer exists. Reload and try again."
+    };
+    return {
+      ok: true,
+      id
+    };
+  }
+  // Create: status is forced, never read from the client.
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_periods").insert({
+    ...fields,
+    status: "draft"
+  }).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not create the week: " + error.message
+  };
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Creating the week was refused by the database. Nothing was added."
+  };
+  return {
+    ok: true,
+    id: hit[0].id
+  };
+}
+/* ---- Delete a period and its lines (pr_delete_period) — DESTRUCTIVE, order matters ----
+   delPeriod (app.jsx:5055) sends { id }, behind a confirm that names the week.
+
+   THERE IS NO FOREIGN KEY from pr_items to pr_periods, so deleting the period does NOT cascade.
+   The lines have to go first and by hand, or they are orphaned — pay rows pointing at a period id
+   that no longer exists, invisible to every screen and impossible to clean up through the app.
+
+   ITEMS FIRST, PERIOD LAST, and if the items delete is refused the period must stay. An orphaned
+   pay line is worse than a stuck week: the week can be deleted again once permission is sorted,
+   but an orphan has lost the only handle anything had on it. So a refusal on the lines aborts
+   before the period is touched, and the "period had rows but zero came back" case counts as a
+   refusal — same reason _supaSaveItems asks for the affected rows back (app.jsx:888).
+
+   Zero items is legitimate, though: a New week that was never Saved has no lines. Counting first
+   is what tells an empty draft apart from a blocked delete — without it the two are the same 200
+   with an empty array, and an empty draft could never be deleted.
+
+   RLS: pr_periods_delete admits (owner OR payroll) AND status<>'locked'; pr_items_write (Piece C,
+   FOR ALL) lets owner+payroll delete non-locked items. The status guard below refuses a locked
+   week before either delete, so a locked week never loses its lines even if the period delete
+   would have been refused anyway. */
+async function _supaDeletePeriod(payload) {
+  const sb = window.SB;
+  const periodId = Number(payload && payload.id || 0);
+  if (!periodId) return {
+    ok: false,
+    error: "Missing id"
+  };
+  const {
+    data: per,
+    error: readErr
+  } = await sb.from("pr_periods").select("status").eq("id", periodId).maybeSingle();
+  if (readErr) return {
+    ok: false,
+    error: readErr.message
+  };
+  if (!per) return {
+    ok: false,
+    error: "This payroll period no longer exists. Reload the page and try again."
+  };
+  // Locked first, before anything is deleted. A locked week is final; deleting it would erase
+  // approved payslips, and RLS refuses it anyway — but the client must not remove the LINES on the
+  // way to discovering that, so this check has to precede the items delete.
+  if (per.status === "locked") return {
+    ok: false,
+    error: "A locked week can't be deleted. Unlock it first (owner only)."
+  };
+  // How many lines SHOULD go, so a zero-rows delete can be read as a refusal rather than an empty
+  // draft.
+  const {
+    data: before,
+    error: cntErr
+  } = await sb.from("pr_items").select("id").eq("period_id", periodId);
+  if (cntErr) return {
+    ok: false,
+    error: cntErr.message
+  };
+  const expected = (before || []).length;
+  if (expected) {
+    const {
+      data: goneItems,
+      error: itemsErr
+    } = await sb.from("pr_items").delete().eq("period_id", periodId).select("id");
+    if (itemsErr) return {
+      ok: false,
+      error: "Delete stopped — the database refused to remove this week's pay lines: " + itemsErr.message + " The week was NOT deleted."
+    };
+    const removed = (goneItems || []).length;
+    if (!removed) return {
+      ok: false,
+      error: "Delete stopped — the database refused to remove this week's pay lines. Your account may not have permission. The week was NOT deleted and nothing changed."
+    };
+    if (removed < expected) {
+      // Partial: RLS filtered the delete row by row. The week is now inconsistent, so stop and say
+      // so rather than deleting the period over a half-emptied line set.
+      return {
+        ok: false,
+        error: "Delete stopped — " + removed + " of " + expected + " pay lines were removed before the database refused the rest. The week was NOT deleted; fix the permission and delete again."
+      };
+    }
+  }
+  // Only now the period. If this is refused after the lines are gone, say plainly that the lines
+  // were removed but the week remains — the same honesty _supaPublish uses when its two writes
+  // half-land.
+  const stranded = expected ? " This week's pay lines were already removed, so the week is empty but still listed — delete it again once the permission is sorted." : "";
+  const {
+    data: gone,
+    error
+  } = await sb.from("pr_periods").delete().eq("id", periodId).select("id");
+  if (error) return {
+    ok: false,
+    error: "Deleting the week failed: " + error.message + stranded
+  };
+  if (!gone || !gone.length) return {
+    ok: false,
+    error: "Deleting the week was refused — your account may not have permission." + stranded
+  };
+  return {
+    ok: true
+  };
+}
 /* ---- The review pair (pr_item_approve / pr_item_contest) ----
    The employee's two buttons on their own payslip (app.jsx:5162/5163), and — new — the officer's
    single-row Approve on the grid. Approve sends { id }; Contest sends { id, remark }.
@@ -2383,6 +2553,12 @@ const API = (action, payload) => {
         }
         if (action === "pr_lock") {
           return await _supaLock(payload);
+        }
+        if (action === "pr_save_period") {
+          return await _supaSavePeriod(payload);
+        }
+        if (action === "pr_delete_period") {
+          return await _supaDeletePeriod(payload);
         }
         if (action === "pr_item_approve") {
           return await _supaItemApprove(payload);
@@ -15269,7 +15445,7 @@ function PayrollPage({
     }
   }, /*#__PURE__*/React.createElement(Users, {
     size: 15
-  }), "Rates & schedules"), canAdd("payroll") && /*#__PURE__*/React.createElement("button", {
+  }), "Rates & schedules"), (isOwner || isPayroll) && /*#__PURE__*/React.createElement("button", {
     onClick: () => setModal({
       type: "period",
       period: null
@@ -15359,7 +15535,7 @@ function PayrollPage({
     }
   }, /*#__PURE__*/React.createElement(IconPencil, {
     size: 14
-  }), "Edit week"), period && /*#__PURE__*/React.createElement("button", {
+  }), "Edit week"), period && (isOwner || isPayroll) && /*#__PURE__*/React.createElement("button", {
     onClick: delPeriod,
     title: "Delete week",
     style: {

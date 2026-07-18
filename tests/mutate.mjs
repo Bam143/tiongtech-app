@@ -274,6 +274,58 @@ const MUTATIONS = [
     from: `  const contested = rows.filter(r => r.status === "contested").length;`,
     to: `  const contested = 0;`,
   },
+  // ---- create / delete period (pr_save_period / pr_delete_period) ----
+  {
+    name: "create-status-from-client",
+    // The forced 'draft' is the guard, and it has to WIN over anything the payload carries — a
+    // create asking to be born 'published' would skip the every-line-approved gate _supaLock
+    // enforces. Reading p.status is exactly the mistake the literal exists to prevent. (Note the
+    // whitelist in _prPeriodFields is a second line of defence — this proves the forced literal is
+    // load-bearing on its own, not resting on the whitelist.)
+    in: "_supaSavePeriod",
+    why: "a crafted create payload publishes a week on insert, skipping the review-and-lock lifecycle entirely",
+    from: `    status: "draft"
+  }).select("id");`,
+    to: `    status: p.status || "draft"
+  }).select("id");`,
+  },
+  {
+    name: "drop-delete-locked-guard",
+    in: "_supaDeletePeriod",
+    why: "a locked week can be deleted, erasing approved payslips — and its lines are removed on the way to finding out RLS would have refused the period",
+    from: `  if (per.status === "locked") return {
+    ok: false,
+    error: "A locked week can't be deleted. Unlock it first (owner only)."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "delete-skips-items",
+    // The items delete and every honest-failure check around it live in one `if (expected)` block.
+    // Neutralise its guard and the period is deleted with its lines never removed — the orphan the
+    // whole items-first order exists to prevent. The strongest form of "no ordering": there is no
+    // items delete left to be ordered against. `expected` stays declared for the stranded line.
+    in: "_supaDeletePeriod",
+    why: "the period is deleted without removing its lines first, orphaning every pay row on a week that no longer exists",
+    from: `  if (expected) {`,
+    to: `  if (false) {`,
+  },
+  {
+    name: "drop-delete-items-zerorows",
+    // Shadowed by `removed < expected` (removed is 0 and expected is >= 1 in this block), so
+    // dropping it still refuses — with a message claiming "0 of N removed before the rest",
+    // implying a partial that never happened. It survived until the test asserted the total-refusal
+    // wording. The guard is about telling the truth, same as drop-publish-items-zerorows.
+    in: "_supaDeletePeriod",
+    why: "a total refusal on the items delete is reported as a partial one, telling the officer some lines went when none did",
+    from: `    if (!removed) return {
+      ok: false,
+      error: "Delete stopped — the database refused to remove this week's pay lines. Your account may not have permission. The week was NOT deleted and nothing changed."
+    };
+`,
+    to: "",
+  },
   // ---- the review pair (pr_item_approve / pr_item_contest) ----
   // The four guards live in _prReviewGate, which BOTH actions run, so each mutation here is a
   // single edit that both handlers' tests get a shot at.
