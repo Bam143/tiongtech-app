@@ -1925,16 +1925,111 @@ await t.test("apply: 'applied' counts only employees who actually got a deductio
   t.eq(itemWrites(sb).length, 2, "but BOTH pay lines are written — Ben's has to be cleared");
 });
 
+/* ---------- client_payments (one client's payment history — READ ONLY) ---------- */
+// The first finance handler with coverage; everything else on payments/expenses is still untested.
+// payments.account is a plain text column holding clients.account_number — no foreign key — so the
+// filter is a string match and "unknown account" and "client with no payments" are the same answer.
+const PAY_ROWS = [
+  { id: 1, paid_at: "2026-05-02", account: "ACC-001", source: "GCash", amount: 1500, reference: "R-1", user_name: "luz" },
+  { id: 2, paid_at: "2026-07-11", account: "ACC-001", source: "Cash", amount: 900, reference: "R-2", user_name: "luz" },
+  { id: 3, paid_at: "2026-06-08", account: "ACC-001", source: "Bank", amount: 1200, reference: "R-3", user_name: "luz" },
+  { id: 4, paid_at: "2026-07-20", account: "ACC-999", source: "Cash", amount: 5000, reference: "R-9", user_name: "luz" },
+];
+const clientPays = async (payload, rows = PAY_ROWS.map((r) => ({ ...r }))) => {
+  const sb = makeFakeSB({ payments: rows });
+  window.SB = sb;
+  const res = await API("client_payments", payload);
+  return { sb, res };
+};
+// makeFakeSB injects errors on WRITES only (opts.errorWrites lives inside the WRITES branch), so a
+// failing SELECT needs a purpose-built stub. Kept local rather than extending the shared fake: this
+// change should not touch infrastructure every other assertion in this file runs through.
+const failingSelectSB = (message) => ({
+  calls: [],
+  from(table) {
+    const q = { table, filters: {} };
+    const b = {
+      select(cols) { q.cols = cols; return b; },
+      eq(k, v) { q.filters[k] = v; return b; },
+      then(res, rej) { return Promise.resolve({ data: null, error: { code: "42501", message } }).then(res, rej); },
+    };
+    return b;
+  },
+});
+
+await t.test("client payments: returns the shape ClientProfile renders", async () => {
+  const { sb, res } = await clientPays({ account: "ACC-001" });
+  t.eq(res.ok, true, `loaded, got: ${res.error}`);
+  t.eq(res.payments.length, 3, "three rows for this account");
+  const p = res.payments[0];
+  // The panel reads exactly these four off each row (app.jsx:6970/6971/6972/6973).
+  t.ok("paid_at" in p && "reference" in p && "source" in p && "amount" in p,
+    `the panel's four fields must be present, got: ${Object.keys(p).sort().join(",")}`);
+  t.eq(typeof p.amount, "number", "amount is a number — the panel sums it into Total Paid");
+  const read = sb.calls.filter((c) => c.op === "select");
+  t.eq(read.length, 1, "one read");
+  t.eq(read[0].table, "payments", "from payments");
+});
+
+await t.test("client payments: newest first", async () => {
+  const { res } = await clientPays({ account: "ACC-001" });
+  t.eq(res.payments.map((p) => p.paid_at).join(","), "2026-07-11,2026-06-08,2026-05-02", "most recent at the top");
+});
+
+await t.test("client payments: filtered to the asked-for client, not the whole ledger", async () => {
+  const { sb, res } = await clientPays({ account: "ACC-001" });
+  t.eq(sb.calls.filter((c) => c.op === "select")[0].filters.account, "ACC-001", "the filter names the account");
+  t.ok(res.payments.every((p) => p.account === "ACC-001"), "no other client's payment came back");
+  t.ok(!res.payments.some((p) => p.reference === "R-9"), "ACC-999's 5000 is absent — it would inflate Total Paid");
+});
+
+await t.test("client payments: a client with none is ok:true and empty, NOT an error", async () => {
+  const { res } = await clientPays({ account: "ACC-NEW" });
+  t.eq(res.ok, true, `an unpaid client is a normal answer, got: ${res.error}`);
+  t.eq(res.payments.length, 0, "empty list");
+});
+
+await t.test("client payments: an empty payments table is still ok:true", async () => {
+  const { res } = await clientPays({ account: "ACC-001" }, []);
+  t.eq(res.ok, true, `still ok, got: ${res.error}`);
+  t.eq(res.payments.length, 0, "empty list");
+});
+
+await t.test("client payments: a FAILED query is an honest failure, never a fake-empty list", async () => {
+  // The distinction that matters: the panel reduces whatever comes back into "Total Paid" and
+  // prints the count beside it, so a swallowed error renders a paying client as ₱0.00 / 0 payments.
+  window.SB = failingSelectSB("permission denied for table payments");
+  const res = await API("client_payments", { account: "ACC-001" });
+  t.eq(res.ok, false, "refused — a broken read must not look like an unpaid client");
+  t.ok(/Could not load this client's payments/.test(res.error), `explains itself, got: ${res.error}`);
+  t.ok(!res.payments, "no payments array on a failure — nothing for the caller to sum");
+});
+
+await t.test("client payments: a missing account is refused before any read", async () => {
+  const { sb, res } = await clientPays({});
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("client payments: is wired — it no longer falls through", async () => {
+  const { res } = await clientPays({ account: "ACC-001" });
+  t.ok(!/is not connected to Supabase yet/.test(res.error || ""), "reaches the handler, not the fallthrough");
+});
+
 const FALLTHROUGH = [];
 
 await t.test("every payroll write is wired — nothing falls through to \"not connected\" any more", async () => {
   t.eq(FALLTHROUGH.length, 0, "the list is empty: pr_apply_plans was the last one");
   // The guard is worth keeping now that it is empty — it fails loudly if an unwired pr_* action
   // is ever added back, which is otherwise only noticed when a button errors in production.
+  // client_payments is not a pr_* action and was never in FALLTHROUGH — it fell through via the
+  // generic terminal line (app.jsx:1723) rather than a tracked list. It is listed here so the same
+  // guard now covers it: the point of this test is "nothing reaches the fallthrough", not "no
+  // payroll action does".
   const PR_ACTIONS = ["pr_save_items", "pr_unlock", "pr_publish", "pr_lock", "pr_save_period",
     "pr_delete_period", "pr_item_approve", "pr_item_contest", "pr_item_reply", "pr_request_print",
     "pr_mark_printed", "pr_set_dayoff", "pr_save_employee", "pr_delete_employee", "pr_save_plan",
-    "pr_delete_plan", "pr_apply_plans"];
+    "pr_delete_plan", "pr_apply_plans", "client_payments"];
   for (const action of PR_ACTIONS) {
     const sb = makeFakeSB({});
     window.SB = sb;

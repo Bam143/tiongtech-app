@@ -638,6 +638,32 @@ const MUTATIONS = [
     active: false
   })`,
   },
+  // ---- client_payments (read-only, but the failure mode is silent and expensive) ----
+  {
+    name: "clientpays-swallow-error",
+    why: "a failed read falls through to an empty list, so the client profile prints a confident 'Total Paid ₱0.00' and '0 payments' for somebody who has paid — a broken query and an unpaid client become the same screen, and the wrong one gets chased for money",
+    in: "_supaClientPayments",
+    from: `  if (error) return {
+    ok: false,
+    error: "Could not load this client's payments: " + error.message
+  };
+`,
+    to: "",
+  },
+  {
+    name: "clientpays-drop-client-filter",
+    why: "every client's profile shows the WHOLE payment ledger — one client's Total Paid includes everyone else's money, and each profile leaks what every other subscriber has paid",
+    in: "_supaClientPayments",
+    from: `await sb.from("payments").select(_pCols).eq("account", account);`,
+    to: `await sb.from("payments").select(_pCols);`,
+  },
+  {
+    name: "clientpays-oldest-first",
+    why: "the payment history reads bottom-up, so the most recent payment is buried at the end and the panel's first row is the client's oldest — the one question it exists to answer, 'did they pay lately', gets the wrong answer at a glance",
+    in: "_supaClientPayments",
+    from: `payments.sort((a, b) => String(b.paid_at || "").localeCompare(String(a.paid_at || "")));`,
+    to: `payments.sort((a, b) => String(a.paid_at || "").localeCompare(String(b.paid_at || "")));`,
+  },
   {
     name: "drop-saveplan-per-week",
     why: "the weekly share is never stored, so every plan saved from this screen goes back to having none — pr_apply_plans falls to its legacy fallback for rows that should not need one, and a schema change that retired the fallback would price every term at zero",

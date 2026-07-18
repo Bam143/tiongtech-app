@@ -628,6 +628,40 @@ async function _supaFinancials() {
     financeMonths: Array.from(months).sort().reverse(),
   };
 }
+/* ---- One client's payment history (client_payments) — READ ONLY ----
+   ClientProfile's payment panel (app.jsx:6897), which asks by ACCOUNT NUMBER, not by client id:
+   payments.account is a plain text column carrying clients.account_number, with no foreign key
+   behind it. So the filter is a string match and nothing guarantees the account exists — an
+   unknown one is simply a client with no payments, which is also what a real client with none
+   looks like. That ambiguity is inherent to the link and is not worth inventing a lookup to
+   resolve; the panel renders "No payments recorded." either way.
+
+   NO ROLE GATE, deliberately. The panel is fetched by anyone who can open a client profile
+   (app.jsx:6895 has no permission check), so a gate here would blank it for technicians. Reads on
+   payments have to stay open to every role for the same reason pr_employees reads do.
+
+   THE ONE THING THIS MUST NOT DO is return an empty list when the query failed. The caller reduces
+   whatever comes back into a "Total Paid" figure (app.jsx:6902) and prints the row count beside
+   it, so a swallowed error renders as a confident ₱0.00 and "0 payments" — a client who has paid
+   shown as one who never has. Empty and broken must not look alike, which is why `error` returns
+   ok:false rather than falling through to an empty map below. */
+async function _supaClientPayments(payload) {
+  const sb = window.SB;
+  const account = String((payload && payload.account) || "").trim();
+  if (!account) return { ok: false, error: "Missing account" };
+  const { data, error } = await sb.from("payments").select(_pCols).eq("account", account);
+  if (error) return { ok: false, error: "Could not load this client's payments: " + error.message };
+  // _payRow is the same mapping the finance pages read through, so the panel sees the shape the
+  // rest of the app already agrees on. It emits more than the panel uses (date, user, account) —
+  // a superset costs nothing and keeps one reader of the payments columns rather than two.
+  const payments = (data || []).map(_payRow);
+  // Newest first, sorted HERE rather than with .order(): _supaFinancials does the same (app.jsx:590)
+  // because PostgREST ordering and JS ordering would be two different rules to keep in step, and
+  // the dates are ISO strings so a plain string compare is the date compare.
+  payments.sort((a, b) => String(b.paid_at || "").localeCompare(String(a.paid_at || "")));
+  // Zero payments is a perfectly good answer, and an ok one: the client simply has not paid yet.
+  return { ok: true, payments };
+}
 // Renewals. Two owners share the renewal_stages row: set_renewal_stage owns `stage`, and
 // set_renewal_followup owns the five follow-up columns. Each writes only its own, so an
 // upsert from one never blanks the other's. account_number is the row key, never a value.
@@ -1823,6 +1857,7 @@ const API = (action, payload) => {
           return { ok: true };
         }
         if (action === "financials") { return await _supaFinancials(); }
+        if (action === "client_payments") { return await _supaClientPayments(payload); }
         if (action === "fin_range") {
           const inc = ((payload && payload.kind) || "income") === "income";
           const col = inc ? "paid_at" : "spent_at";
