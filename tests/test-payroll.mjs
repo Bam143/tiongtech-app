@@ -1469,10 +1469,159 @@ await t.test("period-delete blocked AFTER lines removed → honest 'lines remove
   t.eq(deletes(sb).filter((c) => c.table === "pr_items").length, 1, "the lines really were removed first");
 });
 
-const FALLTHROUGH = ["pr_apply_plans", "pr_save_plan", "pr_delete_plan"];
+/* ---------- pr_save_plan / pr_delete_plan (loans & installment deductions) ---------- */
+// Add/edit and delete, owner+payroll only. Like the roster this is an APP guard and nothing more:
+// pr_plans carries the permissive `staff_all` policy (verified 2026-07-18), so the database accepts
+// a plan write from any signed-in staff account. These tests are the only thing standing behind it.
+// Delete is SOFT (active=0) — a plan whose deductions already ran must keep explaining the money
+// that came off past payslips, so the row survives and only future weeks stop.
+const PLAN_ROW = { id: 12, employee_id: 5, kind: "ca", category: "loan", label: "Cash advance", total_amount: 2000, terms_total: 10, interest_rate: 0, interest_only: 0, start_date: "2026-07-01", active: 1 };
+const PLAN_IN = { employee_id: 5, kind: "ca", category: "loan", label: "Cash advance", total_amount: 2000, terms_total: 10, interest_rate: 0, interest_only: 0, start_date: "2026-07-01", active: 1 };
+const loans = async (action, payload, { role = "technician", rows = [{ ...PLAN_ROW }], opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_plans: rows }, opts);
+    window.SB = sb;
+    const res = await API(action, payload);
+    return { sb, res };
+  } finally { setME(was); }
+};
+const PLAN_COLS = ["active", "category", "employee_id", "interest_only", "interest_rate", "kind", "label", "start_date", "terms_total", "total_amount"].join(",");
 
-await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 3, "3 actions still deferred — the employee add/edit/delete pair is wired now");
+await t.test("save plan: a no-id payload INSERTS and forces active=1", async () => {
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, active: 0 }, { role: "owner" });
+  t.eq(res.ok, true, `created, got: ${res.error}`);
+  t.ok(res.id != null, "a new id came back");
+  const ins = sb.calls.filter((c) => c.op === "insert");
+  t.eq(ins.length, 1, "one insert");
+  t.eq(ins[0].table, "pr_plans", "on pr_plans");
+  t.eq(ins[0].row.active, 1, "active FORCED to 1 — a new plan that deducts nothing is never what was meant");
+  t.ok(!("id" in ins[0].row), "the insert does not carry a client id");
+  t.ok(!("terms_done" in ins[0].row) && !("paid" in ins[0].row), "progress columns are never written by a save");
+  t.ok(!("per_week" in ins[0].row), "the derived weekly share is not written — it would drift from the totals");
+});
+
+await t.test("save plan: an id payload UPDATEs exactly the whitelisted columns", async () => {
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, id: 12, total_amount: 3000, terms_total: 12 }, { role: "owner" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  t.eq(res.id, 12, "echoes the edited id back");
+  const w = sb.calls.filter((c) => c.op === "update");
+  t.eq(w.length, 1, "one update");
+  t.eq(w[0].table, "pr_plans", "on pr_plans");
+  t.eq(w[0].filters.id, 12, "the right row");
+  t.eq(Object.keys(w[0].row).sort().join(","), PLAN_COLS, "owns exactly the plan columns — no terms_done, no paid, no per_week, no id");
+  t.eq(w[0].row.total_amount, 3000, "new total written");
+  t.eq(w[0].row.terms_total, 12, "new term count written");
+});
+
+await t.test("save plan: the payroll officer may save too", async () => {
+  const { res } = await loans("pr_save_plan", { ...PLAN_IN, id: 12 }, { role: "payroll" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+});
+
+await t.test("save plan: smallint flags are written as 0/1, never booleans", async () => {
+  const { sb } = await loans("pr_save_plan", { ...PLAN_IN, id: 12, interest_only: true, active: true }, { role: "owner" });
+  const row = sb.calls.filter((c) => c.op === "update")[0].row;
+  t.eq(row.interest_only, 1, "interest_only is smallint 1, not true");
+  t.eq(row.active, 1, "active is smallint 1, not true");
+  const off = await loans("pr_save_plan", { ...PLAN_IN, id: 12, interest_only: false, active: false }, { role: "owner" });
+  const offRow = off.sb.calls.filter((c) => c.op === "update")[0].row;
+  t.eq(offRow.interest_only, 0, "interest_only is smallint 0, not false");
+  t.eq(offRow.active, 0, "active is smallint 0, not false — PostgREST rejects a boolean for a smallint");
+});
+
+await t.test("save plan: an edit can REACTIVATE a soft-deleted plan (active back to 1)", async () => {
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, id: 12, active: 1 }, { role: "owner", rows: [{ ...PLAN_ROW, active: 0 }] });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op === "update")[0].row.active, 1, "active flips back to 1 — the soft delete is reversible");
+});
+
+await t.test("save plan: a non-officer is refused before any write", async () => {
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, id: 12, total_amount: 1 }, { role: "technician" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can change a loan plan.", "message");
+  t.eq(sb.calls.length, 0, "nothing touched — refused before any DB call");
+});
+
+await t.test("save plan: a missing employee is refused before any write", async () => {
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, employee_id: 0 }, { role: "owner" });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Pick an employee/.test(res.error), `message, got: ${res.error}`);
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("save plan: a zero or negative total is refused — it would misprice every week", async () => {
+  for (const bad of [0, -50]) {
+    const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, total_amount: bad }, { role: "owner" });
+    t.eq(res.ok, false, `total ${bad} refused`);
+    t.ok(/total amount greater than zero/.test(res.error), `message, got: ${res.error}`);
+    t.eq(sb.calls.length, 0, `total ${bad} touched nothing`);
+  }
+});
+
+await t.test("save plan: fewer than one term is refused — the weekly share divides by it", async () => {
+  for (const bad of [0, -3]) {
+    const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, terms_total: bad }, { role: "owner" });
+    t.eq(res.ok, false, `terms ${bad} refused`);
+    t.ok(/at least one weekly term/.test(res.error), `message, got: ${res.error}`);
+    t.eq(sb.calls.length, 0, `terms ${bad} touched nothing`);
+  }
+});
+
+await t.test("save plan: a silently blocked write (200 + []) is an honest failure", async () => {
+  const { res } = await loans("pr_save_plan", { ...PLAN_IN, id: 12 }, { role: "owner", opts: { blockWrites: "pr_plans" } });
+  t.eq(res.ok, false, "refused — never a false 'saved'");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("save plan: a blocked create (0 rows) is an honest failure too", async () => {
+  const { res } = await loans("pr_save_plan", PLAN_IN, { role: "owner", opts: { blockWrites: "pr_plans" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Nothing was added/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("delete plan: the owner SOFT-deletes — active=0, no DELETE, pr_items untouched", async () => {
+  const { sb, res } = await loans("pr_delete_plan", { id: 12 }, { role: "owner" });
+  t.eq(res.ok, true, `deactivated, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op === "delete").length, 0, "NOT a hard delete — the debt record is kept");
+  const w = sb.calls.filter((c) => c.op === "update");
+  t.eq(w.length, 1, "exactly one update");
+  t.eq(w[0].table, "pr_plans", "on pr_plans");
+  t.eq(w[0].filters.id, 12, "the right row");
+  t.eq(w[0].row.active, 0, "active set to 0 (smallint, not boolean false)");
+  t.eq(Object.keys(w[0].row).sort().join(","), "active", "owns exactly the active column — nothing else moves");
+  t.eq(sb.calls.filter((c) => c.table === "pr_items").length, 0, "pr_items is NEVER touched — past deductions keep their explanation");
+});
+
+await t.test("delete plan: the payroll officer may stop a loan too", async () => {
+  const { res } = await loans("pr_delete_plan", { id: 12 }, { role: "payroll" });
+  t.eq(res.ok, true, `deactivated, got: ${res.error}`);
+});
+
+await t.test("delete plan: a non-officer is refused, and nothing is written", async () => {
+  const { sb, res } = await loans("pr_delete_plan", { id: 12 }, { role: "technician" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can change a loan plan.", "message");
+  t.eq(sb.calls.filter((c) => c.op === "update").length, 0, "nothing written");
+});
+
+await t.test("delete plan: a missing id is refused before any lookup", async () => {
+  const { sb, res } = await loans("pr_delete_plan", {}, { role: "owner" });
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("delete plan: a silently blocked delete (200 + []) is an honest failure", async () => {
+  const { res } = await loans("pr_delete_plan", { id: 12 }, { role: "owner", opts: { blockWrites: "pr_plans" } });
+  t.eq(res.ok, false, "refused — never a false 'deleted'");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+const FALLTHROUGH = ["pr_apply_plans"];
+
+await t.test(`the other ${FALLTHROUGH.length} payroll write still falls through to "not connected"`, async () => {
+  t.eq(FALLTHROUGH.length, 1, "1 action still deferred — the plan save/delete pair is wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;

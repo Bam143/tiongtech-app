@@ -2877,6 +2877,154 @@ async function _supaDeleteEmployee(payload) {
     ok: true
   };
 }
+/* ---- Loan / installment plans (pr_save_plan add/edit, pr_delete_plan) ----
+   LoanManagement's Save (app.jsx:5109 via persist), its interest-only toggle (5096) and Delete
+   (5128). PlansModal (4913) sends the same two actions and is DEAD CODE — defined, never rendered
+   — so LoanManagement is the only screen these serve; wiring here covers both regardless.
+
+   Owner or payroll, enforced HERE and ONLY here. pr_plans carries the permissive `staff_all`
+   policy — verified 2026-07-18 — so the database accepts a plan write from any signed-in staff
+   account and refuses nothing. Unlike pr_items (Piece A/C), where RLS is the real freeze and this
+   layer only picks the error message, these two guards ARE the access control: delete the officer
+   check and any technician can write debts onto a co-worker's payslip. Same standing as
+   _supaSaveEmployee against pr_employees. A role-scoped policy on pr_plans is the real fix and is
+   a separate task; until then this check is load-bearing, which is why a mutation covers each one.
+
+   A plan is a DEBT INSTRUCTION, not a payment record: pr_apply_plans reads these rows to write the
+   weekly ded_* lines on pr_items. So a wrong total_amount or terms_total silently misprices every
+   future week, which is why the numbers are validated here and not just in the form. */
+async function _supaSavePlan(payload) {
+  const sb = window.SB;
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change a loan plan."
+  };
+  const employeeId = Number(payload && payload.employee_id || 0);
+  if (!employeeId) return {
+    ok: false,
+    error: "Pick an employee for this loan."
+  };
+  const kind = String(payload && payload.kind || "").trim();
+  if (!kind) return {
+    ok: false,
+    error: "A loan needs a type."
+  };
+  // total_amount drives the weekly share (total / terms) and terms_total is its divisor, so a zero
+  // or negative either prices the deduction wrong or divides by zero. The form checks both
+  // (app.jsx:5115/5121) — repeated here because the form is not the only way in, and a bad plan
+  // corrupts every week it is applied to, not just the screen that created it.
+  const totalAmount = Number(payload && payload.total_amount || 0);
+  if (!(totalAmount > 0)) return {
+    ok: false,
+    error: "A loan needs a total amount greater than zero."
+  };
+  const termsTotal = Number(payload && payload.terms_total || 0);
+  if (!(termsTotal >= 1)) return {
+    ok: false,
+    error: "A loan needs at least one weekly term."
+  };
+  // Whitelist the plan columns. terms_done/paid are NOT here — they are progress, owned by
+  // pr_apply_plans, and letting an edit rewrite them would reset or fake a debt's repayment
+  // history. per_week is not here either: it is derived (total / terms, app.jsx:5090) and the form
+  // never sends it, so writing a value now would drift from the totals the moment either changes.
+  // interest_only and active are smallint (confirmed against the schema, 2026-07-18) like
+  // pr_employees.active and the print flags — 0/1, never false/true, which PostgREST rejects for a
+  // smallint. The read path already assumes this: both are in _PR_PLAN_N's numeric coercion (700).
+  const row = {
+    employee_id: employeeId,
+    kind,
+    category: String(payload && payload.category || "loan"),
+    label: String(payload && payload.label || ""),
+    total_amount: totalAmount,
+    terms_total: termsTotal,
+    interest_rate: Number(payload && payload.interest_rate || 0),
+    interest_only: payload && payload.interest_only ? 1 : 0,
+    start_date: payload && payload.start_date ? payload.start_date : null
+  };
+  const id = Number(payload && payload.id || 0);
+  if (id) {
+    // Edit carries active through, because this is the path that REACTIVATES a soft-deleted plan:
+    // ticking Active on an inactive row and saving flips it back to 1 (app.jsx:5163).
+    row.active = payload && payload.active ? 1 : 0;
+    const {
+      data: hit,
+      error
+    } = await sb.from("pr_plans").update(row).eq("id", id).select("id");
+    if (error) return {
+      ok: false,
+      error: "Could not save this loan: " + error.message
+    };
+    if (!hit || !hit.length) return {
+      ok: false,
+      error: "Saving this loan was refused by the database. Nothing changed."
+    };
+    return {
+      ok: true,
+      id
+    };
+  }
+  // Create: a brand-new plan is always active. The form offers an Active tickbox on a new row
+  // (app.jsx:5163) and an unticked one would write a debt that silently deducts nothing — the
+  // officer would see it listed and wonder why no money moved. A plan that should not run yet has
+  // start_date for that. Same .select("id") shape as _supaSaveEmployee (1454): the new id comes
+  // back as hit[0].id, and LoanManagement reloads from the database rather than storing it (5109).
+  row.active = 1;
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_plans").insert(row).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not add this loan: " + error.message
+  };
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Adding this loan was refused by the database. Nothing was added."
+  };
+  return {
+    ok: true,
+    id: hit[0].id
+  };
+}
+async function _supaDeletePlan(payload) {
+  const sb = window.SB;
+  const id = Number(payload && payload.id || 0);
+  if (!id) return {
+    ok: false,
+    error: "Missing id"
+  };
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change a loan plan."
+  };
+  // SOFT delete, for the same reason as the roster (1465): a hard delete would destroy the record
+  // of a debt that has ALREADY been deducted. The pr_items ded_* lines it produced stay on past
+  // payslips either way, so removing the plan would leave money taken off a payslip with nothing
+  // left to explain it — an employee asking "what was this ₱250?" could not be answered. active=0
+  // stops future weeks deducting (pr_apply_plans reads active plans) while the record survives.
+  // Reactivation is reachable: LoanManagement's "Show inactive" reveals the row and ticking Active
+  // saves it back to 1 (app.jsx:5163 -> the id branch above). smallint, so 0 and not false.
+  // Whitelist active only; pr_items is never touched, so no past deduction is rewritten.
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_plans").update({
+    active: 0
+  }).eq("id", id).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not deactivate this loan: " + error.message
+  };
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Deactivating this loan was refused by the database — your account may not have permission. Nothing changed."
+  };
+  return {
+    ok: true
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -2964,6 +3112,12 @@ const API = (action, payload) => {
         }
         if (action === "pr_delete_employee") {
           return await _supaDeleteEmployee(payload);
+        }
+        if (action === "pr_save_plan") {
+          return await _supaSavePlan(payload);
+        }
+        if (action === "pr_delete_plan") {
+          return await _supaDeletePlan(payload);
         }
         if (action === "create_client") {
           const {
@@ -14754,6 +14908,14 @@ function LoanManagement({
   const [q, setQ] = useState("");
   const [size, setSize] = useState(10);
   const [page, setPage] = useState(0);
+  const [showInactive, setShowInactive] = useState(false);
+  // Who may write a plan. ME.role, and NOT can("payroll") — the same reasoning PayrollPage spells
+  // out for Publish (app.jsx:5267): _supaSavePlan/_supaDeletePlan gate on ME.role, so gating the
+  // buttons on can() would render Edit/Delete for a Settings-granted admin and hand them a refusal
+  // every time. The button should not exist unless the write behind it can succeed.
+  const isOwner = !!ME && ME.role === "owner";
+  const isPayroll = !!ME && ME.role === "payroll";
+  const officer = isOwner || isPayroll;
   const outstanding = plans.filter(p => p.active).reduce((s, p) => s + Math.max(0, (Number(p.total_amount) || 0) - (Number(p.paid) || 0)), 0);
   const flash = (ok, text) => {
     setMsg({
@@ -14897,14 +15059,17 @@ function LoanManagement({
     }, "Saved.", () => cancelEdit(id));
   };
   const delRow = async p => {
-    if (!window.confirm(`Delete this ${p.label} loan for ${empName(p.employee_id)}? This cannot be undone.`)) return;
+    // Says what actually happens. The old text promised "cannot be undone" over a hard delete; the
+    // write is a soft delete, so the honest prompt is that deductions stop and the record stays —
+    // and that it is reversible, which is the difference the officer is deciding on.
+    if (!window.confirm(`Stop this ${p.label} loan for ${empName(p.employee_id)}?\n\nNo further weekly deductions will be made. Past deductions and the loan record are kept, and you can restore it later with "Show inactive".`)) return;
     setBusy(true);
     try {
       await prWrite("pr_delete_plan", {
         id: p.id
       });
       await reload();
-      flash(true, "Deleted.");
+      flash(true, "Loan stopped — no further deductions.");
     } catch (e) {
       flash(false, e.message);
     }
@@ -15113,12 +15278,39 @@ function LoanManagement({
     onClick: onCancel,
     style: btn("transparent", t.textMuted)
   }, "Cancel")));
-  const filteredPlans = plans.filter(p => {
+
+  // A soft-deleted plan (active=0) drops out of the list, so Delete LOOKS like a delete even though
+  // the row survives. "Show inactive" is what keeps reactivation reachable: without it a deleted
+  // plan would be invisible AND un-editable, and ticking Active back on (5163) could never be
+  // reached — the record would persist with no way back, which is a worse outcome than a hard
+  // delete, not a better one. Inactive rows are dimmed so the two states never read alike.
+  const inactiveCount = plans.filter(p => !p.active).length;
+  const visiblePlans = showInactive ? plans : plans.filter(p => p.active);
+  const filteredPlans = visiblePlans.filter(p => {
     const s = (empName(p.employee_id) + " " + kindLabel(p.kind) + " " + catLabel(p.category) + " " + (p.label || "")).toLowerCase();
     return s.includes(q.trim().toLowerCase());
   });
   const pg = prPaginate(filteredPlans, size, page);
   const searchBox = /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2"
+  }, inactiveCount > 0 && /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "inline-flex",
+      alignItems: "center",
+      gap: 5,
+      color: t.textMuted,
+      fontSize: 11.5,
+      whiteSpace: "nowrap",
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: showInactive,
+    onChange: e => {
+      setShowInactive(e.target.checked);
+      setPage(0);
+    }
+  }), "Show inactive (", inactiveCount, ")"), /*#__PURE__*/React.createElement("div", {
     className: "flex items-center gap-2",
     style: {
       background: t.surface2,
@@ -15143,7 +15335,7 @@ function LoanManagement({
       fontSize: 12.5,
       width: "100%"
     }
-  }));
+  })));
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-5"
   }, /*#__PURE__*/React.createElement(Card, {
@@ -15250,7 +15442,8 @@ function LoanManagement({
   }, q ? "No loans match your search." : "No loans yet — add one below.")), pg.slice.map(p => /*#__PURE__*/React.createElement("tr", {
     key: p.id,
     style: {
-      borderBottom: `1px solid ${t.borderSoft}`
+      borderBottom: `1px solid ${t.borderSoft}`,
+      opacity: p.active ? 1 : 0.55
     }
   }, edits[p.id] ? editForm(edits[p.id], (k, v) => setEdit(p.id, k, v), () => saveEdit(p.id), () => cancelEdit(p.id), false) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("td", {
     style: {
@@ -15301,7 +15494,7 @@ function LoanManagement({
       color: t.textFaint,
       fontSize: 12
     }
-  }, "\u2014"), can("payroll") && !done(p) ? /*#__PURE__*/React.createElement("button", {
+  }, "\u2014"), officer && p.active && !done(p) ? /*#__PURE__*/React.createElement("button", {
     onClick: () => toggleIntOnly(p),
     disabled: busy,
     title: "Extend / waive: deduct interest only for now",
@@ -15376,19 +15569,19 @@ function LoanManagement({
       padding: "6px 6px",
       whiteSpace: "nowrap"
     }
-  }, can("payroll") && /*#__PURE__*/React.createElement("button", {
+  }, officer && /*#__PURE__*/React.createElement("button", {
     onClick: () => startEdit(p),
     style: btn(t.violet + "22", t.violet)
-  }, "Edit"), canDel("payroll") && /*#__PURE__*/React.createElement("button", {
+  }, "Edit"), officer && p.active ? /*#__PURE__*/React.createElement("button", {
     onClick: () => delRow(p),
     style: btn(t.badSoft || "#3a1620", t.bad)
-  }, "Delete"))))), newRows.map(row => /*#__PURE__*/React.createElement("tr", {
+  }, "Delete") : null)))), newRows.map(row => /*#__PURE__*/React.createElement("tr", {
     key: row._tmp,
     style: {
       borderBottom: `1px solid ${t.borderSoft}`,
       background: (t.accentSoft || "") + "20"
     }
-  }, editForm(row, (k, v) => setNew(row._tmp, k, v), () => saveNew(row), () => cancelNew(row._tmp), true)))))), canAdd("payroll") && /*#__PURE__*/React.createElement("button", {
+  }, editForm(row, (k, v) => setNew(row._tmp, k, v), () => saveNew(row), () => cancelNew(row._tmp), true)))))), officer && /*#__PURE__*/React.createElement("button", {
     onClick: addRow,
     className: "inline-flex items-center gap-1.5 rounded-xl mt-3",
     style: {

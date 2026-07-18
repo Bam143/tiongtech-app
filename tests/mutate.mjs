@@ -592,6 +592,55 @@ const MUTATIONS = [
   };`,
     to: "",
   },
+  // ---- pr_save_plan / pr_delete_plan (loans; permission text is identical in both, so scope) ----
+  {
+    name: "drop-saveplan-permission",
+    why: "any employee can write a loan plan — raise their own debt to zero, or load a co-worker with one — and pr_apply_plans turns it into real deductions on real payslips",
+    in: "_supaSavePlan",
+    from: `if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change a loan plan."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-delplan-permission",
+    why: "any employee can stop their own loan deducting — the debt stays on the books while the weekly repayment quietly stops coming off",
+    in: "_supaDeletePlan",
+    from: `if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change a loan plan."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-delplan-zerorows",
+    why: "a stop that landed nothing (200 + []) reports success — the officer believes the loan is stopped while it keeps deducting every week",
+    in: "_supaDeletePlan",
+    from: `if (!hit || !hit.length) return {
+    ok: false,
+    error: "Deactivating this loan was refused by the database — your account may not have permission. Nothing changed."
+  };`,
+    to: "",
+  },
+  {
+    name: "delplan-boolean-not-smallint",
+    why: "active is smallint: writing false instead of 0 is rejected by PostgREST, so Delete fails on the real database while every fake-backed test still passes — the exact shape of the print-flag and roster bugs",
+    in: "_supaDeletePlan",
+    from: `.update({
+    active: 0
+  })`,
+    to: `.update({
+    active: false
+  })`,
+  },
+  {
+    name: "saveplan-create-honours-active",
+    why: "a new plan takes the form's Active tickbox instead of being forced on — an unticked box writes a debt that silently never deducts, and the officer sees it listed and assumes it is running",
+    in: "_supaSavePlan",
+    from: `  row.active = 1;`,
+    to: `  row.active = payload && payload.active ? 1 : 0;`,
+  },
 ];
 
 const APP = process.argv[2] || "app.js";
