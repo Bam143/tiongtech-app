@@ -2725,6 +2725,51 @@ async function _supaMarkPrinted(payload) {
     ok: true
   };
 }
+// Day-off is a pure LABEL: everyone works six days and the seventh is handled as OT, so day_off
+// feeds no pay math. This writes pr_employees.day_off and NOTHING else — no pr_items, no recompute.
+async function _supaSetDayoff(payload) {
+  const sb = window.SB;
+  const employeeId = Number(payload && payload.employee_id || 0);
+  if (!employeeId) return {
+    ok: false,
+    error: "Missing employee_id"
+  };
+  // Owner or payroll only — and this app check is the ONLY thing restricting the write. pr_employees
+  // carries a permissive UPDATE policy: a live probe showed an ordinary technician can update day_off
+  // directly, so RLS does not back this the way Piece A/C back pr_items. Until pr_employees gets a
+  // role-scoped policy, the app is the enforcement, so the check has to be real, not decorative.
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change a rest day."
+  };
+  // The grid offers exactly two values (app.jsx:5453/5514). A label with no pay effect still should
+  // not be free-text on the write path, so it is constrained to what the control can produce.
+  const dayOff = String(payload && payload.day_off || "");
+  if (dayOff !== "sun" && dayOff !== "sat") return {
+    ok: false,
+    error: "A rest day must be 'sun' or 'sat'."
+  };
+  // Whitelist: day_off only. Nothing else on the row is touched, and pr_items is never read or
+  // written — the label does not change anyone's pay.
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_employees").update({
+    day_off: dayOff
+  }).eq("id", employeeId).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not change the rest day: " + error.message
+  };
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Changing the rest day was refused by the database. Nothing changed."
+  };
+  return {
+    ok: true
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -2803,6 +2848,9 @@ const API = (action, payload) => {
         }
         if (action === "pr_mark_printed") {
           return await _supaMarkPrinted(payload);
+        }
+        if (action === "pr_set_dayoff") {
+          return await _supaSetDayoff(payload);
         }
         if (action === "create_client") {
           const {
@@ -15426,7 +15474,7 @@ function PayrollPage({
     };
   }));
   const setDayOff = (eid, val) => {
-    if (locked) return;
+    if (locked || !(isOwner || isPayroll)) return; // same gate the DB check enforces (app.jsx:_supaSetDayoff)
     setGrid(g => g.map(r => r.employee_id === eid ? {
       ...r,
       day_off: val
@@ -16305,7 +16353,7 @@ function PayrollPage({
         }
       }, /*#__PURE__*/React.createElement("select", {
         value: r.day_off || "sun",
-        disabled: locked,
+        disabled: locked || !(isOwner || isPayroll),
         onChange: e => setDayOff(r.employee_id, e.target.value),
         style: {
           ...cellInp,
@@ -16696,7 +16744,7 @@ function PayrollPage({
         }
       }, "Day off", /*#__PURE__*/React.createElement("select", {
         value: r.day_off || "sun",
-        disabled: locked,
+        disabled: locked || !(isOwner || isPayroll),
         onChange: e => setDayOff(r.employee_id, e.target.value),
         style: {
           ...cellInp,

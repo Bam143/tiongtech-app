@@ -509,6 +509,27 @@ const MUTATIONS = [
   };`,
     to: "",
   },
+  // ---- pr_set_dayoff ---- (pr_employees is wide-open at the DB level, so the app check is the only guard)
+  {
+    name: "drop-dayoff-permission",
+    why: "any employee can change anybody's rest day — pr_employees has a permissive UPDATE policy, so with this gone nothing restricts the write",
+    in: "_supaSetDayoff",
+    from: `if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change a rest day."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-dayoff-zerorows",
+    why: "a rest-day change silently refused (200 + []) reports success — the grid shows the new day off but the database never took it",
+    in: "_supaSetDayoff",
+    from: `if (!hit || !hit.length) return {
+    ok: false,
+    error: "Changing the rest day was refused by the database. Nothing changed."
+  };`,
+    to: "",
+  },
 ];
 
 const APP = process.argv[2] || "app.js";

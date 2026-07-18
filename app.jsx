@@ -1394,6 +1394,30 @@ async function _supaMarkPrinted(payload) {
   if (!hit || !hit.length) return { ok: false, error: "Marking this printed was refused by the database. Nothing changed." };
   return { ok: true };
 }
+// Day-off is a pure LABEL: everyone works six days and the seventh is handled as OT, so day_off
+// feeds no pay math. This writes pr_employees.day_off and NOTHING else — no pr_items, no recompute.
+async function _supaSetDayoff(payload) {
+  const sb = window.SB;
+  const employeeId = Number((payload && payload.employee_id) || 0);
+  if (!employeeId) return { ok: false, error: "Missing employee_id" };
+  // Owner or payroll only — and this app check is the ONLY thing restricting the write. pr_employees
+  // carries a permissive UPDATE policy: a live probe showed an ordinary technician can update day_off
+  // directly, so RLS does not back this the way Piece A/C back pr_items. Until pr_employees gets a
+  // role-scoped policy, the app is the enforcement, so the check has to be real, not decorative.
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return { ok: false, error: "Only the payroll office can change a rest day." };
+  // The grid offers exactly two values (app.jsx:5453/5514). A label with no pay effect still should
+  // not be free-text on the write path, so it is constrained to what the control can produce.
+  const dayOff = String((payload && payload.day_off) || "");
+  if (dayOff !== "sun" && dayOff !== "sat") return { ok: false, error: "A rest day must be 'sun' or 'sat'." };
+  // Whitelist: day_off only. Nothing else on the row is touched, and pr_items is never read or
+  // written — the label does not change anyone's pay.
+  const { data: hit, error } = await sb.from("pr_employees")
+    .update({ day_off: dayOff }).eq("id", employeeId).select("id");
+  if (error) return { ok: false, error: "Could not change the rest day: " + error.message };
+  if (!hit || !hit.length) return { ok: false, error: "Changing the rest day was refused by the database. Nothing changed." };
+  return { ok: true };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1421,6 +1445,7 @@ const API = (action, payload) => {
         if (action === "pr_item_reply") { return await _supaItemReply(payload); }
         if (action === "pr_request_print") { return await _supaRequestPrint(payload); }
         if (action === "pr_mark_printed") { return await _supaMarkPrinted(payload); }
+        if (action === "pr_set_dayoff") { return await _supaSetDayoff(payload); }
         if (action === "create_client") {
           const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
           if (error) return { ok: false, error: error.message };
@@ -5246,7 +5271,7 @@ function PayrollPage({ t }) {
     return { ...r, [k]: v };
   }));
   const setDayOff = (eid, val) => {
-    if (locked) return;
+    if (locked || !(isOwner || isPayroll)) return;   // same gate the DB check enforces (app.jsx:_supaSetDayoff)
     setGrid((g) => g.map((r) => (r.employee_id === eid ? { ...r, day_off: val } : r)));
     API("pr_set_dayoff", { employee_id: eid, day_off: val }).catch(() => {});
   };
@@ -5449,7 +5474,7 @@ function PayrollPage({ t }) {
                         {prNum(r.ot_hours) > 0 ? <div style={{ color: t.textFaint, fontSize: 9.5, textAlign: "right" }}>₱{Math.round(prOtPay(r))}</div> : null}
                       </td>
                       <td style={{ padding: "4px 5px" }}>
-                        <select value={r.day_off || "sun"} disabled={locked} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: 92, cursor: locked ? "default" : "pointer" }} title="Which day is this employee's day off">
+                        <select value={r.day_off || "sun"} disabled={locked || !(isOwner || isPayroll)} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: 92, cursor: locked ? "default" : "pointer" }} title="Which day is this employee's day off">
                           <option value="sun" style={{ background: t.surface, color: t.text }}>Sun Day Off</option>
                           <option value="sat" style={{ background: t.surface, color: t.text }}>Sat Day Off</option>
                         </select>
@@ -5511,7 +5536,7 @@ function PayrollPage({ t }) {
                   <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 12 }}>
                     <label style={{ fontSize: 11, color: t.textFaint }}>Working days<input type="number" step="0.5" min="0" max="7" value={r.att_present} disabled={locked} onChange={(e) => setCell(r.employee_id, "att_present", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
                     <label style={{ fontSize: 11, color: t.textFaint }}>OT hrs<input type="number" value={r.ot_hours} disabled={locked} onChange={(e) => setCell(r.employee_id, "ot_hours", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
-                    <label style={{ fontSize: 11, color: t.textFaint }}>Day off<select value={r.day_off || "sun"} disabled={locked} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3, cursor: locked ? "default" : "pointer" }}><option value="sun" style={{ background: t.surface, color: t.text }}>Sun Day Off</option><option value="sat" style={{ background: t.surface, color: t.text }}>Sat Day Off</option></select></label>
+                    <label style={{ fontSize: 11, color: t.textFaint }}>Day off<select value={r.day_off || "sun"} disabled={locked || !(isOwner || isPayroll)} onChange={(e) => setDayOff(r.employee_id, e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3, cursor: locked ? "default" : "pointer" }}><option value="sun" style={{ background: t.surface, color: t.text }}>Sun Day Off</option><option value="sat" style={{ background: t.surface, color: t.text }}>Sat Day Off</option></select></label>
                     <label style={{ fontSize: 11, color: t.textFaint }}>Incentive<input type="number" value={r.add_incentive} disabled={locked} onChange={(e) => setCell(r.employee_id, "add_incentive", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} /></label>
                     <label style={{ fontSize: 11, color: t.textFaint, gridColumn: "1 / -1" }}>Manual deduction<input type="number" value={r.ded_manual} disabled={locked} onChange={(e) => setCell(r.employee_id, "ded_manual", e.target.value)} style={{ ...cellInp, width: "100%", marginTop: 3 }} />{prNum(r.ded_manual) > 0 ? <input value={r.ded_manual_note} disabled={locked} onChange={(e) => setCell(r.employee_id, "ded_manual_note", e.target.value)} placeholder="note" style={{ ...cellInp, width: "100%", textAlign: "left", fontSize: 11, marginTop: 4 }} /> : null}</label>
                   </div>

@@ -1033,6 +1033,74 @@ await t.test("mark printed: a payroll 42501 on the write is explained as superad
   t.ok(/only the superadmin/.test(res.error), `names the real cause, got: ${res.error}`);
 });
 
+/* ---------- pr_set_dayoff ---------- */
+// Day-off is a pure label on pr_employees (everyone works six days; the seventh is OT). It writes
+// pr_employees.day_off and nothing else — no pr_items, no recompute. pr_employees carries a
+// permissive UPDATE policy at the DB level (a live probe showed an ordinary technician can write
+// day_off), so the owner/payroll check below is the ONLY thing restricting it — which is exactly why
+// it has a test that bites. The control only ever sends "sun" or "sat".
+const dayoff = async (payload, { role = "technician", opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_employees: [{ id: 28, day_off: null }] }, opts);
+    window.SB = sb;
+    const res = await API("pr_set_dayoff", payload);
+    return { sb, res };
+  } finally { setME(was); }
+};
+const empWrites = (sb) => sb.calls.filter((c) => c.op === "update");
+
+await t.test("day-off: the owner sets a rest day — only day_off is written, on pr_employees", async () => {
+  const { sb, res } = await dayoff({ employee_id: 28, day_off: "sat" }, { role: "owner" });
+  t.eq(res.ok, true, `set, got: ${res.error}`);
+  const w = empWrites(sb);
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].table, "pr_employees", "on pr_employees — not pr_items");
+  t.eq(w[0].filters.id, 28, "the right employee");
+  t.eq(w[0].row.day_off, "sat", "day_off written");
+  t.eq(Object.keys(w[0].row).sort().join(","), "day_off", "owns exactly this one column — no recompute, no pay columns");
+});
+
+await t.test("day-off: the payroll officer may set a rest day too", async () => {
+  const { sb, res } = await dayoff({ employee_id: 28, day_off: "sun" }, { role: "payroll" });
+  t.eq(res.ok, true, `set, got: ${res.error}`);
+  t.eq(empWrites(sb)[0].row.day_off, "sun", "day_off written");
+});
+
+await t.test("day-off: a plain employee is refused, and nothing is written", async () => {
+  const { sb, res } = await dayoff({ employee_id: 28, day_off: "sat" }, { role: "technician" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can change a rest day.", "message");
+  t.eq(sb.calls.length, 0, "nothing touched — refused before any DB call");
+});
+
+await t.test("day-off: a value the control can't produce is refused", async () => {
+  for (const bad of ["funday", "", "monday"]) {
+    const { sb, res } = await dayoff({ employee_id: 28, day_off: bad }, { role: "owner" });
+    t.eq(res.ok, false, `refused for ${JSON.stringify(bad)}`);
+    t.eq(empWrites(sb).length, 0, `nothing written for ${JSON.stringify(bad)}`);
+  }
+});
+
+await t.test("day-off: a missing employee_id is refused before any lookup", async () => {
+  const { sb, res } = await dayoff({ day_off: "sat" }, { role: "owner" });
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("day-off: a silent refusal (200 + []) is an honest failure", async () => {
+  const { res } = await dayoff({ employee_id: 28, day_off: "sat" }, { role: "owner", opts: { blockWrites: "pr_employees" } });
+  t.eq(res.ok, false, "refused — never a false success over a write that never happened");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("day-off: a 42501 refusal surfaces what the database said", async () => {
+  const { res } = await dayoff({ employee_id: 28, day_off: "sat" }, { role: "owner", opts: { errorWrites: "pr_employees" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/new row violates/.test(res.error), `got: ${res.error}`);
+});
+
 /* ---------- pr_lock ---------- */
 // One write, and the interesting part is the precondition: a week only locks once every line is
 // approved. Locking is final — _supaSaveItems refuses to edit a locked period and the review gate
@@ -1294,11 +1362,11 @@ await t.test("period-delete blocked AFTER lines removed → honest 'lines remove
   t.eq(deletes(sb).filter((c) => c.table === "pr_items").length, 1, "the lines really were removed first");
 });
 
-const FALLTHROUGH = ["pr_apply_plans", "pr_set_dayoff",
+const FALLTHROUGH = ["pr_apply_plans",
   "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 6, "6 actions still deferred — the print pair is wired now");
+  t.eq(FALLTHROUGH.length, 5, "5 actions still deferred — pr_set_dayoff is wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;
