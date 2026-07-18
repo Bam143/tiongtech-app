@@ -184,6 +184,43 @@ async function findOwnRowTargets(owner, outsiderUser) {
   };
 }
 
+/* ---------- Piece D discovery ---------- */
+// Piece D needs no test WEEK at all — it asks about two tables, not about a period's state — so it
+// is independent of the locked and open beds and can run when neither exists.
+//
+// What it does need is ROWS. "The technician sees zero plans" is the whole point of case [16], and
+// against an empty pr_plans that assertion passes without touching the policy: it would read green
+// against USING true, which is exactly the leak it exists to detect. So an empty table is a SKIP,
+// not a pass.
+async function findPieceDTargets(owner, outsiderUser) {
+  const { data: plans, error: planErr } = await owner.from("pr_plans").select("id,active,label").order("id");
+  if (planErr) bail("reading pr_plans as owner: " + planErr.message);
+  if (!plans || !plans.length) {
+    return {
+      skip:
+        "pr_plans holds no rows. The core case asserts a technician sees ZERO of them, which passes\n" +
+        "        just as green against a wide-open policy when there is nothing to see — so it would prove\n" +
+        "        nothing. Create a loan plan in Loan Management and re-run.",
+    };
+  }
+
+  const { data: emps, error: empErr } = await owner.from("pr_employees").select("id,full_name,day_off,user_id").order("id");
+  if (empErr) bail("reading pr_employees as owner: " + empErr.message);
+  if (!emps || !emps.length) {
+    return { skip: "pr_employees holds no rows — there is no roster row to read, and none to attempt a write against." };
+  }
+
+  // Prefer the outsider's OWN roster row. pr_employees_write is a flat is_owner() OR is_payroll()
+  // with no ownership clause, so a technician must be refused even on themselves — and proving it
+  // on their own row is the stronger claim. It is also the one a future own-row exception would
+  // break first, which is precisely what should fail loudly.
+  const own = emps.find((e) => e.user_id != null && Number(e.user_id) === Number(outsiderUser.id));
+  return {
+    plan: plans[0], planCount: plans.length,
+    emp: own || emps[0], empCount: emps.length, empIsOwn: !!own,
+  };
+}
+
 /* ---------- pr_items write helpers ---------- */
 // Same shape as the period helpers: attempt, judge the attempt, then ask the OWNER what the column
 // says. The owner is used for every re-read and every restore because the owner clause of the
@@ -241,6 +278,34 @@ async function restoreRemarks(owner, itemId, original, label) {
   const back = await readRemarks(owner, itemId);
   if (!error && sameText(back, original)) pass(`${label} restored`, `pr_items.id ${itemId} remarks back to ${JSON.stringify(back)}`);
   else fail(`${label} restore did not verify`, `pr_items.id ${itemId} now holds ${JSON.stringify(back)}, expected ${JSON.stringify(original)} — RESTORE BY HAND`);
+}
+
+/* ---------- Piece D read helpers ---------- */
+// Same shape as readRemarks/readStatus: the OWNER says what is on disk, because the owner clause is
+// unconditional and so can never itself be refused by the policy under test.
+
+async function readPlanActive(owner, planId) {
+  const { data, error } = await owner.from("pr_plans").select("active").eq("id", planId).maybeSingle();
+  if (error) bail("re-reading pr_plans as owner: " + error.message);
+  if (!data) bail(`pr_plans.id ${planId} vanished mid-test`);
+  return data.active;
+}
+
+async function readDayOff(owner, empId) {
+  const { data, error } = await owner.from("pr_employees").select("day_off").eq("id", empId).maybeSingle();
+  if (error) bail("re-reading pr_employees as owner: " + error.message);
+  if (!data) bail(`pr_employees.id ${empId} vanished mid-test`);
+  return data.day_off;
+}
+
+// pr_employees may or may not carry an updated_at trigger — the column is not in _PR_EMP_COLS
+// (app.jsx:679) and this assumes nothing either way. A read that errors is taken as "no such
+// column" and the note is simply not offered: a missing column is not a policy result, and must
+// not bail a run that is otherwise fine. Returns undefined when unavailable, the value otherwise.
+async function readUpdatedAtOrNone(owner, empId) {
+  const { data, error } = await owner.from("pr_employees").select("updated_at").eq("id", empId).maybeSingle();
+  if (error || !data) return undefined;
+  return data.updated_at;
 }
 
 /* ---------- status-change helpers ---------- */
@@ -441,6 +506,167 @@ async function ownRowCases(ctx, target) {
   }
 }
 
+/* ---------- Piece D: pr_plans (officers only) + pr_employees (open read, officer write) ---------- */
+//
+// The policies:
+//   pr_plans        pr_plans_all        ALL     is_owner() OR is_payroll()
+//   pr_employees    pr_employees_select SELECT  true
+//                   pr_employees_write  ALL     is_owner() OR is_payroll()
+//
+// The two tables are deliberately NOT symmetrical, and the asymmetry is the thing to protect.
+//
+// pr_plans closes a real leak. _supaPayroll reads every plan and then narrows an employee to their
+// own with a .filter() in the BROWSER (app.jsx:724) — the rows had already crossed the wire, so
+// every technician received the whole loan book: who owes what, and how much. Case [16] is where
+// that stops being true.
+//
+// pr_employees must stay readable by EVERYONE, and case [20] is the guard on that. Two things
+// outside payroll depend on it at login: _supaBootstrap resolves the caller's own pr_employee_id
+// (app.jsx:447), and the Job Orders technician dropdown is built from pr_employees.full_name
+// (app.jsx:477 -> JO_TECHS at 2039). Tightening reads here to match pr_plans would break the app
+// for every role at sign-in, which is a far worse outcome than the leak it would close — so the
+// looseness is deliberate and this case is what stops someone "fixing" it.
+//
+// EVERY WRITE BELOW IS SELF-IDENTICAL — the value already on the row, written back. So the verdict
+// is purely allowed-versus-refused, and an unexpected success still changes nothing. That matters
+// more here than in the other pieces: this group runs against the live roster and the live loan
+// book, not against a test week.
+async function pieceDCases(ctx, target) {
+  const { owner, payroll, payrollUser, outsider, outsiderUser } = ctx;
+  const { plan, planCount, emp, empCount, empIsOwn } = target;
+  const planActive = plan.active;
+  const empDayOff = emp.day_off;
+
+  console.log("\n─── Piece D — pr_plans (officers only) + pr_employees (open read, officer write)");
+  console.log(`  plans    owner sees ${planCount} row(s); probing pr_plans.id ${plan.id}${plan.label ? ` "${plan.label}"` : ""}`);
+  console.log(`  roster   owner sees ${empCount} row(s); probing pr_employees.id ${emp.id} "${emp.full_name}"`
+    + (empIsOwn ? ` — ${outsiderUser.username}'s OWN row, so the refusal cannot be about ownership` : ""));
+  console.log(`  columns  pr_plans.active ${JSON.stringify(planActive)}, pr_employees.day_off ${JSON.stringify(empDayOff)}`);
+  console.log("  writes   SELF-IDENTICAL — each puts back the value already there, so even an unexpected");
+  console.log("           success changes nothing on disk\n");
+
+  try {
+    /* ---- [16] THE LEAK: the loan book must be invisible to a non-officer ---- */
+    console.log(`  [16] technician ${outsiderUser.username} SELECTs pr_plans — must return ZERO rows`);
+    console.log("       before Piece D this handed every signed-in user every loan: who owes what, and how much");
+    const { data: tPlans, error: tPlanErr } = await outsider.from("pr_plans").select("id");
+    if (tPlanErr) {
+      pass("refused with an error", `${tPlanErr.code || "?"}: ${tPlanErr.message} — a refusal either way`);
+    } else if ((tPlans || []).length === 0) {
+      pass("zero rows returned", `the owner sees ${planCount}, ${outsiderUser.username} sees 0 — the loan book is closed`);
+    } else {
+      fail("the technician can still read the loan book",
+        `${tPlans.length} of ${planCount} row(s) came back — pr_plans_all is not filtering non-officers`);
+    }
+
+    /* ---- [17] and the officer must still see it ---- */
+    console.log(`\n  [17] payroll ${payrollUser.username} SELECTs pr_plans — must return the same rows the owner sees`);
+    console.log("       is_owner() OR is_payroll() gives both the identical view; fewer would mean a narrower policy");
+    const { data: pPlans, error: pPlanErr } = await payroll.from("pr_plans").select("id");
+    if (pPlanErr) {
+      fail("payroll was refused", `${pPlanErr.code || "?"}: ${pPlanErr.message} — LoanManagement cannot load`);
+    } else if (!pPlans || !pPlans.length) {
+      fail("payroll sees no plans", `the owner sees ${planCount} — the officer's own screen would come up empty`);
+    } else if (pPlans.length !== planCount) {
+      fail("payroll sees a different number of plans", `owner ${planCount}, payroll ${pPlans.length} — the clause is not what it claims`);
+    } else {
+      pass("payroll sees the full loan book", `${pPlans.length} row(s), same as the owner`);
+    }
+
+    /* ---- [18] the owner half of the same clause ---- */
+    console.log(`\n  [18] owner ${OWNER_USERNAME} SELECTs pr_plans — must return rows`);
+    const { data: oPlans, error: oPlanErr } = await owner.from("pr_plans").select("id");
+    if (oPlanErr) fail("the owner was refused", `${oPlanErr.code || "?"}: ${oPlanErr.message}`);
+    else if (!oPlans || !oPlans.length) fail("the owner sees no plans", "discovery found rows a moment ago — the policy is refusing the owner");
+    else pass("owner sees the loan book", `${oPlans.length} row(s)`);
+
+    /* ---- [19] and must not be writable by a non-officer ---- */
+    console.log(`\n  [19] technician ${outsiderUser.username} UPDATEs pr_plans.id ${plan.id} — must be blocked`);
+    console.log(`       writing active back to ${JSON.stringify(planActive)}, the value already there`);
+    const { data: tw, error: twErr } = await outsider.from("pr_plans")
+      .update({ active: planActive }).eq("id", plan.id).select("id");
+    const twRows = (tw || []).length;
+    if (!twErr && twRows > 0) {
+      fail("the technician was NOT blocked", `the update matched ${twRows} row(s) — a non-officer can write the loan book`);
+    } else if (twErr) {
+      pass("blocked with an error", `${twErr.code || "?"}: ${twErr.message}`);
+    } else {
+      pass("blocked silently (0 rows)", "no error — the USING clause hid the row, which is why the re-read decides it");
+    }
+    const planNow = await readPlanActive(owner, plan.id);
+    if (sameNum(planNow, planActive)) pass("plan unchanged on disk", `pr_plans.id ${plan.id} active is still ${JSON.stringify(planNow)}`);
+    else fail("plan CHANGED on disk", `expected ${JSON.stringify(planActive)}, found ${JSON.stringify(planNow)}`);
+
+    /* ---- [20] pr_employees reads stay OPEN — the case that stops a well-meaning tightening ---- */
+    console.log(`\n  [20] technician ${outsiderUser.username} SELECTs pr_employees — must return rows`);
+    console.log("       bootstrap resolves the caller's own pr_employee_id from this table, and the Job Orders");
+    console.log("       technician dropdown is built from it — closing this breaks sign-in for every role");
+    const { data: tEmps, error: tEmpErr } = await outsider.from("pr_employees").select("id");
+    if (tEmpErr) {
+      fail("the technician was refused the roster", `${tEmpErr.code || "?"}: ${tEmpErr.message} — bootstrap and Job Orders both break`);
+    } else if (!tEmps || !tEmps.length) {
+      fail("the technician sees an empty roster", `the owner sees ${empCount} — reads are supposed to be open to everyone`);
+    } else {
+      pass("the roster is readable by everyone", `${tEmps.length} row(s) — pr_employees_select (USING true) is doing its job`);
+    }
+
+    /* ---- [21] but pr_employees WRITES are officer-only ---- */
+    console.log(`\n  [21] technician ${outsiderUser.username} UPDATEs pr_employees.id ${emp.id} — must be blocked`);
+    console.log(`       writing day_off back to ${JSON.stringify(empDayOff)}, the value already there`
+      + (empIsOwn ? " — and it is their OWN row, so only the write policy can refuse it" : ""));
+    const { data: te, error: teErr } = await outsider.from("pr_employees")
+      .update({ day_off: empDayOff }).eq("id", emp.id).select("id");
+    const teRows = (te || []).length;
+    if (!teErr && teRows > 0) {
+      fail("the technician was NOT blocked", `the update matched ${teRows} row(s) — anyone can rewrite the roster, per_day included`);
+    } else if (teErr) {
+      pass("blocked with an error", `${teErr.code || "?"}: ${teErr.message}`);
+    } else {
+      pass("blocked silently (0 rows)", "no error — the write policy's USING clause hid the row");
+    }
+    const dayNow = await readDayOff(owner, emp.id);
+    if (sameText(dayNow, empDayOff)) pass("roster row unchanged on disk", `pr_employees.id ${emp.id} day_off is still ${JSON.stringify(dayNow)}`);
+    else fail("roster row CHANGED on disk", `expected ${JSON.stringify(empDayOff)}, found ${JSON.stringify(dayNow)}`);
+
+    /* ---- [22] and the officer must still get through ---- */
+    console.log(`\n  [22] payroll ${payrollUser.username} UPDATEs the same roster row — must succeed`);
+    console.log("       a policy that refuses this locks the officer out of the roster and the rest-day control");
+    // Read the stamp BEFORE the only write in this group that is meant to land, so a trigger's
+    // touch can be told apart from a real change below.
+    const stampBefore = await readUpdatedAtOrNone(owner, emp.id);
+    const { data: pe, error: peErr } = await payroll.from("pr_employees")
+      .update({ day_off: empDayOff }).eq("id", emp.id).select("id");
+    if (peErr) {
+      fail("payroll was blocked", `${peErr.code || "?"}: ${peErr.message} — the policy is stricter than it should be`);
+    } else if ((pe || []).length !== 1) {
+      fail("payroll's write moved no rows", "no error, but 0 rows came back — silently blocked from a write it should be allowed");
+    } else {
+      pass("payroll's write succeeded", `pr_employees.id ${emp.id} accepted an officer write`);
+    }
+    // Not a verdict on the policy, so not in the tally — but a moved timestamp on a self-identical
+    // write is exactly the kind of thing that later reads as "something changed" when nothing did.
+    // Same treatment as pr_periods.published_at below: reported, not reset.
+    if (stampBefore !== undefined) {
+      const stampAfter = await readUpdatedAtOrNone(owner, emp.id);
+      if (!sameText(stampBefore, stampAfter)) {
+        console.log(`  note     updated_at moved: was ${JSON.stringify(stampBefore)}, now ${JSON.stringify(stampAfter)} (a trigger stamps it)`);
+        console.log("           day_off itself is unchanged — the write put back the value already there");
+      }
+    }
+  } finally {
+    /* ---- CLEANUP: nothing SHOULD have moved, so this is a check, not a repair ---- */
+    // Every write above was self-identical. This exists because "should not have moved" and "did not
+    // move" are different claims, and only the second one is worth reporting.
+    console.log("\n  cleanup  Piece D — every write was self-identical; verifying nothing moved");
+    const planEnd = await readPlanActive(owner, plan.id);
+    if (sameNum(planEnd, planActive)) pass("pr_plans left exactly as found", `id ${plan.id} active ${JSON.stringify(planEnd)}`);
+    else fail("pr_plans did NOT end as found", `id ${plan.id} active is ${JSON.stringify(planEnd)}, expected ${JSON.stringify(planActive)} — RESTORE BY HAND`);
+    const dayEnd = await readDayOff(owner, emp.id);
+    if (sameText(dayEnd, empDayOff)) pass("pr_employees left exactly as found", `id ${emp.id} day_off ${JSON.stringify(dayEnd)}`);
+    else fail("pr_employees did NOT end as found", `id ${emp.id} day_off is ${JSON.stringify(dayEnd)}, expected ${JSON.stringify(empDayOff)} — RESTORE BY HAND`);
+  }
+}
+
 /* ---------- pr_periods: the status policy, v2 ---------- */
 //
 // The WITH CHECK admits a new row when any of these holds:
@@ -596,7 +822,7 @@ async function periodStatusCases(ctx, period) {
 /* ---------- the test ---------- */
 
 async function main() {
-  console.log("\nLIVE RLS — pr_items lock + own-row (Pieces A & C) + pr_periods status policy (v2)");
+  console.log("\nLIVE RLS — pr_items lock + own-row (A & C) + pr_periods status (B) + pr_plans/pr_employees (D)");
   console.log("  project " + url + "\n");
 
   // 1. owner
@@ -661,6 +887,19 @@ async function main() {
     console.log(`  open     #${ownTarget.period.id} "${ownTarget.period.label}" (status '${ownTarget.period.status}') — the own-row cases use this one`);
   }
 
+  // 5b. Piece D needs no week at all, only rows in pr_plans and pr_employees — so it runs
+  //     independently of both beds above, including when neither of them exists.
+  let dTarget = null;
+  let dSkip = null;
+  const dFound = await findPieceDTargets(owner, outsiderUser);
+  if (dFound.skip) {
+    dSkip = dFound.skip;
+    console.log("  pieceD   no usable rows — Piece D will be SKIPPED");
+  } else {
+    dTarget = dFound;
+    console.log(`  pieceD   ${dTarget.planCount} plan(s), ${dTarget.empCount} roster row(s) — the Piece D cases use these`);
+  }
+
   // Both beds present and the same row is impossible — a locked week cannot also be the non-locked
   // one — so if that ever happens no verdict can be trusted.
   if (lockedPeriod && ownTarget && ownTarget.period.id === lockedPeriod.id) {
@@ -670,14 +909,16 @@ async function main() {
   // 6. If NEITHER bed exists there is genuinely nothing to test — THIS is the setup failure (exit
   //    2), and only this. Skipping one group is fine; skipping both means the database is not set
   //    up to prove anything.
-  if (!lockedPeriod && !ownTarget) {
+  if (!lockedPeriod && !ownTarget && !dTarget) {
     bail(
-      "no test bed exists — both groups skipped.\n" +
+      "no test bed exists — every group skipped.\n" +
       `  Piece A/B: ${lockedSkip}\n` +
       "  Piece C: " + ownSkip + "\n" +
-      "  Provide EITHER a period with status 'locked' (for the freeze + status-walk cases) OR a\n" +
+      "  Piece D: " + dSkip + "\n" +
+      "  Provide ANY ONE of: a period with status 'locked' (for the freeze + status-walk cases); a\n" +
       "  non-locked period (draft/published) carrying both the outsider's pay line and another\n" +
-      "  employee's (for the own-row cases). One is enough to run; this run has neither."
+      "  employee's (for the own-row cases); or at least one row in pr_plans (for Piece D). One is\n" +
+      "  enough to run; this run has none of them."
     );
   }
 
@@ -706,6 +947,16 @@ async function main() {
     } else {
       console.log(`\n─── Piece C  SKIPPED — ${ownSkip}`);
       skipped.push(["Piece C", ownSkip]);
+    }
+
+    // Piece D touches neither week, so it cannot collide with anything above and its position in
+    // the sequence carries no meaning — last simply keeps the two payslip groups adjacent.
+    if (dTarget) {
+      await pieceDCases(ctx, dTarget);
+      ran.push("Piece D — pr_plans + pr_employees");
+    } else {
+      console.log(`\n─── Piece D  SKIPPED — ${dSkip}`);
+      skipped.push(["Piece D", dSkip]);
     }
   } finally {
     await owner.auth.signOut().catch(() => {});
