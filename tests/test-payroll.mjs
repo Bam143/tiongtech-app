@@ -1101,6 +1101,113 @@ await t.test("day-off: a 42501 refusal surfaces what the database said", async (
   t.ok(/new row violates/.test(res.error), `got: ${res.error}`);
 });
 
+/* ---------- pr_save_employee / pr_delete_employee (the roster) ---------- */
+// Add/edit and delete, owner+payroll only (an app guard — pr_employees is wide-open at the DB level).
+// Delete HARD-removes the roster row but must NOT touch pr_items: the pay lines are kept on purpose,
+// and the grid renders their now-nameless rows as "?" without breaking (app.jsx:5218/5229).
+const EMP_ROW = { id: 28, full_name: "Old Name", position: "Technician", per_day: 400, schedule_id: 1, user_id: 7, active: 1 };
+const roster = async (action, payload, { role = "technician", rows = [{ ...EMP_ROW }], opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role });
+  try {
+    const sb = makeFakeSB({ pr_employees: rows }, opts);
+    window.SB = sb;
+    const res = await API(action, payload);
+    return { sb, res };
+  } finally { setME(was); }
+};
+const EMP_COLS = ["active", "full_name", "per_day", "position", "schedule_id", "user_id"].join(",");
+
+await t.test("save employee: the owner EDITS a row — exactly the roster columns, on pr_employees", async () => {
+  const { sb, res } = await roster("pr_save_employee", { id: 28, full_name: "New Name", position: "Lineman", per_day: 500, schedule_id: 2, user_id: 7, active: 1 }, { role: "owner" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  t.eq(res.id, 28, "echoes the edited id back");
+  const w = sb.calls.filter((c) => c.op === "update");
+  t.eq(w.length, 1, "one update");
+  t.eq(w[0].table, "pr_employees", "on pr_employees");
+  t.eq(w[0].filters.id, 28, "the right row");
+  t.eq(Object.keys(w[0].row).sort().join(","), EMP_COLS, "owns exactly the roster columns — no day_off, no pay columns, no id");
+  t.eq(w[0].row.full_name, "New Name", "name written");
+  t.eq(w[0].row.active, 1, "active normalised to 1");
+});
+
+await t.test("save employee: the payroll officer may edit too", async () => {
+  const { res } = await roster("pr_save_employee", { id: 28, full_name: "X", per_day: 400, schedule_id: 1, user_id: 7, active: 1 }, { role: "payroll" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+});
+
+await t.test("save employee: a no-id payload INSERTS and returns the new id", async () => {
+  const { sb, res } = await roster("pr_save_employee", { full_name: "Fresh Hire", position: "Technician", per_day: 450, schedule_id: 1, user_id: "", active: 1 }, { role: "owner" });
+  t.eq(res.ok, true, `created, got: ${res.error}`);
+  t.ok(res.id != null, "a new id came back");
+  const ins = sb.calls.filter((c) => c.op === "insert");
+  t.eq(ins.length, 1, "one insert");
+  t.eq(ins[0].table, "pr_employees", "on pr_employees");
+  t.ok(!("id" in ins[0].row), "the insert does not carry a client id");
+});
+
+await t.test("save employee: an empty picker (user_id '') is stored as null, not a bad FK", async () => {
+  const { sb } = await roster("pr_save_employee", { id: 28, full_name: "X", per_day: 400, schedule_id: 1, user_id: "", active: 1 }, { role: "owner" });
+  t.eq(sb.calls.filter((c) => c.op === "update")[0].row.user_id, null, "'' becomes null so the FK is cleared, not set to ''");
+});
+
+await t.test("save employee: a blank name is refused before any write", async () => {
+  const { sb, res } = await roster("pr_save_employee", { id: 28, full_name: "   ", per_day: 400, schedule_id: 1, active: 1 }, { role: "owner" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "An employee needs a name.", "message");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("save employee: a plain employee is refused", async () => {
+  const { sb, res } = await roster("pr_save_employee", { id: 28, full_name: "Sneaky", per_day: 9999, schedule_id: 1, active: 1 }, { role: "technician" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can change the roster.", "message");
+  t.eq(sb.calls.length, 0, "nothing touched — refused before any DB call");
+});
+
+await t.test("save employee: a silent refusal (200 + []) is an honest failure", async () => {
+  const { res } = await roster("pr_save_employee", { id: 28, full_name: "X", per_day: 400, schedule_id: 1, active: 1 }, { role: "owner", opts: { blockWrites: "pr_employees" } });
+  t.eq(res.ok, false, "refused — never a false 'saved'");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("delete employee: the owner SOFT-deletes — sets active=0, keeps the row and the pay lines", async () => {
+  const { sb, res } = await roster("pr_delete_employee", { id: 28 }, { role: "owner" });
+  t.eq(res.ok, true, `deactivated, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op === "delete").length, 0, "NOT a hard delete — the row is kept");
+  const w = sb.calls.filter((c) => c.op === "update");
+  t.eq(w.length, 1, "exactly one update");
+  t.eq(w[0].table, "pr_employees", "on pr_employees");
+  t.eq(w[0].filters.id, 28, "the right row");
+  t.eq(w[0].row.active, 0, "active set to 0 (smallint, not boolean false)");
+  t.eq(Object.keys(w[0].row).sort().join(","), "active", "owns exactly the active column — nothing else on the row moves");
+  t.eq(sb.calls.filter((c) => c.table === "pr_items").length, 0, "pr_items is NEVER touched — the named pay history is kept");
+});
+
+await t.test("delete employee: the payroll officer may deactivate too", async () => {
+  const { res } = await roster("pr_delete_employee", { id: 28 }, { role: "payroll" });
+  t.eq(res.ok, true, `deactivated, got: ${res.error}`);
+});
+
+await t.test("delete employee: a plain employee is refused, and nothing is written", async () => {
+  const { sb, res } = await roster("pr_delete_employee", { id: 28 }, { role: "technician" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can change the roster.", "message");
+  t.eq(sb.calls.filter((c) => c.op === "update").length, 0, "nothing written");
+});
+
+await t.test("delete employee: a missing id is refused before any lookup", async () => {
+  const { sb, res } = await roster("pr_delete_employee", {}, { role: "owner" });
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("delete employee: a silent refusal (200 + []) is an honest failure", async () => {
+  const { res } = await roster("pr_delete_employee", { id: 28 }, { role: "owner", opts: { blockWrites: "pr_employees" } });
+  t.eq(res.ok, false, "refused — never a false 'deactivated' over a write that landed nothing");
+  t.ok(/refused by the database/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
 /* ---------- pr_lock ---------- */
 // One write, and the interesting part is the precondition: a week only locks once every line is
 // approved. Locking is final — _supaSaveItems refuses to edit a locked period and the review gate
@@ -1362,11 +1469,10 @@ await t.test("period-delete blocked AFTER lines removed → honest 'lines remove
   t.eq(deletes(sb).filter((c) => c.table === "pr_items").length, 1, "the lines really were removed first");
 });
 
-const FALLTHROUGH = ["pr_apply_plans",
-  "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan"];
+const FALLTHROUGH = ["pr_apply_plans", "pr_save_plan", "pr_delete_plan"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 5, "5 actions still deferred — pr_set_dayoff is wired now");
+  t.eq(FALLTHROUGH.length, 3, "3 actions still deferred — the employee add/edit/delete pair is wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;

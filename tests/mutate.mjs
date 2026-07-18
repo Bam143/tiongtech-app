@@ -530,6 +530,68 @@ const MUTATIONS = [
   };`,
     to: "",
   },
+  // ---- pr_save_employee / pr_delete_employee (the roster; permission text is identical, so scope) ----
+  {
+    name: "drop-saveemp-permission",
+    why: "any employee can add or rewrite a roster row — set their own per_day, activate anyone — with the owner/payroll check gone (pr_employees is wide-open, so nothing else stops it)",
+    in: "_supaSaveEmployee",
+    from: `if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change the roster."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-saveemp-name-guard",
+    why: "a nameless employee is written — the roster and every grid that reads it get a blank row that can never be told apart from a real one",
+    in: "_supaSaveEmployee",
+    from: `if (!fullName) return {
+    ok: false,
+    error: "An employee needs a name."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-saveemp-zerorows",
+    why: "an edit silently refused by RLS (200 + []) reports 'saved' — the officer believes a rate or status change landed when the database dropped it",
+    in: "_supaSaveEmployee",
+    from: `if (!hit || !hit.length) return {
+      ok: false,
+      error: "Saving this employee was refused by the database. Nothing changed."
+    };`,
+    to: "",
+  },
+  {
+    name: "drop-delemp-permission",
+    why: "any employee can delete anybody off the roster — pr_employees is wide-open, so this app check is the only thing stopping it",
+    in: "_supaDeleteEmployee",
+    from: `if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can change the roster."
+  };`,
+    to: "",
+  },
+  {
+    name: "flip-delemp-to-activate",
+    why: "the soft-delete writes active=1 instead of 0 — 'delete' would REACTIVATE the employee (or no-op), never removing them from payroll",
+    in: "_supaDeleteEmployee",
+    from: `.update({
+    active: 0
+  })`,
+    to: `.update({
+    active: 1
+  })`,
+  },
+  {
+    name: "drop-delemp-zerorows",
+    why: "a deactivate that landed nothing (200 + []) reports success — the row is reported inactive when it is still active and still on payroll",
+    in: "_supaDeleteEmployee",
+    from: `if (!hit || !hit.length) return {
+    ok: false,
+    error: "Deactivating this employee was refused by the database — your account may not have permission. Nothing changed."
+  };`,
+    to: "",
+  },
 ];
 
 const APP = process.argv[2] || "app.js";

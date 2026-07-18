@@ -1418,6 +1418,65 @@ async function _supaSetDayoff(payload) {
   if (!hit || !hit.length) return { ok: false, error: "Changing the rest day was refused by the database. Nothing changed." };
   return { ok: true };
 }
+/* ---- The roster (pr_save_employee add/edit, pr_delete_employee) ----
+   RosterModal's Save (app.jsx:4700) and Delete (app.jsx:4711), both { id }-keyed. Owner or payroll
+   only — an app-level guard and nothing more: pr_employees carries a permissive policy (a live probe
+   showed an ordinary technician can write it), so this refuses the wrong screen, not the intent. The
+   same wide-open policy also governs per_day / schedule_id / active / user_id, which are NOT harmless
+   like day_off — a role-scoped policy on pr_employees is the real fix, and it is a separate task. */
+async function _supaSaveEmployee(payload) {
+  const sb = window.SB;
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return { ok: false, error: "Only the payroll office can change the roster." };
+  const fullName = String((payload && payload.full_name) || "").trim();
+  if (!fullName) return { ok: false, error: "An employee needs a name." };
+  // Whitelist the roster columns. day_off is NOT here — it has its own handler (pr_set_dayoff) — and
+  // the pay figures live on pr_items, never on the roster row. user_id links an EXISTING erp_users
+  // login or none; this never creates a login. The picker's "" (no link) must land as null, not an
+  // empty string, or the foreign key rejects it.
+  const row = {
+    full_name: fullName,
+    position: String((payload && payload.position) || ""),
+    per_day: Number((payload && payload.per_day) || 0),
+    schedule_id: Number((payload && payload.schedule_id) || 1),
+    user_id: (payload && payload.user_id) ? Number(payload.user_id) : null,
+    active: (payload && payload.active) ? 1 : 0,
+  };
+  const id = Number((payload && payload.id) || 0);
+  if (id) {
+    const { data: hit, error } = await sb.from("pr_employees").update(row).eq("id", id).select("id");
+    if (error) return { ok: false, error: "Could not save this employee: " + error.message };
+    if (!hit || !hit.length) return { ok: false, error: "Saving this employee was refused by the database. Nothing changed." };
+    return { ok: true, id };
+  }
+  // Create: same shape as _supaSavePeriod (app.jsx:1134) — .select("id") returns an array, so the
+  // new id is hit[0].id, and the caller stores it so a follow-up edit finds the row (app.jsx:4701).
+  const { data: hit, error } = await sb.from("pr_employees").insert(row).select("id");
+  if (error) return { ok: false, error: "Could not add this employee: " + error.message };
+  if (!hit || !hit.length) return { ok: false, error: "Adding this employee was refused by the database. Nothing was added." };
+  return { ok: true, id: hit[0].id };
+}
+async function _supaDeleteEmployee(payload) {
+  const sb = window.SB;
+  const id = Number((payload && payload.id) || 0);
+  if (!id) return { ok: false, error: "Missing id" };
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return { ok: false, error: "Only the payroll office can change the roster." };
+  // SOFT delete: mark the roster row inactive, never remove it. A hard delete would orphan the
+  // employee's pr_items pay lines — the grid would fall back to "?" for a name it could no longer
+  // resolve (app.jsx:5229) and the history would lose the person's name for good. active=0 keeps the
+  // row, so past payslips stay named, while dropping them from the new-week grid, which pays only
+  // active staff (app.jsx:5216). Reactivation is reachable: the roster lists inactive staff with an
+  // Active toggle (app.jsx:4813/4824), so ticking it and saving flips active back to 1. active is
+  // smallint, so the value is 0, not false — PostgREST rejects a boolean for a smallint (the same
+  // lesson as the print flags). Whitelist active only; pr_items is never touched. .select("id")
+  // turns a silent RLS refusal (200 + []) into a reportable one, as the period delete does (1191).
+  const { data: hit, error } = await sb.from("pr_employees")
+    .update({ active: 0 }).eq("id", id).select("id");
+  if (error) return { ok: false, error: "Could not deactivate this employee: " + error.message };
+  if (!hit || !hit.length) return { ok: false, error: "Deactivating this employee was refused by the database — your account may not have permission. Nothing changed." };
+  return { ok: true };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1446,6 +1505,8 @@ const API = (action, payload) => {
         if (action === "pr_request_print") { return await _supaRequestPrint(payload); }
         if (action === "pr_mark_printed") { return await _supaMarkPrinted(payload); }
         if (action === "pr_set_dayoff") { return await _supaSetDayoff(payload); }
+        if (action === "pr_save_employee") { return await _supaSaveEmployee(payload); }
+        if (action === "pr_delete_employee") { return await _supaDeleteEmployee(payload); }
         if (action === "create_client") {
           const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
           if (error) return { ok: false, error: error.message };
@@ -4706,9 +4767,11 @@ function RosterModal({ t, employees, users, schedules, onClose, onChanged }) {
   };
   const delRow = async (row) => {
     if (row._new) { setRows((r) => r.filter((x) => x.id !== row.id)); return; }
-    if (!window.confirm(`Delete ${row.full_name}? This cannot be undone.\n(Only allowed if they have no payroll history — set them Inactive instead if they do.)`)) return;
+    if (!window.confirm(`Mark ${row.full_name} as inactive?\n\nThey'll be removed from the active roster and won't appear on new payroll weeks, but their past payslips keep their name. You can undo this any time by editing them and ticking Active.`)) return;
     setBusy(true);
-    try { await prWrite("pr_delete_employee", { id: row.id }); setRows((r) => r.filter((x) => x.id !== row.id)); flash(true, "Deleted."); onChanged(); }
+    // Soft delete: the row stays, flipped to inactive in place (so it shows “No” and can be
+    // reactivated), rather than vanishing from the list.
+    try { await prWrite("pr_delete_employee", { id: row.id }); setRows((r) => r.map((x) => (x.id === row.id ? { ...x, active: 0 } : x))); flash(true, "Marked inactive — reactivate any time by editing and ticking Active."); onChanged(); }
     catch (err) { flash(false, err.message); }
     setBusy(false);
   };
@@ -4768,7 +4831,7 @@ function RosterModal({ t, employees, users, schedules, onClose, onChanged }) {
                       <td style={{ padding: "7px 8px", textAlign: "center" }}>{row.active ? <span style={{ color: t.good, fontSize: 12, fontWeight: 700 }}>Yes</span> : <span style={{ color: t.textFaint, fontSize: 12 }}>No</span>}</td>
                       <td style={{ padding: "5px 8px", whiteSpace: "nowrap" }}>
                         <button onClick={() => startEdit(row)} style={editBtn}>Edit</button>
-                        <button onClick={() => delRow(row)} title="Delete" style={{ background: "transparent", border: "none", color: t.bad, cursor: "pointer", padding: 2 }}><IconX size={15} /></button>
+                        {row.active ? <button onClick={() => delRow(row)} title="Mark inactive (removes from active roster; keeps payslip history)" style={{ background: "transparent", border: "none", color: t.bad, cursor: "pointer", padding: 2 }}><IconX size={15} /></button> : null}
                       </td>
                     </>)}
                   </tr>
