@@ -127,7 +127,20 @@ does this for you: it breaks one guard at a time and asserts the suite goes red 
 mutation reported **SURVIVED** is a hole — that behaviour is unprotected. Add a mutation whenever
 you add a guard worth keeping.
 
-Two things about that harness are worth knowing before you touch it:
+One thing about the **fake Supabase** (`makeFakeSB`) is worth knowing before you write a test
+against an upsert:
+
+**It resolves on the conflict key.** An upsert is matched against the columns named in
+`{ onConflict: "a,b" }` — not against `.eq()` filters, which an upsert does not carry. A match
+returns the merged rows; no match synthesises a new row with a fresh id, the way a real insert
+would. Without that, an upsert against an empty fixture returned `[]`, which is indistinguishable
+from a `blockWrites` refusal — so the first write of a row, the commonest path there is, looked
+exactly like a silent rejection and would trip a handler's honest-failure check. The options
+object is recorded on `sb.calls[i].opts`, so a test can assert `onConflict` was actually sent:
+a handler that omits it behaves identically against the fake and then raises a duplicate-key
+error against the real database.
+
+Two things about the **mutation** harness are worth knowing before you touch it:
 
 **It asserts each patch applied.** The first version used `sed`. Babel pretty-prints object
 literals across lines, so the single-line patterns matched nothing, the suite ran against

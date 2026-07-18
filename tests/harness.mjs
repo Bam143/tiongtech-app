@@ -113,6 +113,19 @@ export function makeFakeSB(tables = {}, opts = {}) {
     from(table) {
       const q = { table, filters: {} };
       const hits = () => (db[q.table] || []).filter((r) => Object.entries(q.filters).every(([k, v]) => r[k] === v));
+      // An upsert resolves against its CONFLICT KEY, not against .eq() filters — it carries none.
+      // Falling through to hits() would match every row in the table (an empty filter set matches
+      // everything) and, against an empty fixture, return [] — which is byte-for-byte what
+      // blockWrites produces. That made the commonest path, the FIRST write of a row, look
+      // identical to a silent refusal, so a handler's honest-failure check would fire on it.
+      // With no onConflict the key list is empty and nothing can match, so this behaves as a
+      // plain insert — mirroring PostgREST falling back to the primary key, and leaving "was
+      // onConflict actually sent?" a question for an explicit assertion on calls[].opts.
+      const upsertHits = () => {
+        const keys = String((q.opts && q.opts.onConflict) || "").split(",").map((s) => s.trim()).filter(Boolean);
+        const found = keys.length ? (db[q.table] || []).filter((r) => keys.every((k) => r[k] === q.row[k])) : [];
+        return found.length ? found.map((r) => ({ ...r, ...q.row })) : [{ id: nextId++, ...q.row }];
+      };
       const b = {
         // select() after a write is PostgREST's return=representation, NOT a read — it must not
         // overwrite the op. Without a select(), a write resolves data:null, same as the real one.
@@ -121,11 +134,14 @@ export function makeFakeSB(tables = {}, opts = {}) {
         update(row) { q.op = "update"; q.row = row; return b; },
         insert(row) { q.op = "insert"; q.row = row; return b; },
         delete() { q.op = "delete"; return b; },
-        upsert(row) { q.op = "upsert"; q.row = row; return b; },
+        // opts is kept, not dropped: `onConflict` is the whole contract of an upsert, and a
+        // handler that forgets it raises a duplicate-key error in production while every
+        // fake-backed test still passes. Recording it is what lets a test assert it was sent.
+        upsert(row, opts) { q.op = "upsert"; q.row = row; q.opts = opts; return b; },
         // PostgREST semantics: one row or null, and no error when there is no match.
         maybeSingle() { q.one = true; return b; },
         then(res, rej) {
-          calls.push({ table: q.table, op: q.op, row: q.row, filters: { ...q.filters }, cols: q.cols });
+          calls.push({ table: q.table, op: q.op, row: q.row, filters: { ...q.filters }, cols: q.cols, opts: q.opts });
           let data = null;
           if (q.op === "select") {
             const h = hits();
@@ -143,6 +159,7 @@ export function makeFakeSB(tables = {}, opts = {}) {
             if (q.returning) {
               data = blocked(q.table, n) ? []                                   // <- the silent refusal
                 : q.op === "insert" ? [{ id: nextId++, ...q.row }]
+                : q.op === "upsert" ? upsertHits()
                 : hits().map((r) => ({ ...r, ...q.row }));
             }
           }
