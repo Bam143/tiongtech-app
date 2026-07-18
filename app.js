@@ -1134,7 +1134,7 @@ async function _supaBootstrap() {
     pr_employee_id: null
   };
   // core datasets
-  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile");
+  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password");
   out.vendos = await _supaAll(sb, "vendos", "id,vlan_number,name,address,coordinates,area,phone,email,date_installed,port,nap,url_link,notes,nap_port_id");
   out.olts = await _supaAll(sb, "olt", "id,name,description,standard,total_pon_ports,areas_served");
   out.ponPorts = await _supaAll(sb, "pon_port", "id,olt_id,port_number");
@@ -20784,7 +20784,7 @@ function ClientProfile({
   const di = clientDueInfo(client);
   const status = client.billing_status || "";
   const statusColor = /active/i.test(status) ? t.good : /expired|disconnect/i.test(status) ? t.bad : t.textMuted;
-  const info = [[pmode ? "VLAN #" : "Account #", client.account_number || "—"], ["Area", client.area || "—"], ["Plan / Profile", client.profile || "—"], ["MRC", client.mrc ? peso(client.mrc) : "—"], ["Phone", client.phone || "—"], ["Email", client.email || "—"], ["NAP", client.nap ? `${client.nap}${client.napPort ? " · p" + client.napPort : ""}` : "—"], [pmode ? "Date Installed" : "Subscription Date", client.subscription_date || "—"], ...(pmode ? [] : [["Bill Date", fmtDate(clientBillDate(client))], ["Due Date", fmtDate(clientDueDate(client))]])];
+  const info = [[pmode ? "VLAN #" : "Account #", client.account_number || "—"], ["Area", client.area || "—"], ["Plan / Profile", client.profile || "—"], ["MRC", client.mrc ? peso(client.mrc) : "—"], ["Phone", client.phone || "—"], ["Email", client.email || "—"], ["NAP", client.nap ? `${client.nap}${client.napPort ? " · p" + client.napPort : ""}` : "—"], [pmode ? "Date Installed" : "Subscription Date", client.subscription_date || "—"], ...(pmode ? [] : [["Bill Date", fmtDate(clientBillDate(client))], ["Due Date", fmtDate(clientDueDate(client))], ["PPPoE Username", client.pppoe_username || "—"], ["PPPoE Password", client.pppoe_password || "—"]])];
   const th = {
     textAlign: "left",
     padding: "8px 12px",
@@ -27004,5 +27004,5 @@ function App() {
 Promise.resolve(typeof loadLiveData === 'function' ? loadLiveData() : false).catch(function () {}).finally(function () {
   var _boot = document.getElementById('boot');
   if (_boot) _boot.remove();
-  createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
+  createRoot(document.getElementById("root")).render( /*#__PURE__*/React.createElement(App, null));
 });
