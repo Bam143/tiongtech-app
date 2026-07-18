@@ -694,6 +694,63 @@ const MUTATIONS = [
     from: `let expenses = []; // see cashFlow above — seeded demo categories removed`,
     to: `let expenses = [{ cat: "Payroll", amt: 240000 }, { cat: "Bandwidth", amt: 210000 }];`,
   },
+  // ---- delete_all_expenses (irreversible, whole-table; the guards ARE the feature) ----
+  {
+    name: "drop-wipe-owner-check",
+    why: "any signed-in user can wipe the entire expense ledger — unrecoverable, and it moves all-time net, the year figure and every chart in the flattering direction, so the business looks more profitable than it is",
+    in: "_supaDeleteAllExpenses",
+    from: `if (!ME || ME.role !== "owner") return {
+    ok: false,
+    error: "Only the superadmin can delete all expenses."
+  };`,
+    to: "",
+  },
+  {
+    name: "wipe-unfiltered-delete",
+    why: "the delete loses its filter, and PostgREST refuses an unfiltered DELETE outright — so the wipe silently does nothing while the pre-count still says rows were there, turning the most destructive button in the app into one that reports failure forever",
+    in: "_supaDeleteAllExpenses",
+    from: `await sb.from("expenses").delete().gte("id", 0).select("id");`,
+    to: `await sb.from("expenses").delete().select("id");`,
+  },
+  {
+    name: "wipe-drops-select-count",
+    why: "without asking for the deleted rows back there is no count at all, so the screen reports 'Deleted undefined expenses' and a silent RLS refusal is indistinguishable from a successful wipe",
+    in: "_supaDeleteAllExpenses",
+    from: `await sb.from("expenses").delete().gte("id", 0).select("id");`,
+    to: `await sb.from("expenses").delete().gte("id", 0);`,
+  },
+  {
+    name: "wipe-claims-intended-count",
+    why: "the tally reports how many rows WERE there rather than how many the database removed, so a half-refused wipe reads as a clean one and nobody goes looking for the expenses still on the books",
+    in: "_supaDeleteAllExpenses",
+    from: `  const deleted = (gone || []).length;`,
+    to: `  const deleted = expected;`,
+  },
+  {
+    name: "drop-wipe-zerorows",
+    why: "a delete the database silently refused reports success, so the owner is told the ledger is empty while every expense is still there — and being told it worked is exactly what stops anyone checking",
+    in: "_supaDeleteAllExpenses",
+    from: `  if (!deleted) return {
+    ok: false,
+    error: "The database refused to delete the expenses — your account may not have permission. All " + expected + " are still there."
+  };
+`,
+    to: "",
+  },
+  {
+    name: "drop-wipe-partial-check",
+    why: "a partial wipe reports a clean one: RLS removes some rows and hides others, the count comes back short, and nothing says so — the ledger is left in a state nobody knows about",
+    in: "_supaDeleteAllExpenses",
+    from: `  if (deleted < expected) {
+    return {
+      ok: false,
+      error: "Only " + deleted + " of " + expected + " expenses were deleted before the database refused the rest. The remaining " + (expected - deleted) + " are still there — fix the permission and run it again.",
+      deleted
+    };
+  }
+`,
+    to: "",
+  },
   // ---- import_expenses (bulk insert; add-only is the property worth the most here) ----
   {
     name: "drop-import-permission",

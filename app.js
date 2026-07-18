@@ -1715,6 +1715,82 @@ async function _supaClientPayments(payload) {
     payments
   };
 }
+/* ---- Delete EVERY expense (delete_all_expenses) — OWNER ONLY, IRREVERSIBLE ----
+   The most destructive action in this application. There is no soft delete here and no undo: the
+   payroll deletes all became active=0 precisely so history survived, and this one cannot, because
+   "wipe the expense ledger" is the thing being asked for. Every row goes.
+
+   What that costs, so it is written down where it is done: expenses feeds _supaFinancials and
+   _supaDashboard, so a wipe does not merely empty a list — it moves all-time net, the year figure,
+   the seven-month cash-flow chart and the expense breakdown, and it moves them in the flattering
+   direction. Income stays, outgoings vanish, and the business looks more profitable than it is.
+
+   THREE GATES, and they are deliberately not the same gate written three times:
+     1. The button renders only for ME.role === "owner" (app.jsx:4693).
+     2. The UI demands the literal string "DELETE ALL" typed into a prompt — a confirmation that
+        cannot be dismissed by reflex the way an OK button can.
+     3. This handler re-checks the role, because gates 1 and 2 are both in the browser and neither
+        survives a console.
+   The handler does NOT re-check the typed word. A string echoed back by the caller proves nothing
+   about what a human typed, so treating it as proof would be theatre; the role check is the part
+   that means something on this side.
+
+   COUNTED BEFORE AND AFTER, like _supaDeletePeriod (app.jsx:1173). A DELETE filtered by anything
+   other than a resolved id returns 200 with an empty array both when it removed nothing and when
+   RLS hid every row from it, and on a wipe those two are not remotely the same event. Knowing how
+   many rows were there first is the only way to tell "the table was already empty" from "the
+   database refused" from "some rows were removed and others were not". */
+async function _supaDeleteAllExpenses() {
+  const sb = window.SB;
+  if (!ME || ME.role !== "owner") return {
+    ok: false,
+    error: "Only the superadmin can delete all expenses."
+  };
+  const {
+    data: before,
+    error: countErr
+  } = await sb.from("expenses").select("id");
+  if (countErr) return {
+    ok: false,
+    error: "Could not read the expenses before deleting: " + countErr.message + " Nothing was deleted."
+  };
+  const expected = (before || []).length;
+  // An empty table is a success with nothing in it, not a failure. Returning early also means the
+  // delete below is never issued against a table that has nothing to lose.
+  if (!expected) return {
+    ok: true,
+    deleted: 0
+  };
+  // .gte("id", 0) is how "every row" is spelled to PostgREST, which rejects a DELETE with no filter
+  // at all. Ids are a bigint identity sequence starting at 1, so nothing real sits below zero — and
+  // if anything ever did, it would be SKIPPED rather than swept, and the count comparison below
+  // would catch that as a partial rather than reporting a clean wipe.
+  const {
+    data: gone,
+    error
+  } = await sb.from("expenses").delete().gte("id", 0).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not delete the expenses: " + error.message
+  };
+  const deleted = (gone || []).length;
+  if (!deleted) return {
+    ok: false,
+    error: "The database refused to delete the expenses — your account may not have permission. All " + expected + " are still there."
+  };
+  if (deleted < expected) {
+    return {
+      ok: false,
+      error: "Only " + deleted + " of " + expected + " expenses were deleted before the database refused the rest. The remaining " + (expected - deleted) + " are still there — fix the permission and run it again.",
+      deleted
+    };
+  }
+  // `deleted` is counted from rows the database actually gave back, never from `expected`.
+  return {
+    ok: true,
+    deleted
+  };
+}
 /* ---- Bulk expense import (import_expenses) — OWNER ONLY, ADD ONLY, TWO PHASE ----
    The Import button in ExpensesPage, which parses a CSV or spreadsheet in the browser and sends
    the rows here.
@@ -3928,6 +4004,9 @@ const API = (action, payload) => {
         }
         if (action === "import_expenses") {
           return await _supaImportExpenses(payload);
+        }
+        if (action === "delete_all_expenses") {
+          return await _supaDeleteAllExpenses();
         }
         if (action === "fin_range") {
           const inc = (payload && payload.kind || "income") === "income";
@@ -11176,22 +11255,30 @@ function ExpensesPage({
       setTimeout(() => setFlash(""), 3500);
       return;
     }
+    // The typed gate above is UNCHANGED and is the only thing standing between the click and the
+    // wipe. Everything below just reports what actually happened.
+    let res = null;
     try {
-      const res = await API("delete_all_expenses", {
+      res = await API("delete_all_expenses", {
         confirm: "DELETE ALL"
       });
-      if (res && res.ok) {
-        setFlash(`Deleted ${res.deleted} expense${res.deleted === 1 ? "" : "s"}`);
-        setTimeout(() => setFlash(""), 4000);
-        onSaved();
-      } else {
-        setFlash("Delete failed" + (res && res.error ? ": " + res.error : ""));
-        setTimeout(() => setFlash(""), 4000);
-      }
     } catch (e) {
-      setFlash("Delete failed: " + (e.message || ""));
-      setTimeout(() => setFlash(""), 4000);
+      res = {
+        ok: false,
+        error: e && e.message || "Delete failed."
+      };
     }
+    // Refreshed either way. On success the list empties; on a partial or a refusal the true
+    // remaining rows come back, so the screen can never show a wipe that did not happen. onSaved
+    // also reloads the financial totals, which a wipe moves as much as it moves this list.
+    onSaved();
+    if (res && res.ok) {
+      setFlash(res.deleted === 0 ? "Nothing to delete — there were no expenses." : `Deleted ${res.deleted} expense${res.deleted === 1 ? "" : "s"}.`);
+      setTimeout(() => setFlash(""), 5000);
+      return;
+    }
+    setFlash("NOT deleted — " + (res && res.error || "the database refused it."));
+    setTimeout(() => setFlash(""), 12000);
   };
   const importExpenses = async file => {
     if (!file) return;

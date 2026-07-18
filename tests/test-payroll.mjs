@@ -2343,6 +2343,104 @@ await t.test("finance writes: a delete that moved nothing says the row is STILL 
   t.ok(/still there/.test(res.error), `names the consequence, got: ${res.error}`);
 });
 
+/* ---------- delete_all_expenses (the whole ledger, irreversible) ---------- */
+// The most destructive action in the app. Nothing here runs against anything but the fake.
+const WIPE_ROWS = [
+  { id: 1, spent_at: "2026-07-01", supplier: "Fuel", description: "Diesel", amount: 1200, invoice: "", user_name: "luz" },
+  { id: 2, spent_at: "2026-07-02", supplier: "Rent", description: "July", amount: 8000, invoice: "", user_name: "luz" },
+  { id: 3, spent_at: "2026-06-30", supplier: "Power", description: "June", amount: 400, invoice: "", user_name: "luz" },
+];
+const wipe = async ({ role = "owner", rows = WIPE_ROWS.map((r) => ({ ...r })), opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role, allowed_views: null });
+  try {
+    const sb = makeFakeSB({ expenses: rows }, opts);
+    window.SB = sb;
+    const res = await API("delete_all_expenses", { confirm: "DELETE ALL" });
+    return { sb, res };
+  } finally { setME(was); }
+};
+
+await t.test("wipe: the owner deletes every expense and gets the REAL count", async () => {
+  const { sb, res } = await wipe({});
+  t.eq(res.ok, true, `deleted, got: ${res.error}`);
+  t.eq(res.deleted, 3, "the count is what the database gave back, not what was hoped for");
+  const del = sb.calls.filter((c) => c.op === "delete");
+  t.eq(del.length, 1, "one delete — a wipe is a single statement, not a loop");
+  t.eq(del[0].table, "expenses", "on expenses and NOTHING else");
+  t.eq(del[0].cols, "id", ".select(\"id\") — without it there is no way to know what went");
+  t.eq(sb.calls.filter((c) => c.table !== "expenses").length, 0, "no other table is touched — payments and the payroll ledger are untouched");
+});
+
+await t.test("wipe: the delete carries a filter, because PostgREST refuses one without", async () => {
+  const { sb } = await wipe({});
+  const del = sb.calls.filter((c) => c.op === "delete")[0];
+  t.ok(del.gte && del.gte.id === 0, `filtered .gte("id", 0) — the phrasing that means every row, got: ${JSON.stringify(del.gte)}`);
+});
+
+await t.test("wipe: EVERY non-owner role is refused, and nothing is deleted", async () => {
+  for (const role of ["cfo", "admin_officer", "payroll", "technician", "admin"]) {
+    const { sb, res } = await wipe({ role });
+    t.eq(res.ok, false, `${role} refused`);
+    t.eq(res.error, "Only the superadmin can delete all expenses.", `${role} message`);
+    t.eq(sb.calls.length, 0, `${role} touched nothing — refused before even counting`);
+  }
+});
+
+await t.test("wipe: an already-empty table is a success with nothing in it", async () => {
+  const { sb, res } = await wipe({ rows: [] });
+  t.eq(res.ok, true, "not an error — there was simply nothing to delete");
+  t.eq(res.deleted, 0, "zero deleted");
+  t.eq(sb.calls.filter((c) => c.op === "delete").length, 0, "and no delete is issued at all against an empty table");
+});
+
+await t.test("wipe: a silently refused delete reports the rows are STILL THERE", async () => {
+  // The case the pre-count exists for: 200 + [] means both "removed nothing" and "RLS hid every
+  // row", and on a wipe those are not remotely the same event.
+  const { res } = await wipe({ opts: { blockWrites: "expenses" } });
+  t.eq(res.ok, false, "refused — never a false 'all deleted'");
+  t.ok(/refused/.test(res.error), `says refused, got: ${res.error}`);
+  t.ok(/All 3 are still there/.test(res.error), `names how many survived, got: ${res.error}`);
+});
+
+await t.test("wipe: a row the filter cannot reach is reported as a PARTIAL, not a clean wipe", async () => {
+  // .gte("id", 0) is how "every row" is spelled to PostgREST, and it carries an assumption: that no
+  // id sits below zero. Ids are a bigint identity sequence starting at 1, so nothing real does —
+  // but if anything ever did it would be SKIPPED rather than swept, and the whole point of counting
+  // first is that the miss surfaces as a reported partial instead of a silent one. This is that
+  // case, and it is also the only way to produce a genuine partial against the fake: blockWrites is
+  // all-or-nothing, so the shortfall has to come from the fixture.
+  const rows = [
+    { id: -1, spent_at: "2026-07-01", supplier: "Legacy", description: "negative id", amount: 50, invoice: "", user_name: "" },
+    { id: 1, spent_at: "2026-07-01", supplier: "Fuel", description: "", amount: 100, invoice: "", user_name: "" },
+    { id: 2, spent_at: "2026-07-02", supplier: "Rent", description: "", amount: 200, invoice: "", user_name: "" },
+  ];
+  const { res } = await wipe({ rows });
+  t.eq(res.ok, false, "a partial wipe is NOT a success");
+  t.eq(res.deleted, 2, "two rows really went, and the count says two");
+  t.ok(/Only 2 of 3/.test(res.error), `says how far it got, got: ${res.error}`);
+  t.ok(/remaining 1/.test(res.error), `and how many survived, got: ${res.error}`);
+});
+
+await t.test("wipe: a 42501 on the delete is an honest failure", async () => {
+  const { res } = await wipe({ opts: { errorWrites: "expenses" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Could not delete the expenses/.test(res.error), `explains itself, got: ${res.error}`);
+});
+
+await t.test("wipe: a failed pre-count refuses rather than guessing", async () => {
+  const sb = makeFakeSB({ expenses: [] });
+  sb.from = () => ({ select: () => Promise.resolve({ data: null, error: { message: "permission denied" } }) });
+  const was = getME();
+  setME({ ...was, role: "owner", allowed_views: null });
+  try {
+    window.SB = sb;
+    const res = await API("delete_all_expenses", { confirm: "DELETE ALL" });
+    t.eq(res.ok, false, "refused");
+    t.ok(/Nothing was deleted/.test(res.error), `says plainly that nothing went, got: ${res.error}`);
+  } finally { setME(was); }
+});
+
 /* ---------- import_expenses (bulk CSV import — owner only, ADD ONLY, two phase) ---------- */
 // The property these tests exist to hold: an import can never overwrite an existing expense. The
 // api.php version matched on an id column and upserted, so a stale export silently reverted real
