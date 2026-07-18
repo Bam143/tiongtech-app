@@ -429,7 +429,7 @@ async function _supaBootstrap() {
   if (me) { const { data: pe } = await sb.from("pr_employees").select("id").eq("user_id", me.id).eq("active", 1).limit(1); if (pe && pe.length) prId = pe[0].id; }
   out.me = me ? { role: me.role, name: me.full_name, uid: me.id, position: me.position, allowed_views: allowed, pr_employee_id: prId } : { role: "admin", name: "", uid: null, position: null, allowed_views: null, pr_employee_id: null };
   // core datasets
-  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile");
+  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password");
   out.vendos = await _supaAll(sb, "vendos", "id,vlan_number,name,address,coordinates,area,phone,email,date_installed,port,nap,url_link,notes,nap_port_id");
   out.olts = await _supaAll(sb, "olt", "id,name,description,standard,total_pon_ports,areas_served");
   out.ponPorts = await _supaAll(sb, "pon_port", "id,olt_id,port_number");
@@ -7590,7 +7590,7 @@ function ClientProfile({ t, client, onClose, pmode }) {
     ["Email", client.email || "—"],
     ["NAP", client.nap ? `${client.nap}${client.napPort ? " · p" + client.napPort : ""}` : "—"],
     [pmode ? "Date Installed" : "Subscription Date", client.subscription_date || "—"],
-    ...(pmode ? [] : [["Bill Date", fmtDate(clientBillDate(client))], ["Due Date", fmtDate(clientDueDate(client))]]),
+    ...(pmode ? [] : [["Bill Date", fmtDate(clientBillDate(client))], ["Due Date", fmtDate(clientDueDate(client))], ["PPPoE Username", client.pppoe_username || "—"], ["PPPoE Password", client.pppoe_password || "—"]]),
   ];
   const th = { textAlign: "left", padding: "8px 12px", fontWeight: 700, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.05em", color: t.textFaint, borderBottom: `1px solid ${t.border}` };
   const td = { padding: "8px 12px", fontSize: 12.5, color: t.textMuted, borderBottom: `1px solid ${t.borderSoft}` };
