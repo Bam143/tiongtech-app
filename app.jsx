@@ -128,28 +128,29 @@ const peso = (n) =>
 const pesoK = (n) =>
   n >= 1000 ? "₱" + (n / 1000).toFixed(n >= 100000 ? 0 : 1) + "k" : "₱" + n;
 
+// Zeroed, not seeded. This held 742 active clients, 38 installs, ₱1,043,000 revenue and a 1.26%
+// churn rate — demo figures, of which only activeClients and revenue were ever overwritten by live
+// data. The rest rendered as fact. Every member is now 0 and the tiles that need a real number
+// either count it from the client list or say "—".
 let KPI = {
-  activeClients: 742,
-  newInstalls: 38,
-  renewed: 610,
-  expired: 24,
-  disconnected: 9,
-  saved: 15,
-  churn: 1.26,
-  revenue: 1043000,
-  collectionRate: 91,
-  target: 1000,
+  activeClients: 0,
+  newInstalls: 0,
+  renewed: 0,
+  expired: 0,
+  disconnected: 0,
+  saved: 0,
+  churn: 0,
+  revenue: 0,
+  collectionRate: 0,
+  target: 1000,   // a GOAL, not a measurement — the only honest constant here
 };
 
-const growth = [
-  { m: "Aug", subs: 612, rev: 861 },
-  { m: "Sep", subs: 641, rev: 902 },
-  { m: "Oct", subs: 668, rev: 940 },
-  { m: "Nov", subs: 693, rev: 975 },
-  { m: "Dec", subs: 704, rev: 991 },
-  { m: "Jan", subs: 713, rev: 1006 },
-  { m: "Feb", subs: 742, rev: 1043 },
-];
+// EMPTY, not seeded. This fed the growth curve on the Owner Dashboard hero — a rise from 612 to
+// 742 subscribers and ₱861k to ₱1,043k in revenue that belonged to nobody. The Subscribers screen
+// already builds a REAL equivalent (growthReal, app.jsx:3049) from client_snapshots plus payments;
+// pointing the hero chart at that is a follow-up, and until then an empty chart that says so beats
+// a confident line going up.
+const growth = [];
 
 const churnTrend = [
   { m: "Aug", churn: 2.1, saved: 8 },
@@ -170,27 +171,14 @@ const retentionFunnel = [
   { label: "Ending active", value: 742 },
 ];
 
-let cashFlow = [
-  { m: "Aug", inflow: 861, outflow: 612 },
-  { m: "Sep", inflow: 902, outflow: 641 },
-  { m: "Oct", inflow: 940, outflow: 655 },
-  { m: "Nov", inflow: 975, outflow: 668 },
-  { m: "Dec", inflow: 991, outflow: 690 },
-  { m: "Jan", inflow: 1006, outflow: 702 },
-  { m: "Feb", inflow: 1043, outflow: 678 },
-];
+// EMPTY, not seeded. These three held demo figures — a cash-flow curve peaking at ₱1,043k, expense
+// categories headed by "Payroll ₱240,000" and "Bandwidth ₱210,000", income led by "Subscriptions
+// ₱963,000" — and the loader only replaced them when the live result was NON-EMPTY. So a database
+// with no expenses yet did not show an empty chart; it showed somebody else's business, on the
+// owner's screen, labelled as theirs. An empty chart is the honest answer to an empty table.
+let cashFlow = [];
 
-let expenses = [
-  { cat: "Payroll", amt: 240000 },
-  { cat: "Bandwidth", amt: 210000 },
-  { cat: "ONUs / Routers", amt: 55000 },
-  { cat: "Fiber & materials", amt: 48000 },
-  { cat: "Electricity", amt: 42000 },
-  { cat: "Rent", amt: 35000 },
-  { cat: "Fuel", amt: 18000 },
-  { cat: "Marketing", amt: 15000 },
-  { cat: "Misc / repairs", amt: 15000 },
-];
+let expenses = [];   // see cashFlow above — seeded demo categories removed
 
 let FIN_KPI = null;
 let DASH = null;
@@ -298,13 +286,7 @@ let FIN_ALL = null;
 let FIN_YEAR = null;
 let FIN_MONTHS = [];
 let FIN_PAYMENTS = [];
-let income = [
-  { src: "Subscriptions", amt: 963000 },
-  { src: "Installation fees", amt: 45600 },
-  { src: "Reconnection fees", amt: 12800 },
-  { src: "Equipment sales", amt: 15400 },
-  { src: "Other", amt: 6200 },
-];
+let income = [];   // see cashFlow above — seeded demo sources removed
 
 const barangayProfit = [
   { area: "Anabu", subs: 168, margin: 41 },
@@ -627,6 +609,193 @@ async function _supaFinancials() {
     allTime: { income: aIn, expense: aOut, net: aIn - aOut },
     financeMonths: Array.from(months).sort().reverse(),
   };
+}
+/* ---- The Owner Dashboard's money (dashboard) ----
+   Every figure on the owner's main screen. Until this was wired the action fell through, DASH
+   stayed null, and the tiles rendered hardcoded demo constants — ₱58,400 collected today, ₱678,000
+   spent over two months, ₱365,000 net — numbers that were never anyone's data. Everything else in
+   that block read ₱0 no matter what had actually been paid.
+
+   ASIA/MANILA, EXPLICITLY. Every boundary here — today, this week, this month — is a Philippine
+   local boundary, not a UTC one. paid_at is timestamptz, so a payment taken at 23:30 in Manila is
+   15:30 UTC the same day, while one at 08:30 Manila is 00:30 UTC the same day: truncating the UTC
+   instant would move evening payments into tomorrow and make "Collections Today" wrong every
+   evening. The Philippines has never observed DST, so a fixed +8 is exact rather than an
+   approximation — this is one of the few timezones where that shortcut is not a bug waiting to
+   happen. Shifting the instant by +8h and then reading the UTC calendar fields off the result gives
+   Manila wall-clock without needing a timezone database inside the VM.
+
+   MONTHLY FIGURES COME FROM THE SAME ARITHMETIC AS THE FINANCIALS SCREEN, deliberately: same
+   _supaAll reads, same _payRow/_expRow mapping, same "YYYY-MM prefix" bucketing. Two screens
+   showing the same month must not be able to disagree, and the only way to guarantee that is to
+   compute them the same way rather than to compute them twice.
+
+   HONEST FAILURE, AND THIS ONE MATTERS MORE THAN USUAL. Every field here is a number the owner
+   makes decisions on. A half-read dashboard would render as a confident set of zeros — which is
+   indistinguishable from a quiet month — so any failed read returns ok:false and the screen shows
+   "—" rather than a total nobody can tell is missing. */
+const _MNL_OFFSET_MS = 8 * 60 * 60 * 1000;   // Asia/Manila is UTC+8 year-round; no DST, ever
+// A timestamp -> the Manila calendar date it falls on. Accepts a full timestamptz or a bare
+// "YYYY-MM-DD": a date-only value parses as UTC midnight, and +8h leaves it on its own date.
+const _mnlDay = (v) => {
+  if (!v) return "";
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return String(v).slice(0, 10);   // unparseable: fall back to the prefix
+  return new Date(d.getTime() + _MNL_OFFSET_MS).toISOString().slice(0, 10);
+};
+// "Now" as Manila wall-clock. `at` is a test seam — the boundary cases are the whole point of this
+// handler and cannot be exercised against a clock that moves. Read-only either way.
+const _mnlNow = (at) => new Date((at ? new Date(at).getTime() : Date.now()) + _MNL_OFFSET_MS);
+async function _supaDashboard(payload) {
+  const sb = window.SB;
+  try {
+    const now = _mnlNow(payload && payload.now);
+    const today = now.toISOString().slice(0, 10);
+    const thisK = today.slice(0, 7);
+    const lastD = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    const lastK = lastD.toISOString().slice(0, 7);
+    // The Manila week, Monday-start: getUTCDay() on the shifted instant is the Manila weekday.
+    const dow = (now.getUTCDay() + 6) % 7;   // 0 = Monday
+    const weekStart = new Date(now.getTime() - dow * 86400000).toISOString().slice(0, 10);
+    const weekEnd = new Date(now.getTime() + (6 - dow) * 86400000).toISOString().slice(0, 10);
+
+    // _supaAll paginates; a plain .select() would stop at PostgREST's default 1000 and understate
+    // every total the moment the ledger outgrows one page.
+    const payRaw = await _supaAll(sb, "payments", _pCols + ",created_by");
+    const expRaw = await _supaAll(sb, "expenses", _eCols);
+    const cliRaw = await _supaAll(sb, "clients", "account_number,area,first_name,last_name");
+    const planRaw = await _supaAll(sb, "pr_plans", "id,kind,total_amount,active");
+    const ledRaw = await _supaAll(sb, "pr_plan_applied", _PR_APPLIED_COLS);
+    const itemRaw = await _supaAll(sb, "pr_items", "id,period_id,net");
+    const perRaw = await _supaAll(sb, "pr_periods", "id,pay_date");
+
+    const pays = payRaw.map(_payRow);
+    const exps = expRaw.map(_expRow);
+    // Manila day per payment, computed from the RAW timestamptz rather than _payRow's already
+    // date-truncated copy — truncating first would throw away the time and with it the timezone.
+    const payDay = payRaw.map((r) => _mnlDay(r.paid_at));
+    const expDay = expRaw.map((r) => _mnlDay(r.spent_at));
+
+    const sum = (rows) => rows.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+    const inMonth = (rows, days, k) => rows.reduce((a, r, i) => a + ((days[i] || "").slice(0, 7) === k ? (Number(r.amount) || 0) : 0), 0);
+
+    const incomeThisMonth = inMonth(pays, payDay, thisK);
+    const incomeLastMonth = inMonth(pays, payDay, lastK);
+    const expensesThisMonth = inMonth(exps, expDay, thisK);
+    const expensesLastMonth = inMonth(exps, expDay, lastK);
+    // Two CALENDAR months, this plus last — not a rolling 60 days. The tiles sit beside the
+    // per-month tiles, so the pair has to add up to what is shown above it.
+    const income2mo = incomeThisMonth + incomeLastMonth;
+    const expenses2mo = expensesThisMonth + expensesLastMonth;
+
+    const todayIdx = [];
+    payDay.forEach((d, i) => { if (d === today) todayIdx.push(i); });
+    const cliByAcct = {};
+    cliRaw.forEach((c) => { cliByAcct[String(c.account_number || "")] = c; });
+    const cliName = (acct) => {
+      const c = cliByAcct[String(acct || "")];
+      return c ? ((c.first_name || "") + " " + (c.last_name || "")).trim() : "";
+    };
+    const collectionsTodayList = todayIdx.map((i) => ({
+      reference: payRaw[i].reference || "", account: payRaw[i].account || "", client: cliName(payRaw[i].account),
+      source: payRaw[i].source || "", amount: Number(payRaw[i].amount) || 0, paid_at: payRaw[i].paid_at || "",
+      user_name: payRaw[i].user_name || "", created_by: payRaw[i].created_by || "",
+    }));
+    const thisMonthIdx = [];
+    payDay.forEach((d, i) => { if ((d || "").slice(0, 7) === thisK) thisMonthIdx.push(i); });
+    const incomeThisMonthList = thisMonthIdx.map((i) => ({
+      reference: payRaw[i].reference || "", account: payRaw[i].account || "", client: cliName(payRaw[i].account),
+      source: payRaw[i].source || "", amount: Number(payRaw[i].amount) || 0, paid_at: payRaw[i].paid_at || "",
+      user_name: payRaw[i].user_name || "", created_by: payRaw[i].created_by || "",
+    }));
+    // Clients renewed this month: DISTINCT accounts, so paying twice counts the person once.
+    const renewedAccts = {};
+    thisMonthIdx.forEach((i) => { const a = String(payRaw[i].account || "").trim(); if (a) renewedAccts[a] = 1; });
+
+    // PESOWiFi income: a vending account is identified by clients.area starting "PESOWIFI"
+    // (isPeso, app.jsx:7117). Same rule the client screens use, so the split cannot disagree.
+    const isPesoAcct = (acct) => {
+      const c = cliByAcct[String(acct || "")];
+      return !!c && String(c.area || "").toUpperCase().trim().indexOf("PESOWIFI") === 0;
+    };
+    const pesoIn = (k) => payDay.reduce((a, d, i) => a + (((d || "").slice(0, 7) === k && isPesoAcct(payRaw[i].account)) ? (Number(payRaw[i].amount) || 0) : 0), 0);
+
+    // Outstanding loans: REMAINING PRINCIPAL on active plans. Interest-only weeks carry term_no 0
+    // and are excluded — they take interest and advance no principal, so counting them would report
+    // a debt shrinking when it is not. Floored at 0 so an overpaid plan cannot subtract from
+    // somebody else's balance and understate the total.
+    const paidByPlan = {};
+    ledRaw.forEach((r) => {
+      if (!(Number(r.term_no) > 0)) return;
+      const k = String(r.plan_id);
+      paidByPlan[k] = (paidByPlan[k] || 0) + (Number(r.amount) || 0);
+    });
+    let outstandingLoans = 0;
+    planRaw.forEach((p) => {
+      if (!(Number(p.active) === 1)) return;
+      outstandingLoans += Math.max(0, (Number(p.total_amount) || 0) - (paidByPlan[String(p.id)] || 0));
+    });
+
+    // Collection funds: money ALREADY taken, bucketed by the plan's kind. Every ledger row counts,
+    // interest-only included — that money really was collected even though it advanced no term.
+    const kindByPlan = {};
+    planRaw.forEach((p) => { kindByPlan[String(p.id)] = String(p.kind || "").toLowerCase(); });
+    const collectionFunds = { coop: 0, tshirt: 0, ca: 0, fines: 0 };
+    ledRaw.forEach((r) => {
+      const kind = kindByPlan[String(r.plan_id)];
+      if (Object.prototype.hasOwnProperty.call(collectionFunds, kind)) collectionFunds[kind] += Number(r.amount) || 0;
+    });
+    // Summed from the four rather than tracked alongside them, so the total cannot drift from its parts.
+    const collectionFundsTotal = collectionFunds.coop + collectionFunds.tshirt + collectionFunds.ca + collectionFunds.fines;
+
+    // Payroll expense: pr_items.net for periods whose PAY DATE lands in the window. Keyed on
+    // pay_date rather than on when the week was worked, because that is when the money leaves.
+    const perDay = {};
+    perRaw.forEach((p) => { perDay[String(p.id)] = _mnlDay(p.pay_date); });
+    const payrollIn = (lo, hi) => itemRaw.reduce((a, it) => {
+      const d = perDay[String(it.period_id)] || "";
+      return a + (d >= lo && d <= hi ? (Number(it.net) || 0) : 0);
+    }, 0);
+
+    const bySource = {};
+    payRaw.forEach((r) => {
+      const s = String(r.source || "").trim() || "Other";
+      if (!bySource[s]) bySource[s] = { source: s, count: 0, amount: 0 };
+      bySource[s].count++;
+      bySource[s].amount += Number(r.amount) || 0;
+    });
+    const expMonths = {};
+    expDay.forEach((d, i) => { const k = (d || "").slice(0, 7); if (!k) return; expMonths[k] = (expMonths[k] || 0) + (Number(expRaw[i].amount) || 0); });
+
+    return {
+      ok: true,
+      dashboard: {
+        collectionsToday: todayIdx.reduce((a, i) => a + (Number(payRaw[i].amount) || 0), 0),
+        collectionsTodayCount: todayIdx.length,
+        collectionsTodayList,
+        incomeThisMonth, incomeLastMonth,
+        expensesThisMonth, expensesLastMonth,
+        netLastMonth: incomeLastMonth - expensesLastMonth,
+        income2mo, expenses2mo, net2mo: income2mo - expenses2mo,
+        incomeThisMonthList,
+        renewedThisMonth: Object.keys(renewedAccts).length,
+        pesoThis: pesoIn(thisK), pesoLast: pesoIn(lastK),
+        outstandingLoans,
+        collectionFunds, collectionFundsTotal,
+        payrollExpenseWeek: payrollIn(weekStart, weekEnd),
+        payrollExpenseMonth: payrollIn(thisK + "-01", thisK + "-31"),
+        // DASH's own spelling: {source, count, amount}. The financials screen's incomeBySource is
+        // {src, amt} with no count — same name, different contract, and they must not be swapped.
+        incomeBySource: Object.keys(bySource).map((k) => bySource[k]).sort((a, b) => b.amount - a.amount),
+        expenseMonths: Object.keys(expMonths).sort().map((k) => ({ ym: k, amount: expMonths[k] })),
+        sumAllIncome: sum(pays), sumAllExpense: sum(exps),
+      },
+    };
+  } catch (e) {
+    // _supaAll throws on a read error. Better a dashboard that says it could not load than one
+    // showing a confident set of zeros that reads exactly like a quiet month.
+    return { ok: false, error: "Could not load the dashboard: " + ((e && e.message) || String(e)) };
+  }
 }
 /* ---- One client's payment history (client_payments) — READ ONLY ----
    ClientProfile's payment panel (app.jsx:6897), which asks by ACCOUNT NUMBER, not by client id:
@@ -2024,6 +2193,7 @@ const API = (action, payload) => {
           return { ok: true };
         }
         if (action === "financials") { return await _supaFinancials(); }
+        if (action === "dashboard") { return await _supaDashboard(payload); }
         if (action === "client_payments") { return await _supaClientPayments(payload); }
         if (action === "save_expense_cats") { return await _supaSaveExpenseCats(payload); }
         if (action === "import_expenses") { return await _supaImportExpenses(payload); }
@@ -2260,9 +2430,13 @@ async function loadLiveData() {
   try {
     const fin = await API("financials");
     if (fin && fin.ok) {
-      if (Array.isArray(fin.cashFlow) && fin.cashFlow.length) cashFlow = fin.cashFlow;
-      if (Array.isArray(fin.incomeBySource) && fin.incomeBySource.length) income = fin.incomeBySource;
-      if (Array.isArray(fin.expensesByCategory) && fin.expensesByCategory.length) expenses = fin.expensesByCategory;
+      // No `.length` guard. It used to be there, and it was the mechanism that kept the demo data
+      // alive: an empty live result failed the test, the assignment was skipped, and the seed
+      // stayed on screen looking exactly like real figures. An empty array IS the answer when the
+      // table is empty, and it has to be allowed to win.
+      if (Array.isArray(fin.cashFlow)) cashFlow = fin.cashFlow;
+      if (Array.isArray(fin.incomeBySource)) income = fin.incomeBySource;
+      if (Array.isArray(fin.expensesByCategory)) expenses = fin.expensesByCategory;
       if (Array.isArray(fin.recentExpenses)) FIN_RECENT = fin.recentExpenses;
       if (Array.isArray(fin.recentPayments)) FIN_PAYMENTS = fin.recentPayments;
       if (fin.kpi) { FIN_KPI = fin.kpi; if (fin.kpi.mtdIncome != null) KPI.revenue = fin.kpi.mtdIncome; }
@@ -2274,7 +2448,15 @@ async function loadLiveData() {
   } catch (e) {}
   try {
     const dash = await API("dashboard");
-    if (dash && dash.ok && dash.dashboard) DASH = dash.dashboard;
+    if (dash && dash.ok && dash.dashboard) {
+      DASH = dash.dashboard;
+      // The Financials screen's two PESOWiFi tiles read FIN_MONTH.pesoThis/pesoLast, which
+      // _supaFinancials has never produced — they rendered pesoK(undefined), a permanent ₱0 that
+      // looked like a reading. The dashboard computes them (it already loads clients, which is what
+      // identifies a PESOWiFi account), so the value is carried across rather than computed twice
+      // in two places that could then disagree.
+      if (FIN_MONTH) { FIN_MONTH.pesoThis = DASH.pesoThis; FIN_MONTH.pesoLast = DASH.pesoLast; }
+    }
   } catch (e) {}
   KPI.activeClients = clients.length || KPI.activeClients;
   return true;
@@ -2491,33 +2673,42 @@ function OwnerDashboard({ t }) {
   const _due3 = _regularList.filter((c) => dueDays(c) === 3).length;
   const _arList = _regularList.filter((c) => clientIsActive(c) && !clientPaid(c) && dueDays(c) <= 0);
   const _ar = _arList.reduce((a, c) => a + (Number(c.mrc) || 0), 0);
+  // _live now means LOADED, not "real vs demo". It used to gate invented constants — ₱58,400
+  // collected today, ₱678,000 spent over two months, ₱365,000 net — that rendered whenever the
+  // dashboard had not loaded, which was always, because the action was never wired. They are gone.
+  // A screen that has not loaded shows "—" through _n() below; a screen that HAS loaded shows the
+  // real figure, including a real ₱0. "I don't know yet" and "it is zero" are different answers and
+  // must not look alike on a page somebody makes decisions from.
   const _live = !!DASH;
-  const _collToday = _live ? DASH.collectionsToday : 58400;
-  const _collN = _live ? DASH.collectionsTodayCount : 62;
-  const _exp2 = _live ? DASH.expenses2mo : 678000;
-  const _net2 = _live ? DASH.net2mo : 365000;
-  const _inc2 = _live ? DASH.income2mo : 0;
-  const _incThisM = _live ? DASH.incomeThisMonth : 0;
-  const _incLastM = _live ? DASH.incomeLastMonth : 0;
-  const _expLastM = _live ? DASH.expensesLastMonth : 0;
-  const _netLastM = _live ? DASH.netLastMonth : 0;
-  const _cf = (_live && DASH.collectionFunds) ? DASH.collectionFunds : { coop: 0, tshirt: 0, ca: 0, fines: 0 };
-  const _cfTotal = _live ? (DASH.collectionFundsTotal || 0) : 0;
-  const _payWk = _live ? (DASH.payrollExpenseWeek || 0) : 0;
-  const _payMo = _live ? (DASH.payrollExpenseMonth || 0) : 0;
-  const _outLoans = _live ? (DASH.outstandingLoans || 0) : 0;
+  const _n = (v) => (_live ? (Number(v) || 0) : null);        // null -> the tile renders "—"
+  const _money = (v) => (v === null ? "—" : peso(v));
+  const _moneyK = (v) => (v === null ? "—" : pesoK(v));
+  const _collToday = _n(DASH && DASH.collectionsToday);
+  const _collN = _live ? (Number(DASH.collectionsTodayCount) || 0) : null;
+  const _exp2 = _n(DASH && DASH.expenses2mo);
+  const _net2 = _n(DASH && DASH.net2mo);
+  const _inc2 = _n(DASH && DASH.income2mo);
+  const _incThisM = _n(DASH && DASH.incomeThisMonth);
+  const _incLastM = _n(DASH && DASH.incomeLastMonth);
+  const _expLastM = _n(DASH && DASH.expensesLastMonth);
+  const _netLastM = _n(DASH && DASH.netLastMonth);
+  const _cf = (_live && DASH.collectionFunds) ? DASH.collectionFunds : { coop: null, tshirt: null, ca: null, fines: null };
+  const _cfTotal = _n(DASH && DASH.collectionFundsTotal);
+  const _payWk = _n(DASH && DASH.payrollExpenseWeek);
+  const _payMo = _n(DASH && DASH.payrollExpenseMonth);
+  const _outLoans = _n(DASH && DASH.outstandingLoans);
   const tiles = [
     { label: "Active Clients", value: _active, icon: Users, tone: "good", sub: "renewed · not expired" },
     { label: "Active Renewal This Month", value: (DASH && DASH.renewedThisMonth != null) ? DASH.renewedThisMonth : "—", icon: CheckCircle2, tone: "good", sub: "clients who paid this month · tap to view", onClick: () => setShowIncome(true) },
     { label: "Clients Renewed Today", value: _renewedToday.length, icon: CheckCircle2, tone: "good", sub: "paid today · tap to view", onClick: () => setShowRenewed(true) },
-    { label: "Collections Today", value: peso(_collToday), icon: PiggyBank, tone: "good", sub: `${_collN} payment${_collN === 1 ? "" : "s"} · tap to view`, onClick: () => setShowColl(true) },
-    { label: "Income this Month", value: pesoK(_incThisM), icon: Banknote, tone: "good", sub: "payments, this month · tap to view", onClick: () => setShowIncome(true) },
-    { label: "Income Last Month", value: pesoK(_incLastM), icon: Banknote, tone: "accent", sub: "payments, last month" },
-    { label: "Expenses Last Month", value: pesoK(_expLastM), icon: Receipt, tone: "warn", sub: "last month" },
-    { label: "Net Profit Last Month", value: pesoK(_netLastM), icon: TrendingUp, tone: _netLastM >= 0 ? "good" : "bad", sub: "income − expenses" },
-    { label: "Income (last 2 mo)", value: pesoK(_inc2), icon: Banknote, tone: "good", sub: "payments, trailing 60 days" },
-    { label: "Expenses (last 2 mo)", value: pesoK(_exp2), icon: Receipt, tone: "warn", sub: "trailing 60 days" },
-    { label: "Net Profit (last 2 mo)", value: pesoK(_net2), icon: TrendingUp, tone: _net2 >= 0 ? "good" : "bad", sub: "income − expenses" },
+    { label: "Collections Today", value: _money(_collToday), icon: PiggyBank, tone: "good", sub: _collN === null ? "not loaded yet" : `${_collN} payment${_collN === 1 ? "" : "s"} · tap to view`, onClick: () => setShowColl(true) },
+    { label: "Income this Month", value: _moneyK(_incThisM), icon: Banknote, tone: "good", sub: "payments, this month · tap to view", onClick: () => setShowIncome(true) },
+    { label: "Income Last Month", value: _moneyK(_incLastM), icon: Banknote, tone: "accent", sub: "payments, last month" },
+    { label: "Expenses Last Month", value: _moneyK(_expLastM), icon: Receipt, tone: "warn", sub: "last month" },
+    { label: "Net Profit Last Month", value: _moneyK(_netLastM), icon: TrendingUp, tone: _netLastM === null ? "accent" : (_netLastM >= 0 ? "good" : "bad"), sub: "income − expenses" },
+    { label: "Income (last 2 mo)", value: _moneyK(_inc2), icon: Banknote, tone: "good", sub: "payments, this + last month" },
+    { label: "Expenses (last 2 mo)", value: _moneyK(_exp2), icon: Receipt, tone: "warn", sub: "this + last month" },
+    { label: "Net Profit (last 2 mo)", value: _moneyK(_net2), icon: TrendingUp, tone: _net2 === null ? "accent" : (_net2 >= 0 ? "good" : "bad"), sub: "income − expenses" },
     { label: "Accounts Receivable", value: pesoK(_ar), icon: Wallet, tone: "warn", sub: `${_arList.length} unpaid, due/overdue` },
     { label: "Renewals Today", value: _renewToday, icon: CalendarClock, tone: "accent", sub: "due today, excl. PESOWiFi" },
     { label: "Clients Due Tomorrow", value: _due1, icon: CalendarClock, tone: "accent", sub: "in 1 day, excl. PESOWiFi" },
@@ -2606,6 +2797,11 @@ function OwnerDashboard({ t }) {
             </div>
           </div>
           <div style={{ width: "100%", maxWidth: 360, height: 150 }}>
+            {!growth.length ? (
+              <div style={{ height: 150, display: "grid", placeItems: "center", color: t.textFaint, fontSize: 12, textAlign: "center" }}>
+                <div>No growth history yet<div style={{ fontSize: 10.5, marginTop: 3 }}>Builds up as monthly snapshots accumulate.</div></div>
+              </div>
+            ) : (
             <ResponsiveContainer>
               <AreaChart data={growth} margin={{ top: 6, right: 4, left: -18, bottom: 0 }}>
                 <defs>
@@ -2621,6 +2817,7 @@ function OwnerDashboard({ t }) {
                 <Area type="monotone" dataKey="subs" name="Subscribers" stroke={t.accent} strokeWidth={2.5} fill="url(#subFill)" />
               </AreaChart>
             </ResponsiveContainer>
+            )}
           </div>
         </div>
       </Card>
@@ -2638,14 +2835,14 @@ function OwnerDashboard({ t }) {
         </div>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-3.5 p-4">
           {[
-            { label: "Salary Expense This Week", value: pesoK(_payWk), tone: "warn" },
-            { label: "Salary Expense This Month", value: pesoK(_payMo), tone: "warn" },
-            { label: "Outstanding Employee Loans", value: pesoK(_outLoans), tone: "bad" },
-            { label: "Cooperative Collections", value: pesoK(_cf.coop || 0), tone: "accent" },
-            { label: "T-Shirt Collections", value: pesoK(_cf.tshirt || 0), tone: "accent" },
-            { label: "Cash Advance Collections", value: pesoK(_cf.ca || 0), tone: "accent" },
-            { label: "Other Employee Collections", value: pesoK(_cf.fines || 0), tone: "accent" },
-            { label: "Total Collection Funds", value: pesoK(_cfTotal), tone: "good" },
+            { label: "Salary Expense This Week", value: _moneyK(_payWk), tone: "warn" },
+            { label: "Salary Expense This Month", value: _moneyK(_payMo), tone: "warn" },
+            { label: "Outstanding Employee Loans", value: _moneyK(_outLoans), tone: "bad" },
+            { label: "Cooperative Collections", value: _moneyK(_cf.coop), tone: "accent" },
+            { label: "T-Shirt Collections", value: _moneyK(_cf.tshirt), tone: "accent" },
+            { label: "Cash Advance Collections", value: _moneyK(_cf.ca), tone: "accent" },
+            { label: "Other Employee Collections", value: _moneyK(_cf.fines), tone: "accent" },
+            { label: "Total Collection Funds", value: _moneyK(_cfTotal), tone: "good" },
           ].map((x) => {
             const col = { accent: t.accent, good: t.good, warn: t.warn, bad: t.bad }[x.tone];
             return (
@@ -2775,7 +2972,7 @@ function OwnerDashboard({ t }) {
           <div onClick={() => setShowColl(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.6)" }} />
           <Card t={t} style={{ position: "relative", zIndex: 91, width: "100%", maxWidth: 600, padding: 0, maxHeight: "82vh", display: "flex", flexDirection: "column" }}>
             <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: `1px solid ${t.border}` }}>
-              <div style={{ color: t.text, fontWeight: 800, fontSize: 16 }}>Collections today <span style={{ color: t.textFaint, fontWeight: 500 }}>· {peso(_collToday)} from {_collList.length} payment{_collList.length === 1 ? "" : "s"}</span></div>
+              <div style={{ color: t.text, fontWeight: 800, fontSize: 16 }}>Collections today <span style={{ color: t.textFaint, fontWeight: 500 }}>· {_money(_collToday)} from {_collList.length} payment{_collList.length === 1 ? "" : "s"}</span></div>
               <button onClick={() => setShowColl(false)} className="grid place-items-center rounded-lg" style={{ width: 30, height: 30, background: t.surface2, border: `1px solid ${t.border}`, color: t.textMuted, cursor: "pointer" }}><IconX size={15} /></button>
             </div>
             <div style={{ overflowY: "auto", padding: "6px 0" }}>
@@ -2819,13 +3016,19 @@ function Subscribers({ t }) {
   const [vipOpen, setVipOpen] = useState(false);
   const funnelTiles = [
     { label: "Active Clients", value: activeRegular, tone: "accent", icon: Users },
-    { label: "New Client Installed", value: KPI.newInstalls, tone: "good", icon: Zap, delta: 8.6 },
+    // These four read KPI's seed until now: 38 new installs, 24 expired, 1.26% churn, 91%
+    // collection rate — none of them anybody's data, and each carried a hardcoded delta arrow
+    // (+8.6, −3.1, +2.0) implying a trend that was never measured. The first two are countable from
+    // the client list the tiles beside them already use, so they are counted. The last two are NOT
+    // derivable from what the app holds — churn needs a prior-period snapshot and collection rate
+    // needs billed-versus-collected — so they say "—" instead of a number nobody computed.
+    { label: "New Client Installed", value: _reg.filter((c) => (c.subscription_date || "").slice(0, 7) === _ym).length, tone: "good", icon: Zap, sub: "subscribed this month" },
     { label: "PESOWiFi Installed", value: pesoInstalled, tone: "accent", icon: Wifi },
     { label: "VIP Clients", value: vipClients.length, tone: "violet", icon: Users, sub: "balance · no pay 2mo", onClick: () => setVipOpen(true) },
     { label: "Renewed Clients", value: renewedRegular, tone: "good", icon: CheckCircle2, sub: "paid this cycle" },
-    { label: "Expired Clients", value: KPI.expired, tone: "warn", icon: Clock },
-    { label: "Monthly Churn", value: KPI.churn + "%", tone: "good", icon: TrendingDown, delta: -3.1, invert: true },
-    { label: "Collection Rate", value: KPI.collectionRate + "%", tone: "accent", icon: PiggyBank, delta: 2.0 },
+    { label: "Expired Clients", value: _reg.filter((c) => (c.active_profile || "").trim().toLowerCase() === "expired").length, tone: "warn", icon: Clock },
+    { label: "Monthly Churn", value: "—", tone: "accent", icon: TrendingDown, sub: "needs a prior-month snapshot" },
+    { label: "Collection Rate", value: "—", tone: "accent", icon: PiggyBank, sub: "needs billed vs collected" },
   ];
   const [subStats, setSubStats] = useState(null);
   useEffect(() => { let ok = true; API("subscriber_stats").then((d) => { if (ok && d && d.ok) setSubStats(d); }).catch(() => {}); return () => { ok = false; }; }, []);
@@ -4016,20 +4219,29 @@ function Financials({ t }) {
           </>
         ) : (
           <>
-            <StatTile t={t} label="Total Collection · Last Month" value={pesoK(0)} icon={Wallet} tone="good" />
-            <StatTile t={t} label="Total Expenses · Last Month" value={pesoK(0)} icon={Receipt} tone="warn" />
-            <StatTile t={t} label="Total Net · Last Month" value={pesoK(0)} icon={PiggyBank} tone="good" />
-            <StatTile t={t} label="PESOWiFi Income · Last Month" value={pesoK(0)} icon={Wifi} tone="accent" />
-            <StatTile t={t} label="Total Collection · This Month" value={pesoK(0)} icon={Wallet} tone="good" />
-            <StatTile t={t} label="Total Expenses · This Month" value={pesoK(0)} icon={Receipt} tone="warn" />
-            <StatTile t={t} label="Total Net · This Month" value={pesoK(0)} icon={PiggyBank} tone="good" />
-            <StatTile t={t} label="PESOWiFi Income · This Month" value={pesoK(0)} icon={Wifi} tone="accent" />
+            {/* Not loaded is not the same as zero. These used to read ₱0 before the financials
+                call had returned, which is indistinguishable from a month with no money in it. */}
+            <StatTile t={t} label="Total Collection · Last Month" value="—" icon={Wallet} tone="accent" />
+            <StatTile t={t} label="Total Expenses · Last Month" value="—" icon={Receipt} tone="accent" />
+            <StatTile t={t} label="Total Net · Last Month" value="—" icon={PiggyBank} tone="accent" />
+            <StatTile t={t} label="PESOWiFi Income · Last Month" value="—" icon={Wifi} tone="accent" />
+            <StatTile t={t} label="Total Collection · This Month" value="—" icon={Wallet} tone="accent" />
+            <StatTile t={t} label="Total Expenses · This Month" value="—" icon={Receipt} tone="accent" />
+            <StatTile t={t} label="Total Net · This Month" value="—" icon={PiggyBank} tone="accent" />
+            <StatTile t={t} label="PESOWiFi Income · This Month" value="—" icon={Wifi} tone="accent" />
           </>
         )}
       </div>
       <div className="grid lg:grid-cols-5 gap-4">
         <Card t={t} className="lg:col-span-3" style={{ padding: 18 }}>
           <SectionTitle t={t} right={<Eyebrow t={t}>₱ thousands</Eyebrow>}>Monthly cash flow</SectionTitle>
+          {/* An empty chart with no words on it reads as broken. Saying so is what makes an empty
+              database look like an empty database rather than a failure. */}
+          {!cashFlow.length ? (
+            <div style={{ height: 250, display: "grid", placeItems: "center", color: t.textFaint, fontSize: 13, textAlign: "center" }}>
+              <div>No data yet<div style={{ fontSize: 11.5, marginTop: 4 }}>Record a payment or an expense and this fills in.</div></div>
+            </div>
+          ) : (
           <div style={{ height: 250 }}>
             <ResponsiveContainer>
               <BarChart data={cashFlow} margin={{ top: 4, right: 8, left: -18, bottom: 0 }}>
@@ -4043,9 +4255,15 @@ function Financials({ t }) {
               </BarChart>
             </ResponsiveContainer>
           </div>
+          )}
         </Card>
         <Card t={t} className="lg:col-span-2" style={{ padding: 18 }}>
           <SectionTitle t={t}>Expense breakdown</SectionTitle>
+          {!donut.length ? (
+            <div style={{ height: 250, display: "grid", placeItems: "center", color: t.textFaint, fontSize: 13, textAlign: "center" }}>
+              <div>No expenses recorded yet<div style={{ fontSize: 11.5, marginTop: 4 }}>Add one, or import a CSV, and the breakdown appears.</div></div>
+            </div>
+          ) : (
           <div style={{ height: 250 }}>
             <ResponsiveContainer>
               <PieChart>
@@ -4056,6 +4274,7 @@ function Financials({ t }) {
               </PieChart>
             </ResponsiveContainer>
           </div>
+          )}
           <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 mt-1">
             {donut.slice(0, 6).map((d) => (
               <div key={d.cat} className="flex items-center gap-1.5" style={{ fontSize: 11.5, color: t.textMuted }}>

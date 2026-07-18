@@ -44,6 +44,10 @@ export function loadApp(appJsPath) {
       // for Set just as the real constructor does. L is app.jsx's icon lookup, built with Proxy at
       // module scope, so it doubles as proof that Proxy was real while app.js was still evaluating.
       +  " __globals: () => ({ set: new Set([1, 1, 2]).size === 2, map: (() => { const m = new Map(); m.set(\"k\", 7); return m.get(\"k\") === 7; })(), proxy: Object.prototype.toString.call(L) === \"[object Object]\", isFinite: isFinite(0 / 0) === false, isNaN: isNaN(\"x\") === true, nan: typeof NaN === \"number\", undef: (function (a) { return a === undefined; })() }),"
+      // Arrows, not values: cashFlow/income/expenses are `let` bindings that loadLiveData
+      // reassigns, so capturing them by value would freeze whatever they held at load. These are
+      // the three that used to carry demo chart data, and the only way to assert it is gone.
+      +  " __charts: () => ({ cashFlow, income, expenses }),"
       +  " setME: (v) => { ME = v; }, getME: () => ME };\n";
 
   const windowObj = { SB: null, __LIVE__: true, addEventListener() {}, location: { href: "" }, matchMedia: () => ({ matches: false, addEventListener() {} }) };

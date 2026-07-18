@@ -638,6 +638,62 @@ const MUTATIONS = [
     active: false
   })`,
   },
+  // ---- dashboard (every figure on the owner's main screen) ----
+  {
+    name: "dashboard-utc-not-manila",
+    why: "every date boundary silently becomes UTC, so an evening payment lands on tomorrow: 'Collections Today' is wrong every evening after 4pm Manila, and a payment on the last night of the month falls into the next month's income",
+    from: `const _MNL_OFFSET_MS = 8 * 60 * 60 * 1000;`,
+    to: `const _MNL_OFFSET_MS = 0;`,
+  },
+  {
+    name: "dashboard-outstanding-counts-interest",
+    why: "interest-only weeks count against the principal, so a loan that took only interest reports a shrinking balance — the owner sees debt being repaid that never was",
+    in: "_supaDashboard",
+    from: `      if (!(Number(r.term_no) > 0)) return;
+`,
+    to: "",
+  },
+  {
+    name: "dashboard-outstanding-ignores-paid",
+    why: "Outstanding Employee Loans shows the ORIGINAL debt instead of what is left, so a nearly-repaid loan book reads as though nobody has paid anything",
+    in: "_supaDashboard",
+    from: `      outstandingLoans += Math.max(0, (Number(p.total_amount) || 0) - (paidByPlan[String(p.id)] || 0));`,
+    to: `      outstandingLoans += (Number(p.total_amount) || 0);`,
+  },
+  {
+    name: "dashboard-outstanding-allows-negative",
+    why: "an overpaid plan subtracts from everyone else's balance, so one over-collected loan silently understates the whole outstanding figure",
+    in: "_supaDashboard",
+    from: `Math.max(0, (Number(p.total_amount) || 0) - (paidByPlan[String(p.id)] || 0))`,
+    to: `((Number(p.total_amount) || 0) - (paidByPlan[String(p.id)] || 0))`,
+  },
+  {
+    name: "dashboard-funds-not-bucketed-by-kind",
+    why: "every collection lands in one bucket regardless of the plan's kind, so the Coop / T-shirt / Cash-advance / Fines split on the dashboard is meaningless — the money is real but attributed to the wrong fund",
+    in: "_supaDashboard",
+    from: `      if (Object.prototype.hasOwnProperty.call(collectionFunds, kind)) collectionFunds[kind] += Number(r.amount) || 0;`,
+    to: `      collectionFunds.coop += Number(r.amount) || 0;`,
+  },
+  {
+    name: "dashboard-half-built-on-read-failure",
+    why: "a failed read returns a dashboard of zeros instead of an error, and a page of zeros is indistinguishable from a quiet month — the owner reads 'no money came in' when the truth is 'nothing could be loaded'",
+    in: "_supaDashboard",
+    from: `    return {
+      ok: false,
+      error: "Could not load the dashboard: " + (e && e.message || String(e))
+    };`,
+    to: `    return { ok: true, dashboard: { collectionsToday: 0, collectionsTodayCount: 0, collectionsTodayList: [], incomeThisMonth: 0, incomeLastMonth: 0, expensesLastMonth: 0, netLastMonth: 0, income2mo: 0, expenses2mo: 0, net2mo: 0, incomeThisMonthList: [], renewedThisMonth: 0, pesoThis: 0, pesoLast: 0, outstandingLoans: 0, collectionFunds: { coop: 0, tshirt: 0, ca: 0, fines: 0 }, collectionFundsTotal: 0, payrollExpenseWeek: 0, payrollExpenseMonth: 0, incomeBySource: [], expenseMonths: [], sumAllIncome: 0, sumAllExpense: 0 } };`,
+  },
+  {
+    // The FIRST version of this mutated loadLiveData's `.length` guard back, and it survived — for a
+    // good reason worth keeping written down. Now that the seed arrays are genuinely empty, the
+    // guard is belt-and-braces: assigning [] or skipping the assignment leaves [] either way. What
+    // actually protects the screen is that the demo data is GONE, so that is what this mutates.
+    name: "dashboard-seed-charts-return",
+    why: "the demo chart data comes back, so an empty expense table renders 'Payroll ₱240,000' and 'Bandwidth ₱210,000' as the owner's own spending — invented figures presented as fact on the finance screen",
+    from: `let expenses = []; // see cashFlow above — seeded demo categories removed`,
+    to: `let expenses = [{ cat: "Payroll", amt: 240000 }, { cat: "Bandwidth", amt: 210000 }];`,
+  },
   // ---- import_expenses (bulk insert; add-only is the property worth the most here) ----
   {
     name: "drop-import-permission",

@@ -10,7 +10,7 @@
 import { loadApp, makeFakeSB, makeSuite } from "./harness.mjs";
 
 const APP_JS = process.argv[2] || "app.js";   // relative to the repo root, where npm runs
-const { API, window, prCalc, setME, getME, __globals } = loadApp(APP_JS);
+const { API, window, prCalc, setME, getME, __globals, __charts } = loadApp(APP_JS);
 const t = makeSuite("payroll / pr_save_items + pr_unlock");
 
 // One grid row exactly as saveGrid builds it (app.jsx:4577-4580).
@@ -2014,6 +2014,221 @@ await t.test("client payments: a missing account is refused before any read", as
 await t.test("client payments: is wired — it no longer falls through", async () => {
   const { res } = await clientPays({ account: "ACC-001" });
   t.ok(!/is not connected to Supabase yet/.test(res.error || ""), "reaches the handler, not the fallthrough");
+});
+
+/* ---------- dashboard (the Owner Dashboard's money) ---------- */
+// Before this was wired the action fell through, DASH stayed null, and the tiles rendered demo
+// constants — ₱58,400 collected today, ₱678,000 spent, ₱365,000 net. Every assertion here is a
+// figure the owner makes decisions on, so each is pinned to fixture rows rather than to a shape.
+//
+// `now` is passed explicitly throughout: these are TIMEZONE tests, and a boundary case cannot be
+// tested against a clock that moves. 2026-07-15T04:00:00Z is 12:00 noon in Manila on 2026-07-15.
+const DASH_NOW = "2026-07-15T04:00:00Z";
+const dash = async (tables, now = DASH_NOW) => {
+  const sb = makeFakeSB({ payments: [], expenses: [], clients: [], pr_plans: [], pr_plan_applied: [], pr_items: [], pr_periods: [], ...tables });
+  window.SB = sb;
+  const res = await API("dashboard", { now });
+  return { sb, res, d: res && res.dashboard };
+};
+const PAY = (over) => ({ id: 1, paid_at: "2026-07-15T02:00:00Z", account: "ACC-1", source: "Cash", amount: 100, reference: "R", user_name: "luz", created_by: "luz", ...over });
+
+await t.test("dashboard: collections today counts only TODAY in Manila, not UTC", async () => {
+  const payments = [
+    // 23:30 Manila on the 15th = 15:30Z the same day. UTC-truncation keeps it on the 15th too,
+    // so this row alone cannot tell the two apart — the next two are what discriminate.
+    PAY({ id: 1, paid_at: "2026-07-15T15:30:00Z", amount: 500 }),
+    // 23:30 UTC on the 14th is already 07:30 Manila on the 15th — TODAY in Manila, yesterday in UTC.
+    PAY({ id: 2, paid_at: "2026-07-14T23:30:00Z", amount: 300 }),
+    // 23:30 UTC on the 15th is 07:30 Manila on the 16th — TOMORROW in Manila, today in UTC.
+    PAY({ id: 3, paid_at: "2026-07-15T23:30:00Z", amount: 900 }),
+  ];
+  const { d } = await dash({ payments });
+  t.eq(d.collectionsToday, 800, "500 + 300 — the UTC-yesterday payment counts, the UTC-today one does not");
+  t.eq(d.collectionsTodayCount, 2, "two payments, not three");
+  t.ok(!d.collectionsTodayList.some((r) => r.amount === 900), "tomorrow's Manila payment is excluded from the list too");
+});
+
+await t.test("dashboard: a payment at 23:30 Manila on the last day of the month stays in that month", async () => {
+  // 2026-07-31 23:30 Manila = 2026-07-31T15:30Z. Under UTC truncation it is still July, so the
+  // discriminating case is the mirror: 2026-07-31T23:30Z is 2026-08-01 07:30 Manila — AUGUST.
+  const payments = [
+    PAY({ id: 1, paid_at: "2026-07-31T15:30:00Z", amount: 400 }),
+    PAY({ id: 2, paid_at: "2026-07-31T23:30:00Z", amount: 700 }),
+  ];
+  const { d } = await dash({ payments });
+  t.eq(d.incomeThisMonth, 400, "only the genuinely-July payment counts toward July");
+  t.eq(d.income2mo, 400, "and the August one is outside this+last month entirely");
+});
+
+await t.test("dashboard: the list carries the shape the UI and the Assistant render", async () => {
+  const payments = [PAY({ paid_at: "2026-07-15T02:00:00Z", amount: 250, reference: "OR-9", account: "ACC-1", source: "GCash" })];
+  const clients = [{ account_number: "ACC-1", area: "Poblacion", first_name: "Ana", last_name: "Cruz" }];
+  const { d } = await dash({ payments, clients });
+  const row = d.collectionsTodayList[0];
+  for (const k of ["reference", "account", "client", "source", "amount", "paid_at", "user_name", "created_by"]) {
+    t.ok(k in row, `${k} present — the export columns depend on it`);
+  }
+  t.eq(row.client, "Ana Cruz", "the client name is resolved from the account, which payments alone cannot give");
+});
+
+await t.test("dashboard: 2-month figures are this + last CALENDAR month", async () => {
+  const payments = [
+    PAY({ id: 1, paid_at: "2026-07-10T02:00:00Z", amount: 100 }),   // this month
+    PAY({ id: 2, paid_at: "2026-06-10T02:00:00Z", amount: 200 }),   // last month
+    PAY({ id: 3, paid_at: "2026-05-10T02:00:00Z", amount: 400 }),   // older — excluded
+  ];
+  const expenses = [
+    { id: 1, spent_at: "2026-07-05", supplier: "Fuel", description: "", amount: 30, invoice: "", user_name: "" },
+    { id: 2, spent_at: "2026-06-05", supplier: "Rent", description: "", amount: 50, invoice: "", user_name: "" },
+    { id: 3, spent_at: "2026-05-05", supplier: "Old", description: "", amount: 99, invoice: "", user_name: "" },
+  ];
+  const { d } = await dash({ payments, expenses });
+  t.eq(d.incomeThisMonth, 100, "July income");
+  t.eq(d.incomeLastMonth, 200, "June income");
+  t.eq(d.income2mo, 300, "this + last, NOT a rolling 60 days and NOT all-time");
+  t.eq(d.expensesLastMonth, 50, "June expenses");
+  t.eq(d.expenses2mo, 80, "30 + 50");
+  t.eq(d.netLastMonth, 150, "200 − 50");
+  t.eq(d.net2mo, 220, "300 − 80");
+});
+
+await t.test("dashboard: renewedThisMonth counts DISTINCT accounts", async () => {
+  const payments = [
+    PAY({ id: 1, account: "ACC-1", paid_at: "2026-07-02T02:00:00Z" }),
+    PAY({ id: 2, account: "ACC-1", paid_at: "2026-07-09T02:00:00Z" }),   // same client, paid twice
+    PAY({ id: 3, account: "ACC-2", paid_at: "2026-07-09T02:00:00Z" }),
+    PAY({ id: 4, account: "ACC-3", paid_at: "2026-06-09T02:00:00Z" }),   // last month
+  ];
+  const { d } = await dash({ payments });
+  t.eq(d.renewedThisMonth, 2, "paying twice makes one renewed client, not two");
+});
+
+await t.test("dashboard: outstanding loans = principal remaining, interest-only excluded, floored", async () => {
+  const pr_plans = [
+    { id: 1, kind: "ca", total_amount: 1000, active: 1 },
+    { id: 2, kind: "coop", total_amount: 500, active: 1 },
+    { id: 3, kind: "ca", total_amount: 9999, active: 0 },   // inactive — not outstanding
+  ];
+  const pr_plan_applied = [
+    { id: 1, plan_id: 1, period_id: 1, term_no: 1, amount: 200 },
+    { id: 2, plan_id: 1, period_id: 2, term_no: 2, amount: 200 },
+    { id: 3, plan_id: 1, period_id: 3, term_no: 0, amount: 50 },     // interest-only: no principal
+    { id: 4, plan_id: 2, period_id: 1, term_no: 1, amount: 900 },    // overpaid past its total
+  ];
+  const { d } = await dash({ pr_plans, pr_plan_applied });
+  // plan 1: 1000 − 400 = 600 (the term_no 0 row does NOT reduce principal)
+  // plan 2: 500 − 900 = −400, floored to 0 (must not subtract from plan 1's balance)
+  t.eq(d.outstandingLoans, 600, "600, not 550 (interest counted) and not 200 (negative allowed to leak)");
+});
+
+await t.test("dashboard: collection funds bucket the ledger by plan kind", async () => {
+  const pr_plans = [
+    { id: 1, kind: "coop", total_amount: 1000, active: 1 },
+    { id: 2, kind: "tshirt", total_amount: 250, active: 1 },
+    { id: 3, kind: "ca", total_amount: 800, active: 0 },
+    { id: 4, kind: "fines", total_amount: 300, active: 1 },
+  ];
+  const pr_plan_applied = [
+    { id: 1, plan_id: 1, period_id: 1, term_no: 1, amount: 100 },
+    { id: 2, plan_id: 1, period_id: 2, term_no: 0, amount: 10 },    // interest-only: still COLLECTED
+    { id: 3, plan_id: 2, period_id: 1, term_no: 1, amount: 50 },
+    { id: 4, plan_id: 3, period_id: 1, term_no: 1, amount: 80 },    // inactive plan, money still taken
+    { id: 5, plan_id: 4, period_id: 1, term_no: 1, amount: 25 },
+  ];
+  const { d } = await dash({ pr_plans, pr_plan_applied });
+  t.eq(d.collectionFunds.coop, 110, "100 + the interest-only 10 — it was collected");
+  t.eq(d.collectionFunds.tshirt, 50, "tshirt");
+  t.eq(d.collectionFunds.ca, 80, "an inactive plan's past deductions still happened");
+  t.eq(d.collectionFunds.fines, 25, "fines");
+  t.eq(d.collectionFundsTotal, 265, "the total is the sum of the four — it cannot drift from them");
+});
+
+await t.test("dashboard: payroll expense uses pr_items.net for periods paid in the window", async () => {
+  const pr_periods = [
+    { id: 1, pay_date: "2026-07-13" },   // this week (Mon 13 – Sun 19 July 2026)
+    { id: 2, pay_date: "2026-07-06" },   // earlier this month, previous week
+    { id: 3, pay_date: "2026-06-29" },   // last month
+  ];
+  const pr_items = [
+    { id: 1, period_id: 1, net: 3000 }, { id: 2, period_id: 1, net: 2000 },
+    { id: 3, period_id: 2, net: 1500 },
+    { id: 4, period_id: 3, net: 9999 },
+  ];
+  const { d } = await dash({ pr_periods, pr_items });
+  t.eq(d.payrollExpenseWeek, 5000, "only the week containing 15 July");
+  t.eq(d.payrollExpenseMonth, 6500, "5000 + 1500 — July, excluding June's week");
+});
+
+await t.test("dashboard: income by source uses the DASH spelling, not the financials one", async () => {
+  const payments = [
+    PAY({ id: 1, source: "GCash", amount: 100 }), PAY({ id: 2, source: "GCash", amount: 200 }),
+    PAY({ id: 3, source: "Cash", amount: 50 }), PAY({ id: 4, source: "", amount: 5 }),
+  ];
+  const { d } = await dash({ payments });
+  const top = d.incomeBySource[0];
+  t.eq(top.source, "GCash", "keyed `source`, NOT `src` — the Assistant export reads this spelling");
+  t.eq(top.count, 2, "with a count, which the financials shape does not carry");
+  t.eq(top.amount, 300, "and the summed amount");
+  t.ok(d.incomeBySource.some((s) => s.source === "Other"), "a blank source falls into Other rather than vanishing");
+});
+
+await t.test("dashboard: PESOWiFi income is split out by the client's area", async () => {
+  const clients = [
+    { account_number: "ACC-1", area: "PESOWIFI Anabu", first_name: "Vend", last_name: "One" },
+    { account_number: "ACC-2", area: "Poblacion", first_name: "Ana", last_name: "Cruz" },
+  ];
+  const payments = [
+    PAY({ id: 1, account: "ACC-1", amount: 60, paid_at: "2026-07-10T02:00:00Z" }),
+    PAY({ id: 2, account: "ACC-2", amount: 900, paid_at: "2026-07-10T02:00:00Z" }),
+    PAY({ id: 3, account: "ACC-1", amount: 40, paid_at: "2026-06-10T02:00:00Z" }),
+  ];
+  const { d } = await dash({ payments, clients });
+  t.eq(d.pesoThis, 60, "this month's vending income only");
+  t.eq(d.pesoLast, 40, "last month's");
+  t.eq(d.incomeThisMonth, 960, "and total income still counts BOTH — the split is a breakdown, not a filter");
+});
+
+await t.test("dashboard: an empty database returns real zeros, never a demo number", async () => {
+  const { d, res } = await dash({});
+  t.eq(res.ok, true, `ok on an empty database, got: ${res.error}`);
+  for (const k of ["collectionsToday", "collectionsTodayCount", "incomeThisMonth", "incomeLastMonth",
+    "expensesLastMonth", "netLastMonth", "income2mo", "expenses2mo", "net2mo", "renewedThisMonth",
+    "outstandingLoans", "collectionFundsTotal", "payrollExpenseWeek", "payrollExpenseMonth", "pesoThis", "pesoLast"]) {
+    t.eq(d[k], 0, `${k} is 0`);
+  }
+  t.eq(d.collectionsTodayList.length, 0, "empty list");
+  t.eq(d.incomeBySource.length, 0, "empty breakdown");
+  // The constants that used to render when the dashboard had not loaded.
+  const seeded = [58400, 62, 678000, 365000];
+  const vals = Object.keys(d).map((k) => d[k]).filter((v) => typeof v === "number");
+  for (const s of seeded) t.ok(!vals.includes(s), `no demo constant ${s} anywhere in the payload`);
+});
+
+await t.test("dashboard: the demo chart data is GONE — no seed survives an empty database", async () => {
+  // These three globals shipped with a fake business in them: a cash-flow curve peaking at ₱1,043k,
+  // expense categories led by "Payroll ₱240,000" and "Bandwidth ₱210,000", income led by
+  // "Subscriptions ₱963,000". The loader only replaced them when the live result was NON-EMPTY, so
+  // an empty table showed somebody else's numbers on the owner's screen, labelled as theirs.
+  const c = __charts();
+  t.eq(c.cashFlow.length, 0, "cash flow starts empty");
+  t.eq(c.income.length, 0, "income by source starts empty");
+  t.eq(c.expenses.length, 0, "expense breakdown starts empty");
+  const flat = JSON.stringify(c);
+  for (const seeded of [240000, 210000, 963000, 1043, 861, 45600]) {
+    t.ok(flat.indexOf(String(seeded)) === -1, `no demo value ${seeded} anywhere in the chart data`);
+  }
+});
+
+await t.test("dashboard: a failed read is an honest failure, not a page of confident zeros", async () => {
+  // A dashboard of zeros is indistinguishable from a quiet month, which is the worst possible way
+  // for a money screen to fail.
+  const sb = makeFakeSB({ payments: [] });
+  sb.from = () => { throw new Error("permission denied for table payments"); };
+  window.SB = sb;
+  const res = await API("dashboard", { now: DASH_NOW });
+  t.eq(res.ok, false, "refused");
+  t.ok(!res.dashboard, "no half-built dashboard comes back");
+  t.ok(/Could not load the dashboard/.test(res.error), `explains itself, got: ${res.error}`);
 });
 
 /* ---------- the harness itself: is the VM honest? ---------- */
