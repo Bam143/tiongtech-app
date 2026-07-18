@@ -1596,11 +1596,14 @@ const _expRowInvalid = r => {
   if (!_cDate(r.spent_at)) return "missing or unreadable date";
   const raw = String(r.amount == null ? "" : r.amount).trim();
   if (!raw) return "missing amount";
-  // Number.isFinite, not _cNum, and not the bare isFinite _cNum leans on. A cell reading "n/a" or
-  // "—" parses to NaN, and NaN reaching the column would land as null and drag every total down
-  // silently. Number.isFinite is a property of Number rather than a free global, which also means
-  // it cannot be quietly stubbed out from under this check the way a global can.
-  if (!Number.isFinite(Number(raw))) return "amount is not a number";
+  // _cNum, deliberately — the same helper _expensePayload uses to WRITE the amount. Asking the
+  // question with the writer's own rule is what stops validation and storage from ever disagreeing:
+  // anything this accepts is by construction something _cNum will turn into a real number, so a row
+  // cannot pass here and still land as null. A cell reading "n/a" or "—" parses to NaN and is
+  // refused. (This briefly used Number.isFinite instead, because isFinite was missing from the test
+  // harness's VM globals and _cNum returned NaN under test; that gap is fixed in harness.mjs, and
+  // the "every required field is enforced" test now doubles as the alarm if it ever comes back.)
+  if (_cNum(raw) == null) return "amount is not a number";
   if (!String(r.supplier == null ? "" : r.supplier).trim()) return "missing supplier";
   return null;
 };

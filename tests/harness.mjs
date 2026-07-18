@@ -51,7 +51,15 @@ export function loadApp(appJsPath) {
       addEventListener() {},
     },
     console, Promise, JSON, Math, Date, Number, String, Object, Array, Boolean, Error,
-    isNaN, parseInt, parseFloat, setTimeout, clearTimeout, setInterval, clearInterval,
+    // isFinite is here because _cNum (app.jsx:489) is built on it, and _cNum decides what every
+    // money value becomes on the way into the database — it backs _expensePayload,
+    // _paymentPayload and _clientPayload. Left out, it resolved to the Proxy stub above, whose
+    // apply returns a truthy stub, so `!isFinite(n)` was ALWAYS false and _cNum handed back NaN
+    // where the real thing returns null. Tests asserting how a non-numeric cell is stored were
+    // therefore exercising the stub, not the code. A missing global does not fail loudly here —
+    // `has: () => true` guarantees it silently becomes something plausible — so anything app.jsx
+    // relies on has to be listed explicitly.
+    isNaN, isFinite, parseInt, parseFloat, setTimeout, clearTimeout, setInterval, clearInterval,
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     navigator: { userAgent: "node", clipboard: { writeText: () => Promise.resolve() } },
     fetch: () => Promise.reject(new Error("network disabled in tests")),
