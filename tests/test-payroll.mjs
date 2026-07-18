@@ -1487,7 +1487,7 @@ const loans = async (action, payload, { role = "technician", rows = [{ ...PLAN_R
     return { sb, res };
   } finally { setME(was); }
 };
-const PLAN_COLS = ["active", "category", "employee_id", "interest_only", "interest_rate", "kind", "label", "start_date", "terms_total", "total_amount"].join(",");
+const PLAN_COLS = ["active", "category", "employee_id", "interest_only", "interest_rate", "kind", "label", "per_week", "start_date", "terms_total", "total_amount"].join(",");
 
 await t.test("save plan: a no-id payload INSERTS and forces active=1", async () => {
   const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, active: 0 }, { role: "owner" });
@@ -1499,7 +1499,38 @@ await t.test("save plan: a no-id payload INSERTS and forces active=1", async () 
   t.eq(ins[0].row.active, 1, "active FORCED to 1 — a new plan that deducts nothing is never what was meant");
   t.ok(!("id" in ins[0].row), "the insert does not carry a client id");
   t.ok(!("terms_done" in ins[0].row) && !("paid" in ins[0].row), "progress columns are never written by a save");
-  t.ok(!("per_week" in ins[0].row), "the derived weekly share is not written — it would drift from the totals");
+  t.eq(ins[0].row.per_week, 200, "the weekly share IS written — 2000 over 10 weeks");
+});
+
+await t.test("save plan: create stores per_week = total / terms", async () => {
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, total_amount: 1000, terms_total: 4 }, { role: "owner" });
+  t.eq(res.ok, true, `created, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op === "insert")[0].row.per_week, 250, "1000 over 4 weeks = 250");
+});
+
+await t.test("save plan: an edit RECOMPUTES per_week when the totals change", async () => {
+  // Same loan, re-termed from 4 weeks to 5. The stored weekly share has to follow, or the plan
+  // would keep deducting 250 against a schedule that now says 200.
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, id: 12, total_amount: 1000, terms_total: 5 }, { role: "owner" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op === "update")[0].row.per_week, 200, "1000 over 5 weeks = 200, not the old 250");
+});
+
+await t.test("save plan: a client-supplied per_week is IGNORED, always recomputed", async () => {
+  // The one thing that would let the stored copy drift from the debt it divides.
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, id: 12, total_amount: 1000, terms_total: 4, per_week: 9999 }, { role: "owner" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  const stored = sb.calls.filter((c) => c.op === "update")[0].row.per_week;
+  t.eq(stored, 250, "recomputed from total/terms");
+  t.ok(stored !== 9999, "the payload's value never reaches the column — a caller cannot price a term independently of its debt");
+});
+
+await t.test("save plan: per_week is rounded to centavos", async () => {
+  // 1000/3 does not divide. The stored share is the rounded one; _supaApplyPlans then makes the
+  // FINAL term absorb what rounding left behind, so the loan still collects exactly 1000.
+  const { sb, res } = await loans("pr_save_plan", { ...PLAN_IN, total_amount: 1000, terms_total: 3 }, { role: "owner" });
+  t.eq(res.ok, true, `created, got: ${res.error}`);
+  t.eq(sb.calls.filter((c) => c.op === "insert")[0].row.per_week, 333.33, "two decimal places, not 333.3333333333333");
 });
 
 await t.test("save plan: an id payload UPDATEs exactly the whitelisted columns", async () => {

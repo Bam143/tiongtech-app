@@ -638,6 +638,21 @@ const MUTATIONS = [
     active: false
   })`,
   },
+  {
+    name: "drop-saveplan-per-week",
+    why: "the weekly share is never stored, so every plan saved from this screen goes back to having none — pr_apply_plans falls to its legacy fallback for rows that should not need one, and a schema change that retired the fallback would price every term at zero",
+    in: "_supaSavePlan",
+    from: `    per_week: _prR2(totalAmount / termsTotal),
+`,
+    to: "",
+  },
+  {
+    name: "saveplan-trusts-client-per-week",
+    why: "the caller sets the weekly share directly, so it can be any number at all regardless of the debt it is meant to divide — a 2000 loan over 10 weeks deducting whatever the payload asked for, which is exactly the drift storing a derived column risks",
+    in: "_supaSavePlan",
+    from: `    per_week: _prR2(totalAmount / termsTotal),`,
+    to: `    per_week: Number(payload && payload.per_week || 0),`,
+  },
   // ---- pr_apply_plans (the deductions themselves; every pattern scoped, the guards repeat) ----
   {
     name: "drop-applyplans-permission",

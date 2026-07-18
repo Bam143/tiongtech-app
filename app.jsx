@@ -1510,8 +1510,19 @@ async function _supaSavePlan(payload) {
   if (!(termsTotal >= 1)) return { ok: false, error: "A loan needs at least one weekly term." };
   // Whitelist the plan columns. terms_done/paid are NOT here — they are progress, owned by
   // pr_apply_plans, and letting an edit rewrite them would reset or fake a debt's repayment
-  // history. per_week is not here either: it is derived (total / terms, app.jsx:5090) and the form
-  // never sends it, so writing a value now would drift from the totals the moment either changes.
+  // history.
+  //
+  // per_week IS here, and is always RECOMPUTED from the two numbers just validated above — never
+  // read off the payload, on either branch. api.php stores it the same way (round($total/$terms,
+  // 2)) and pr_apply_plans reads it back as the weekly share. An earlier version of this handler
+  // left the column alone on the grounds that a stored copy of a derived value drifts the moment
+  // total_amount or terms_total changes; that worry is real but recomputing on every save answers
+  // it directly, whereas omitting the write left every plan created since with no weekly share at
+  // all. Taking a client-supplied per_week is the one thing that WOULD let it drift, which is why
+  // payload.per_week is not consulted anywhere — a caller cannot set the price of a term
+  // independently of the debt it divides. The terms_total >= 1 guard above runs first, so the
+  // division cannot be by zero.
+  //
   // interest_only and active are smallint (confirmed against the schema, 2026-07-18) like
   // pr_employees.active and the print flags — 0/1, never false/true, which PostgREST rejects for a
   // smallint. The read path already assumes this: both are in _PR_PLAN_N's numeric coercion (700).
@@ -1522,6 +1533,7 @@ async function _supaSavePlan(payload) {
     label: String((payload && payload.label) || ""),
     total_amount: totalAmount,
     terms_total: termsTotal,
+    per_week: _prR2(totalAmount / termsTotal),
     interest_rate: Number((payload && payload.interest_rate) || 0),
     interest_only: (payload && payload.interest_only) ? 1 : 0,
     start_date: (payload && payload.start_date) ? payload.start_date : null,
@@ -1702,12 +1714,14 @@ async function _supaApplyPlans(payload) {
       // even share. This is the one line where the obvious simplification quietly overcharges
       // every borrower, which is why it has a test of its own.
       //
-      // per_week is READ when the row carries one and DERIVED when it does not. _supaSavePlan
-      // (app.jsx:1520) deliberately does not write per_week — it is total/terms by definition and
-      // a stored copy drifts the moment either changes — so every plan created since that handler
-      // was wired has none, and taking the column at face value would price those at zero for
-      // every term but the last. Preferring the stored value keeps rows written by api.php
-      // deducting exactly what they always did.
+      // per_week is READ when the row carries one and DERIVED when it does not. _supaSavePlan now
+      // stores it on every save, so the fallback covers exactly one population: plans created or
+      // edited through the Supabase path in the window between pr_save_plan being wired (5dba650)
+      // and per_week being added to its whitelist. Those rows have no weekly share, and taking the
+      // column at face value would price them at zero for every term but the last. It is kept
+      // rather than removed because nothing has back-filled them, and a plan that silently
+      // deducted nothing until someone re-saved it would be a quiet way to lose money. Preferring
+      // the stored value also keeps rows written by api.php deducting exactly what they always did.
       const stored = prNum(p.per_week);
       const pw = _prR2(stored > 0 ? stored : totalAmount / termsTotal);
       const principal = termNo === termsTotal ? _prR2(totalAmount - pw * (termsTotal - 1)) : pw;
