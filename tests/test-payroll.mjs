@@ -859,6 +859,81 @@ await t.test("a contest refused with 42501 surfaces what the database said", asy
   t.ok(/new row violates/.test(res.error), `got: ${res.error}`);
 });
 
+/* ---------- pr_item_reply ---------- */
+// The officer's answer to a contested line. It stores the reply AND resets the line to 'pending'
+// so the employee reviews again. Item 74 is the contested line in REV_ITEMS. empId is null on the
+// officer cases on purpose: the reply path must not depend on the officer having a payroll row.
+
+await t.test("the officer replies to a contested line — reply stored and the line resets to pending", async () => {
+  const { sb, res } = await review("pr_item_reply", { id: 74, reply: "Fixed the OT for 06/28 — please review again." }, { role: "payroll", empId: null });
+  t.eq(res.ok, true, `replied, got: ${res.error}`);
+  const w = revWrites(sb);
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].table, "pr_items", "on pr_items");
+  t.eq(w[0].filters.id, 74, "the right line");
+  t.eq(w[0].row.officer_reply, "Fixed the OT for 06/28 — please review again.", "reply lands in officer_reply");
+  t.eq(w[0].row.status, "pending", "and the line resets to 'pending' for re-approval — not left 'contested'");
+  t.eq(Object.keys(w[0].row).sort().join(","), "officer_reply,status", "reply owns exactly these two columns — approved_at/deductions untouched");
+});
+
+await t.test("the owner may reply too, and the reply is trimmed", async () => {
+  const { sb, res } = await review("pr_item_reply", { id: 74, reply: "   Adjusted.  " }, { role: "owner", empId: null });
+  t.eq(res.ok, true, `owner replied, got: ${res.error}`);
+  t.eq(revWrites(sb)[0].row.officer_reply, "Adjusted.", "surrounding whitespace stripped before storing");
+});
+
+await t.test("a blank reply is refused before any lookup", async () => {
+  const { sb, res } = await review("pr_item_reply", { id: 74, reply: "   " }, { role: "payroll", empId: null });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Please write a reply before sending.", "message");
+  t.eq(sb.calls.length, 0, "nothing touched — not even a read");
+});
+
+await t.test("you can only reply to a CONTESTED line, not a pending or approved one", async () => {
+  for (const id of [71 /* pending */, 73 /* approved */]) {
+    const { sb, res } = await review("pr_item_reply", { id, reply: "trying" }, { role: "payroll", empId: null });
+    t.eq(res.ok, false, `refused on line ${id}`);
+    t.eq(res.error, "You can only reply to a contested line.", `message for ${id}`);
+    t.eq(revWrites(sb).length, 0, `nothing written for ${id}`);
+  }
+});
+
+await t.test("an ordinary employee may NOT reply, even on their own contested line", async () => {
+  // Line 74 is employee 5's own contested line, and I am employee 5 — so only the officer gate
+  // stands between them and a self-serve reply. RLS does not stop them writing their own row's
+  // officer_reply, which is exactly why this app check is the one that matters.
+  const { sb, res } = await review("pr_item_reply", { id: 74, reply: "let me just fix this myself" }, { role: "technician", empId: 5 });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can reply.", "message");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("no reply on a LOCKED week — a locked line must not be reopened this way", async () => {
+  const { sb, res } = await review("pr_item_reply", { id: 74, reply: "reopening" }, { role: "payroll", empId: null, periods: [{ id: 9, status: "locked" }] });
+  t.eq(res.ok, false, "refused");
+  t.ok(/locked/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("replying to a line that no longer exists is refused", async () => {
+  const { sb, res } = await review("pr_item_reply", { id: 999, reply: "hello?" }, { role: "payroll", empId: null });
+  t.eq(res.ok, false, "refused");
+  t.ok(/no longer exists/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("a silently refused reply (USING policy, 200 + []) is not a false success", async () => {
+  const { res } = await review("pr_item_reply", { id: 74, reply: "fixed" }, { role: "payroll", empId: null, opts: { blockWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused — never 'Reply sent' over a write that never happened");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("a reply refused with 42501 surfaces what the database said", async () => {
+  const { res } = await review("pr_item_reply", { id: 74, reply: "fixed" }, { role: "payroll", empId: null, opts: { errorWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/new row violates/.test(res.error), `the database's own words reach the officer, got: ${res.error}`);
+});
+
 /* ---------- pr_lock ---------- */
 // One write, and the interesting part is the precondition: a week only locks once every line is
 // approved. Locking is final — _supaSaveItems refuses to edit a locked period and the review gate
@@ -1122,10 +1197,10 @@ await t.test("period-delete blocked AFTER lines removed → honest 'lines remove
 
 const FALLTHROUGH = ["pr_apply_plans", "pr_set_dayoff",
   "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan",
-  "pr_item_reply", "pr_request_print", "pr_mark_printed"];
+  "pr_request_print", "pr_mark_printed"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 9, "9 actions still deferred — save/delete period are wired now");
+  t.eq(FALLTHROUGH.length, 8, "8 actions still deferred — pr_item_reply is wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;

@@ -1284,6 +1284,45 @@ async function _supaItemContest(payload) {
   if (!hit || !hit.length) return { ok: false, error: "The database refused to record this discrepancy. Nothing changed." };
   return { ok: true };
 }
+async function _supaItemReply(payload) {
+  const sb = window.SB;
+  const id = Number((payload && payload.id) || 0);
+  // The Reply UI sends `reply` (app.jsx:5157); the column is officer_reply, which the employee's
+  // card renders back as "Payroll office: …" (app.jsx:5482) and the officer's grid reads as _reply
+  // (app.jsx:5105). Blank is refused before any lookup — the same discipline contest keeps for an
+  // empty remark (app.jsx:1275): a reply with nothing in it must never reopen a line.
+  const reply = String((payload && payload.reply) || "").trim();
+  if (!reply) return { ok: false, error: "Please write a reply before sending." };
+  const { data: it, error: readErr } = await sb.from("pr_items").select("id,status,period_id").eq("id", id).maybeSingle();
+  if (readErr) return { ok: false, error: readErr.message };
+  if (!it) return { ok: false, error: "This payslip line no longer exists. Reload the page and try again." };
+  // Reply is the contested-line path and nothing else. A pending line has not been questioned and
+  // an approved one is decided; only 'contested' has something to answer, and answering it is what
+  // resets it to pending below. Without this guard a reply could quietly reopen a settled line.
+  if (it.status !== "contested") return { ok: false, error: "You can only reply to a contested line." };
+  // Officer-only, and this app check is load-bearing. RLS Piece C already lets owner/payroll write
+  // any non-locked pr_items row, so the database backs THEM here — but that same policy does not
+  // stop an ordinary employee from writing officer_reply on their OWN row, so nothing in the DB
+  // refuses a self-serve "reply". True enforcement would need a column-level rule; until that
+  // exists this is the only thing standing between an employee and answering on the office's behalf.
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) return { ok: false, error: "Only the payroll office can reply." };
+  // A contested line should not exist on a locked week, but guard anyway: locking ends a week and
+  // only an owner-unlock reopens it (see _supaUnlock). A reply resets the line to pending, so on a
+  // locked week it would be a second, un-gated way back into an editable state — refuse it.
+  const { data: per, error: perErr } = await sb.from("pr_periods").select("status").eq("id", it.period_id).maybeSingle();
+  if (perErr) return { ok: false, error: perErr.message };
+  if (!per) return { ok: false, error: "This payslip's week no longer exists. Reload the page and try again." };
+  if (per.status === "locked") return { ok: false, error: "This week is locked; unlock it first." };
+  // Owns exactly two columns: the reply text and the reset to pending for re-approval. approved_at,
+  // the employee's remark and every deduction are left untouched — the same whitelist discipline
+  // approve/contest/save keep (app.jsx:757).
+  const { data: hit, error } = await sb.from("pr_items")
+    .update({ officer_reply: reply, status: "pending" }).eq("id", id).select("id");
+  if (error) return { ok: false, error: "Could not send this reply: " + error.message };
+  if (!hit || !hit.length) return { ok: false, error: "Sending this reply was refused by the database. Nothing changed." };
+  return { ok: true };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -1308,6 +1347,7 @@ const API = (action, payload) => {
         if (action === "pr_delete_period") { return await _supaDeletePeriod(payload); }
         if (action === "pr_item_approve") { return await _supaItemApprove(payload); }
         if (action === "pr_item_contest") { return await _supaItemContest(payload); }
+        if (action === "pr_item_reply") { return await _supaItemReply(payload); }
         if (action === "create_client") {
           const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
           if (error) return { ok: false, error: error.message };
@@ -5236,11 +5276,11 @@ function PayrollPage({ t }) {
                 {r._status === "contested" && <div style={{ color: t.textMuted, fontSize: 12.5, marginTop: 6 }}><b style={{ color: t.bad }}>Employee note:</b> {r._emp_remark}</div>}
                 {r._reply && <div style={{ color: t.textMuted, fontSize: 12.5, marginTop: 4 }}><b style={{ color: t.good }}>Your reply:</b> {r._reply}</div>}
                 <div className="flex items-center gap-2 flex-wrap" style={{ marginTop: 8 }}>
-                  {r._status === "contested" && replyFor !== r._id && <button onClick={() => { setReplyFor(r._id); setReplyText(r._reply || ""); }} className="rounded-lg" style={{ background: t.accentSoft, color: t.accent, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, padding: "6px 12px" }}>Reply / resolve</button>}
+                  {(isOwner || isPayroll) && r._status === "contested" && replyFor !== r._id && <button onClick={() => { setReplyFor(r._id); setReplyText(r._reply || ""); }} className="rounded-lg" style={{ background: t.accentSoft, color: t.accent, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, padding: "6px 12px" }}>Reply / resolve</button>}
                   {r._print_req && !r._printed ? <button onClick={() => printPayslip(r.full_name, r.position, period, r)} className="inline-flex items-center gap-1 rounded-lg" style={{ background: t.surface, color: t.text, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 12, fontWeight: 700, padding: "6px 12px" }}><IconPrint size={14} />Print</button> : null}
                   {r._print_req && !r._printed ? <button onClick={() => markPrinted(r._id)} className="rounded-lg" style={{ background: t.goodSoft, color: t.good, border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, padding: "6px 12px" }}>Mark printed</button> : null}
                 </div>
-                {replyFor === r._id && (
+                {(isOwner || isPayroll) && replyFor === r._id && (
                   <div className="flex items-center gap-2" style={{ marginTop: 8 }}>
                     <input value={replyText} onChange={(e) => setReplyText(e.target.value)} placeholder="Explain / confirm the fix…" style={{ flex: 1, background: t.surface, color: t.text, border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", fontSize: 12.5, outline: "none" }} />
                     <button onClick={() => sendReply(r._id)} className="rounded-lg" style={{ background: t.good, color: "#04222A", border: "none", cursor: "pointer", fontSize: 12, fontWeight: 700, padding: "7px 12px" }}>Send</button>
