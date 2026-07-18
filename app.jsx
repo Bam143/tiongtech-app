@@ -4397,7 +4397,7 @@ function ExpensesPage({ t }) {
                     <span style={{ color: t.text, fontSize: 13 }}>{c}</span>
                     <div className="flex items-center gap-1">
                       <button onClick={() => { const nv = (window.prompt("Rename category:", c) || "").trim(); if (nv && !cats.some((x, idx) => idx !== i && x.toLowerCase() === nv.toLowerCase())) setCats(cats.map((x, idx) => (idx === i ? nv : x))); }} title="Rename" style={{ background: "transparent", border: "none", color: t.textMuted, cursor: "pointer", display: "inline-flex", padding: 2 }}><IconPencil size={14} /></button>
-                      <button onClick={() => setCats(cats.filter((_, idx) => idx !== i))} title="Remove" style={{ background: "transparent", border: "none", color: t.bad, cursor: "pointer", display: "inline-flex", padding: 2 }}><IconX size={14} /></button>
+                      <button onClick={() => { if (!window.confirm(`Remove the category "${c}"?\n\nIt's only removed from the dropdown list — your existing expenses keep their category. You still need to press Save.`)) return; setCats(cats.filter((_, idx) => idx !== i)); }} title="Remove" style={{ background: "transparent", border: "none", color: t.bad, cursor: "pointer", display: "inline-flex", padding: 2 }}><IconX size={14} /></button>
                     </div>
                   </div>
                 ))}
@@ -4899,20 +4899,82 @@ function SettingsPage({ t }) {
   }, [users]);
   const refresh = async () => { try { const d = await API("bootstrap"); if (d && d.ok) { if (Array.isArray(d.users)) { USERS = d.users; setUsers(d.users); } if (Array.isArray(d.positions)) { POSITIONS = d.positions; setPositions(d.positions); } } } catch (e) {} };
   const onSaved = () => { setModal(null); setFlash("Saved"); setTimeout(() => setFlash(""), 2500); refresh(); };
-  const delUser = async (u) => { if (!window.confirm(`Delete user "${u.username}"?`)) return; try { await API("delete_user", { id: u.id }); } catch (e) {} setFlash("User deleted"); setTimeout(() => setFlash(""), 2500); refresh(); };
+  /* delete_user, reset_password and save_positions ALL still fall through to api.php — none of the
+     three is in the Supabase dispatcher. That matters for how success is reported, because an
+     unwired action does not throw: it RESOLVES { ok:false, "… is not connected to Supabase yet." }
+     (app.jsx:2026). A `catch` around it therefore never fires, which is exactly how all three came
+     to announce success for work that never happened. The rule below is the same one savePositions
+     now follows — flash success only when the call SAYS it succeeded, and otherwise say what went
+     wrong. In Supabase mode that means these three now surface an honest "not connected" instead of
+     a false confirmation; that is a visible change, and the visible thing was the bug. */
+  const delUser = async (u) => {
+    if (!window.confirm(`Delete user "${u.username}"?`)) return;
+    let res = null;
+    try { res = await API("delete_user", { id: u.id }); }
+    catch (e) { res = { ok: false, error: (e && e.message) || "Delete failed." }; }
+    // Refreshed either way, and deliberately: on success the row goes, on failure the true list
+    // comes back, so the screen can never keep showing a deletion that did not happen.
+    refresh();
+    if (res && res.ok) { setFlash("User deleted"); setTimeout(() => setFlash(""), 2500); return; }
+    setFlash("NOT deleted — " + ((res && res.error) || "the server refused the change.") + " The account is still active.");
+    setTimeout(() => setFlash(""), 7000);
+  };
   const resetPw = async (u) => {
-    const np = window.prompt(`Set a NEW password for ${u.full_name || u.username} (they'll log in with this):`, "");
+    const who = u.full_name || u.username;
+    // Asked BEFORE the password is typed, not after: naming the account up front is what catches a
+    // click on the wrong row, and it costs nothing to answer. Confirming afterwards would mean
+    // discovering the mistake with a password already composed.
+    if (!window.confirm(`Reset the password for "${who}"?\n\nTheir current password stops working immediately — they will not be able to sign in until you give them the new one. Continue?`)) return;
+    const np = window.prompt(`Set a NEW password for ${who} (they'll log in with this):`, "");
     if (np === null) return;
     if (np.trim().length < 4) { setFlash("Password must be at least 4 characters."); setTimeout(() => setFlash(""), 3500); return; }
-    try {
-      await API("reset_password", { id: u.id, password: np.trim() });
-      setFlash(`✓ New password for ${u.username} is "${np.trim()}" — give this to them. They can change it later under My account.`);
-      setTimeout(() => setFlash(""), 15000);
-    } catch (e) { setFlash(e.message || "Reset failed."); setTimeout(() => setFlash(""), 4000); }
+    let res = null;
+    try { res = await API("reset_password", { id: u.id, password: np.trim() }); }
+    catch (e) { res = { ok: false, error: (e && e.message) || "Reset failed." }; }
+    if (res && res.ok) {
+      // The password is NOT echoed back, and this is not a loss of information: the admin typed it
+      // a second ago, so repeating it tells them nothing they do not already know. It only puts a
+      // live credential on screen for anyone walking past — and the old message left it there for
+      // fifteen seconds, long enough to be read across a room or caught by a screen share.
+      setFlash(`✓ Password reset for ${u.username}. Give them the password you just set — they can change it under My account.`);
+      setTimeout(() => setFlash(""), 6000);
+      return;
+    }
+    // Saying which password still works is the whole point of this branch. An admin who believes a
+    // reset landed hands out a credential that does not work, and the account holder is locked out
+    // with nobody knowing why — so a failed reset has to be unmistakable, and has to say that the
+    // OLD password is still the live one.
+    setFlash("Password NOT reset — " + ((res && res.error) || "the server refused the change.") + " Their existing password still works; do not hand out the new one.");
+    setTimeout(() => setFlash(""), 9000);
   };
-  const savePositions = async (list) => { setPositions(list); POSITIONS = list; try { await API("save_positions", { positions: list }); } catch (e) {} setFlash("Positions saved"); setTimeout(() => setFlash(""), 2000); };
+  // Reports what actually happened. This used to swallow every error and then flash "Positions
+  // saved" unconditionally, which was worst against the Supabase path: save_positions is not wired
+  // there, so it RESOLVES { ok:false, "not connected" } rather than throwing (app.jsx:2026), the
+  // catch never fired, and a save that never happened always read as success.
+  //
+  // The optimistic local update is rolled back on failure too. Leaving it would keep a removed
+  // position off the screen while it is still in the database — the same lie one layer down, and
+  // the more durable one, because POSITIONS is a module global that outlives the flash.
+  const savePositions = async (list) => {
+    const prev = positions;
+    setPositions(list); POSITIONS = list;
+    let res = null;
+    try { res = await API("save_positions", { positions: list }); }
+    catch (e) { res = { ok: false, error: (e && e.message) || "Save failed." }; }
+    if (res && res.ok) { setFlash("Positions saved"); setTimeout(() => setFlash(""), 2000); return true; }
+    setPositions(prev); POSITIONS = prev;
+    setFlash("NOT saved — " + ((res && res.error) || "the server refused the change.") + " The list has been put back.");
+    setTimeout(() => setFlash(""), 7000);
+    return false;
+  };
   const addPos = () => { const p = newPos.trim(); if (!p || positions.includes(p)) return; savePositions([...positions, p]); setNewPos(""); };
-  const removePos = (p) => savePositions(positions.filter((x) => x !== p));
+  // Confirmed before the destructive step, because there is no step after it: this list persists
+  // the moment it changes, with no Save button standing between the click and the write. The
+  // wording says so rather than promising a Save that does not exist.
+  const removePos = (p) => {
+    if (!window.confirm(`Remove the position "${p}"?\n\nThis updates the shared positions list used across the app, and saves immediately — there is no separate Save step. Employees already recorded with this position keep it; it just stops being offered on new entries.`)) return;
+    savePositions(positions.filter((x) => x !== p));
+  };
 
   if (ME.role !== "owner") return <Card t={t} style={{ padding: 30, textAlign: "center" }}><div style={{ color: t.textMuted }}>Settings are available to the owner account only.</div></Card>;
 
