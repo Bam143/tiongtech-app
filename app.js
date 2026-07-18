@@ -1564,6 +1564,160 @@ async function _supaClientPayments(payload) {
     payments
   };
 }
+/* ---- Bulk expense import (import_expenses) — OWNER ONLY, ADD ONLY, TWO PHASE ----
+   The Import button in ExpensesPage, which parses a CSV or spreadsheet in the browser and sends
+   the rows here.
+
+   ADD ONLY, AND THAT IS THE WHOLE POINT. The api.php version this replaces matched on an `id`
+   column and UPSERTED, and the export writes that column — so re-uploading a file exported last
+   week silently reverted every edit made since, with no prompt and no trace. Nothing on screen
+   would have looked wrong. Here an incoming id is IGNORED: every accepted row goes through
+   _expensePayload (app.jsx:563), which has no id key at all, so the database assigns a fresh one
+   and an existing expense can never be written over. The worst case becomes a visible duplicate
+   somebody can delete, instead of an invisible reversion nobody can see.
+
+   TWO PHASES on one action. commit:false reads, tags and counts, and writes NOTHING; commit:true
+   inserts. The preview is what turns "I uploaded a file" into "I am adding 31 rows totalling
+   ₱48,200", which is the only point at which a wrong file is still cheap to notice.
+
+   PHASE 2 RE-DECIDES EVERYTHING. It does not trust the tags Phase 1 handed out, because the rows
+   come back through the browser in between and the ledger may have moved on. Validation and
+   duplicate detection run again on fresh data, and only rows that pass THEN are inserted. */
+const _EXP_REQUIRED = "a date, an amount and a supplier";
+// Two expenses on the same day, for the same money, to the same supplier, with the same note are
+// a re-import rather than a coincidence. Deliberately NOT keyed on invoice or user_name: those are
+// the fields most often blank or retyped, and including them would let a re-upload slip through by
+// differing in a column nobody looks at.
+const _expDupKey = r => [_cDate(r.spent_at) || "", String(_cNum(r.amount)), String(r.supplier == null ? "" : r.supplier).trim().toLowerCase(), String(r.description == null ? "" : r.description).trim().toLowerCase()].join("|");
+// A row is only worth writing if it carries the three things an expense IS. Everything else on the
+// table is optional and stays optional. Amount has to parse to a real number: a blank or a stray
+// "n/a" arriving as NaN would otherwise land as null and quietly drag every total down.
+const _expRowInvalid = r => {
+  if (!_cDate(r.spent_at)) return "missing or unreadable date";
+  const raw = String(r.amount == null ? "" : r.amount).trim();
+  if (!raw) return "missing amount";
+  // Number.isFinite, not _cNum, and not the bare isFinite _cNum leans on. A cell reading "n/a" or
+  // "—" parses to NaN, and NaN reaching the column would land as null and drag every total down
+  // silently. Number.isFinite is a property of Number rather than a free global, which also means
+  // it cannot be quietly stubbed out from under this check the way a global can.
+  if (!Number.isFinite(Number(raw))) return "amount is not a number";
+  if (!String(r.supplier == null ? "" : r.supplier).trim()) return "missing supplier";
+  return null;
+};
+async function _supaImportExpenses(payload) {
+  const sb = window.SB;
+  // Owner only, and stricter than the button that used to open this (canAdd("fin_expense"), which
+  // also admits cfo and admin_officer). A bulk insert into the ledger is the same class of action
+  // as Delete all beside it, and that one has always been owner-only.
+  if (!ME || ME.role !== "owner") return {
+    ok: false,
+    error: "Only the superadmin can import expenses."
+  };
+  const rows = payload && payload.rows;
+  if (!Array.isArray(rows)) return {
+    ok: false,
+    error: "Nothing to import — the file produced no rows."
+  };
+  if (!rows.length) return {
+    ok: false,
+    error: "Nothing to import — the file produced no rows."
+  };
+  // The existing ledger, read fresh on BOTH phases. Reusing the preview's answer would mean
+  // deciding against a snapshot the officer may have been staring at for minutes.
+  const {
+    data: existing,
+    error: readErr
+  } = await sb.from("expenses").select("id,spent_at,supplier,description,amount");
+  if (readErr) return {
+    ok: false,
+    error: "Could not read the existing expenses to check for duplicates: " + readErr.message
+  };
+  const seen = {};
+  (existing || []).forEach(r => {
+    seen[_expDupKey(r)] = 1;
+  });
+  // Tagged in file order. `seen` grows as accepted rows are taken, so a file containing the same
+  // line twice flags the second one — the same hazard as re-importing, one step earlier.
+  const tagged = rows.map(r => {
+    const why = _expRowInvalid(r);
+    if (why) return {
+      row: r,
+      tag: "invalid",
+      why
+    };
+    const key = _expDupKey(r);
+    if (seen[key]) return {
+      row: r,
+      tag: "duplicate",
+      why: "already recorded"
+    };
+    seen[key] = 1;
+    return {
+      row: r,
+      tag: "new",
+      why: null
+    };
+  });
+  const fresh = tagged.filter(x => x.tag === "new");
+  const duplicateCount = tagged.filter(x => x.tag === "duplicate").length;
+  const invalidCount = tagged.filter(x => x.tag === "invalid").length;
+  const total = fresh.reduce((a, x) => a + (_cNum(x.row.amount) || 0), 0);
+  if (!payload.commit) {
+    // PHASE 1. Nothing has been written and nothing will be until this comes back and the officer
+    // says yes. The rows go back tagged so the screen can show WHICH ones it is about to skip.
+    return {
+      ok: true,
+      preview: true,
+      newCount: fresh.length,
+      duplicateCount,
+      invalidCount,
+      newTotal: total,
+      rows: tagged.map(x => ({
+        ...x.row,
+        _tag: x.tag,
+        _why: x.why
+      })),
+      required: _EXP_REQUIRED
+    };
+  }
+  // PHASE 2. One insert per row, sequentially — the fake cannot represent an array insert, a bulk
+  // insert would report one outcome for many rows, and the tally has to be what actually landed
+  // rather than what was attempted. Stopping at the first refusal (rather than pressing on) means
+  // the officer is told exactly where it stopped and how much of the file is already in.
+  let added = 0;
+  for (const x of fresh) {
+    const {
+      data: hit,
+      error
+    } = await sb.from("expenses").insert(_expensePayload(x.row)).select("id");
+    if (error) {
+      return {
+        ok: false,
+        error: "Import stopped after " + added + " of " + fresh.length + " new rows: " + error.message + " The " + added + " already added are in the ledger and will be seen as duplicates if you import again.",
+        added,
+        skipped_duplicates: duplicateCount,
+        skipped_invalid: invalidCount
+      };
+    }
+    if (!hit || !hit.length) {
+      return {
+        ok: false,
+        error: "Import stopped after " + added + " of " + fresh.length + " new rows — the database refused the next one. The " + added + " already added are in the ledger and will be seen as duplicates if you import again.",
+        added,
+        skipped_duplicates: duplicateCount,
+        skipped_invalid: invalidCount
+      };
+    }
+    added++;
+  }
+  // added is counted from rows the database actually gave an id back for, never from fresh.length.
+  return {
+    ok: true,
+    added,
+    skipped_duplicates: duplicateCount,
+    skipped_invalid: invalidCount
+  };
+}
 /* ---- Expense category labels (save_expense_cats) ----
    The Categories modal in ExpensesPage (app.jsx:4088), which sends the WHOLE new list every time —
    this is a replacement, not an add or a remove, and the handler treats it as one.
@@ -3614,6 +3768,9 @@ const API = (action, payload) => {
         }
         if (action === "save_expense_cats") {
           return await _supaSaveExpenseCats(payload);
+        }
+        if (action === "import_expenses") {
+          return await _supaImportExpenses(payload);
         }
         if (action === "fin_range") {
           const inc = (payload && payload.kind || "income") === "income";
@@ -10756,6 +10913,8 @@ function ExpensesPage({
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [catModal, setCatModal] = useState(false);
+  const [impPreview, setImpPreview] = useState(null); // Phase 1 result; non-null = the confirm dialog is up
+  const [importing, setImporting] = useState(false);
   const [cats, setCats] = useState(EXPENSE_CATS);
   const [newCat, setNewCat] = useState("");
   const addCat = () => {
@@ -10915,21 +11074,59 @@ function ExpensesPage({
       user_name: iUser >= 0 ? (r[iUser] || "").trim() : "",
       invoice: iInv >= 0 ? (r[iInv] || "").trim() : ""
     }));
+    // PHASE 1 only. Nothing is written here — this asks what WOULD happen and puts it on screen.
     try {
       const res = await API("import_expenses", {
         rows
       });
       if (res && res.ok) {
-        setFlash(`Imported: ${res.added} added, ${res.updated} updated${res.skipped ? ", " + res.skipped + " skipped" : ""}`);
-        setTimeout(() => setFlash(""), 6000);
-        onSaved();
+        setImpPreview({
+          ...res,
+          rows: res.rows || [],
+          _src: rows
+        });
       } else {
-        setFlash("Import failed");
-        setTimeout(() => setFlash(""), 3000);
+        setFlash("Import failed: " + (res && res.error || "the file could not be read."));
+        setTimeout(() => setFlash(""), 5000);
       }
     } catch (e) {
       setFlash("Import failed: " + (e.message || ""));
       setTimeout(() => setFlash(""), 4000);
+    }
+  };
+  // PHASE 2. Only reachable from the Confirm button in the preview, and it re-sends the ORIGINAL
+  // parsed rows rather than the tagged copy: the handler decides again from scratch, so nothing the
+  // preview concluded is trusted on the way back in.
+  const commitImport = async () => {
+    if (!impPreview) return;
+    const src = impPreview._src || [];
+    setImporting(true);
+    try {
+      const res = await API("import_expenses", {
+        rows: src,
+        commit: true
+      });
+      setImporting(false);
+      setImpPreview(null);
+      if (res && res.ok) {
+        const bits = [`${res.added} added`];
+        if (res.skipped_duplicates) bits.push(`${res.skipped_duplicates} duplicate${res.skipped_duplicates === 1 ? "" : "s"} skipped`);
+        if (res.skipped_invalid) bits.push(`${res.skipped_invalid} invalid skipped`);
+        setFlash("Import complete — " + bits.join(", "));
+        setTimeout(() => setFlash(""), 7000);
+        onSaved();
+        return;
+      }
+      // A partial import still added rows, and the officer has to know how many before deciding
+      // whether to retry — so the handler's real count is shown, not the one that was hoped for.
+      setFlash(res && res.error || "Import failed — nothing was added.");
+      setTimeout(() => setFlash(""), 12000);
+      onSaved();
+    } catch (e) {
+      setImporting(false);
+      setImpPreview(null);
+      setFlash("Import failed: " + (e.message || ""));
+      setTimeout(() => setFlash(""), 5000);
     }
   };
   const refresh = () => _finRefresh(null, setExps);
@@ -11185,7 +11382,7 @@ function ExpensesPage({
     }
   }, /*#__PURE__*/React.createElement(IconDownload, {
     size: 15
-  }), "Download"), canAdd("fin_expense") && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
+  }), "Download"), ME.role === "owner" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
     ref: impRef,
     type: "file",
     accept: ".csv,.xlsx,.xls,text/csv",
@@ -11199,6 +11396,7 @@ function ExpensesPage({
     }
   }), /*#__PURE__*/React.createElement("button", {
     onClick: () => impRef.current && impRef.current.click(),
+    title: "Bulk-add expenses from a CSV (owner only) \u2014 shows a preview before anything is written",
     className: "inline-flex items-center gap-1.5 rounded-xl",
     style: {
       background: t.surface2,
@@ -11539,7 +11737,216 @@ function ExpensesPage({
     row: modal.row,
     onClose: () => setModal(null),
     onSaved: onSaved
-  }), catModal && /*#__PURE__*/React.createElement("div", {
+  }), impPreview && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      inset: 0,
+      zIndex: 90,
+      display: "grid",
+      placeItems: "center",
+      padding: 16
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    onClick: () => !importing && setImpPreview(null),
+    style: {
+      position: "absolute",
+      inset: 0,
+      background: "rgba(0,0,0,0.6)"
+    }
+  }), /*#__PURE__*/React.createElement(Card, {
+    t: t,
+    style: {
+      position: "relative",
+      zIndex: 91,
+      width: "100%",
+      maxWidth: 620,
+      padding: 0,
+      maxHeight: "88vh",
+      overflowY: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center justify-between px-5 py-4",
+    style: {
+      borderBottom: `1px solid ${t.border}`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: t.text,
+      fontWeight: 800,
+      fontSize: 16
+    }
+  }, "Review this import"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => !importing && setImpPreview(null),
+    className: "grid place-items-center rounded-lg",
+    style: {
+      width: 30,
+      height: 30,
+      background: t.surface2,
+      border: `1px solid ${t.border}`,
+      color: t.textMuted,
+      cursor: "pointer"
+    }
+  }, /*#__PURE__*/React.createElement(IconX, {
+    size: 15
+  }))), /*#__PURE__*/React.createElement("div", {
+    className: "px-5 py-4"
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: t.text,
+      fontSize: 14,
+      fontWeight: 700,
+      marginBottom: 4
+    }
+  }, "This will ADD ", impPreview.newCount, " new expense", impPreview.newCount === 1 ? "" : "s", " totalling ", peso(impPreview.newTotal || 0), "."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: t.textMuted,
+      fontSize: 12.5,
+      marginBottom: 12
+    }
+  }, "Nothing has been written yet. Existing expenses are never changed by an import \u2014 rows are only ever added."), /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-2",
+    style: {
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      background: t.goodSoft,
+      color: t.good,
+      borderRadius: 8,
+      padding: "5px 10px",
+      fontSize: 12,
+      fontWeight: 700
+    }
+  }, impPreview.newCount, " to add"), impPreview.duplicateCount > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      background: t.warnSoft,
+      color: t.warn,
+      borderRadius: 8,
+      padding: "5px 10px",
+      fontSize: 12,
+      fontWeight: 700
+    }
+  }, impPreview.duplicateCount, " duplicate", impPreview.duplicateCount === 1 ? "" : "s", " \u2014 skipped"), impPreview.invalidCount > 0 && /*#__PURE__*/React.createElement("span", {
+    style: {
+      background: t.badSoft || "#3a1620",
+      color: t.bad,
+      borderRadius: 8,
+      padding: "5px 10px",
+      fontSize: 12,
+      fontWeight: 700
+    }
+  }, impPreview.invalidCount, " invalid \u2014 skipped")), (impPreview.duplicateCount > 0 || impPreview.invalidCount > 0) && /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: t.textFaint,
+      fontSize: 11.5,
+      marginBottom: 10
+    }
+  }, "A duplicate is a row already in the ledger with the same date, amount, supplier and description. Invalid rows are missing ", impPreview.required || "required fields", "."), /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxHeight: 260,
+      overflowY: "auto",
+      border: `1px solid ${t.border}`,
+      borderRadius: 10
+    }
+  }, /*#__PURE__*/React.createElement("table", {
+    style: {
+      width: "100%",
+      borderCollapse: "collapse"
+    }
+  }, /*#__PURE__*/React.createElement("thead", null, /*#__PURE__*/React.createElement("tr", {
+    style: {
+      color: t.textFaint,
+      fontSize: 10,
+      textTransform: "uppercase",
+      letterSpacing: "0.05em"
+    }
+  }, ["", "Date", "Supplier", "Amount", "Note"].map((h, i) => /*#__PURE__*/React.createElement("th", {
+    key: i,
+    style: {
+      textAlign: "left",
+      padding: "6px 8px",
+      fontWeight: 700,
+      borderBottom: `1px solid ${t.border}`,
+      background: t.surface2,
+      position: "sticky",
+      top: 0
+    }
+  }, h)))), /*#__PURE__*/React.createElement("tbody", null, (impPreview.rows || []).map((r, i) => {
+    const tone = r._tag === "new" ? t.good : r._tag === "duplicate" ? t.warn : t.bad;
+    return /*#__PURE__*/React.createElement("tr", {
+      key: i,
+      style: {
+        borderBottom: `1px solid ${t.borderSoft}`,
+        opacity: r._tag === "new" ? 1 : 0.6
+      }
+    }, /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "5px 8px",
+        color: tone,
+        fontSize: 10.5,
+        fontWeight: 700,
+        whiteSpace: "nowrap"
+      }
+    }, r._tag === "new" ? "ADD" : r._tag === "duplicate" ? "DUP" : "BAD"), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "5px 8px",
+        color: t.text,
+        fontSize: 12,
+        whiteSpace: "nowrap"
+      }
+    }, r.spent_at || "—"), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "5px 8px",
+        color: t.text,
+        fontSize: 12
+      }
+    }, r.supplier || "—"), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "5px 8px",
+        color: t.text,
+        fontSize: 12,
+        whiteSpace: "nowrap"
+      }
+    }, r.amount === "" || r.amount == null ? "—" : peso(r.amount)), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "5px 8px",
+        color: t.textFaint,
+        fontSize: 11
+      }
+    }, r._why || r.description || ""));
+  }))))), /*#__PURE__*/React.createElement("div", {
+    className: "flex justify-end gap-2 px-5 py-4",
+    style: {
+      borderTop: `1px solid ${t.border}`
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => setImpPreview(null),
+    disabled: importing,
+    style: {
+      background: t.surface2,
+      color: t.textMuted,
+      border: `1px solid ${t.border}`,
+      borderRadius: 10,
+      padding: "9px 16px",
+      fontSize: 13,
+      fontWeight: 600,
+      cursor: importing ? "default" : "pointer"
+    }
+  }, "Cancel \u2014 write nothing"), /*#__PURE__*/React.createElement("button", {
+    onClick: commitImport,
+    disabled: importing || !impPreview.newCount,
+    style: {
+      background: t.good,
+      color: "#04222A",
+      border: "none",
+      borderRadius: 10,
+      padding: "9px 18px",
+      fontSize: 13,
+      fontWeight: 700,
+      cursor: importing || !impPreview.newCount ? "default" : "pointer",
+      opacity: importing || !impPreview.newCount ? 0.5 : 1
+    }
+  }, importing ? "Adding…" : `Add ${impPreview.newCount} expense${impPreview.newCount === 1 ? "" : "s"}`)))), catModal && /*#__PURE__*/React.createElement("div", {
     style: {
       position: "fixed",
       inset: 0,

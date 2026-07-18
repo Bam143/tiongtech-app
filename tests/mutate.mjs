@@ -638,6 +638,45 @@ const MUTATIONS = [
     active: false
   })`,
   },
+  // ---- import_expenses (bulk insert; add-only is the property worth the most here) ----
+  {
+    name: "drop-import-permission",
+    why: "anyone who can reach the expenses page bulk-inserts into the ledger — a technician uploads a spreadsheet and every total the finance page prints moves, with no record of who did it",
+    in: "_supaImportExpenses",
+    from: `if (!ME || ME.role !== "owner") return {
+    ok: false,
+    error: "Only the superadmin can import expenses."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-import-duplicate-skip",
+    why: "duplicate rows are inserted instead of skipped, so re-uploading the same file doubles every expense in it — the ledger silently overstates spending and nothing on screen says a row arrived twice",
+    in: "_supaImportExpenses",
+    from: `    if (seen[key]) return {
+      row: r,
+      tag: "duplicate",
+      why: "already recorded"
+    };
+`,
+    to: "",
+  },
+  {
+    name: "import-upserts-instead-of-adding",
+    why: "the import writes through the client's id again, so a stale export REVERTS every edit made since it was downloaded — the exact silent data loss add-only exists to prevent, and the one failure here that leaves no visible trace",
+    in: "_supaImportExpenses",
+    from: `await sb.from("expenses").insert(_expensePayload(x.row)).select("id");`,
+    to: `await sb.from("expenses").upsert({ id: x.row.id, ..._expensePayload(x.row) }, { onConflict: "id" }).select("id");`,
+  },
+  {
+    name: "import-claims-intended-count",
+    why: "the tally reports how many rows it MEANT to add rather than how many the database took, so a half-refused import reads as a complete one and nobody goes looking for the missing half",
+    in: "_supaImportExpenses",
+    from: `    added++;
+  }`,
+    to: `  }
+  added = fresh.length;`,
+  },
   // ---- the four live finance writes (edit / delete a payment or an expense) ----
   // These live inline in the API dispatcher rather than in named functions, so they cannot be
   // `in:`-scoped. The error strings carry the `what` variable, which makes each compiled pattern

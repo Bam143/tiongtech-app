@@ -662,6 +662,108 @@ async function _supaClientPayments(payload) {
   // Zero payments is a perfectly good answer, and an ok one: the client simply has not paid yet.
   return { ok: true, payments };
 }
+/* ---- Bulk expense import (import_expenses) — OWNER ONLY, ADD ONLY, TWO PHASE ----
+   The Import button in ExpensesPage, which parses a CSV or spreadsheet in the browser and sends
+   the rows here.
+
+   ADD ONLY, AND THAT IS THE WHOLE POINT. The api.php version this replaces matched on an `id`
+   column and UPSERTED, and the export writes that column — so re-uploading a file exported last
+   week silently reverted every edit made since, with no prompt and no trace. Nothing on screen
+   would have looked wrong. Here an incoming id is IGNORED: every accepted row goes through
+   _expensePayload (app.jsx:563), which has no id key at all, so the database assigns a fresh one
+   and an existing expense can never be written over. The worst case becomes a visible duplicate
+   somebody can delete, instead of an invisible reversion nobody can see.
+
+   TWO PHASES on one action. commit:false reads, tags and counts, and writes NOTHING; commit:true
+   inserts. The preview is what turns "I uploaded a file" into "I am adding 31 rows totalling
+   ₱48,200", which is the only point at which a wrong file is still cheap to notice.
+
+   PHASE 2 RE-DECIDES EVERYTHING. It does not trust the tags Phase 1 handed out, because the rows
+   come back through the browser in between and the ledger may have moved on. Validation and
+   duplicate detection run again on fresh data, and only rows that pass THEN are inserted. */
+const _EXP_REQUIRED = "a date, an amount and a supplier";
+// Two expenses on the same day, for the same money, to the same supplier, with the same note are
+// a re-import rather than a coincidence. Deliberately NOT keyed on invoice or user_name: those are
+// the fields most often blank or retyped, and including them would let a re-upload slip through by
+// differing in a column nobody looks at.
+const _expDupKey = (r) => [
+  _cDate(r.spent_at) || "",
+  String(_cNum(r.amount)),
+  String(r.supplier == null ? "" : r.supplier).trim().toLowerCase(),
+  String(r.description == null ? "" : r.description).trim().toLowerCase(),
+].join("|");
+// A row is only worth writing if it carries the three things an expense IS. Everything else on the
+// table is optional and stays optional. Amount has to parse to a real number: a blank or a stray
+// "n/a" arriving as NaN would otherwise land as null and quietly drag every total down.
+const _expRowInvalid = (r) => {
+  if (!_cDate(r.spent_at)) return "missing or unreadable date";
+  const raw = String(r.amount == null ? "" : r.amount).trim();
+  if (!raw) return "missing amount";
+  // Number.isFinite, not _cNum, and not the bare isFinite _cNum leans on. A cell reading "n/a" or
+  // "—" parses to NaN, and NaN reaching the column would land as null and drag every total down
+  // silently. Number.isFinite is a property of Number rather than a free global, which also means
+  // it cannot be quietly stubbed out from under this check the way a global can.
+  if (!Number.isFinite(Number(raw))) return "amount is not a number";
+  if (!String(r.supplier == null ? "" : r.supplier).trim()) return "missing supplier";
+  return null;
+};
+async function _supaImportExpenses(payload) {
+  const sb = window.SB;
+  // Owner only, and stricter than the button that used to open this (canAdd("fin_expense"), which
+  // also admits cfo and admin_officer). A bulk insert into the ledger is the same class of action
+  // as Delete all beside it, and that one has always been owner-only.
+  if (!ME || ME.role !== "owner") return { ok: false, error: "Only the superadmin can import expenses." };
+  const rows = payload && payload.rows;
+  if (!Array.isArray(rows)) return { ok: false, error: "Nothing to import — the file produced no rows." };
+  if (!rows.length) return { ok: false, error: "Nothing to import — the file produced no rows." };
+  // The existing ledger, read fresh on BOTH phases. Reusing the preview's answer would mean
+  // deciding against a snapshot the officer may have been staring at for minutes.
+  const { data: existing, error: readErr } = await sb.from("expenses").select("id,spent_at,supplier,description,amount");
+  if (readErr) return { ok: false, error: "Could not read the existing expenses to check for duplicates: " + readErr.message };
+  const seen = {};
+  (existing || []).forEach((r) => { seen[_expDupKey(r)] = 1; });
+  // Tagged in file order. `seen` grows as accepted rows are taken, so a file containing the same
+  // line twice flags the second one — the same hazard as re-importing, one step earlier.
+  const tagged = rows.map((r) => {
+    const why = _expRowInvalid(r);
+    if (why) return { row: r, tag: "invalid", why };
+    const key = _expDupKey(r);
+    if (seen[key]) return { row: r, tag: "duplicate", why: "already recorded" };
+    seen[key] = 1;
+    return { row: r, tag: "new", why: null };
+  });
+  const fresh = tagged.filter((x) => x.tag === "new");
+  const duplicateCount = tagged.filter((x) => x.tag === "duplicate").length;
+  const invalidCount = tagged.filter((x) => x.tag === "invalid").length;
+  const total = fresh.reduce((a, x) => a + (_cNum(x.row.amount) || 0), 0);
+  if (!payload.commit) {
+    // PHASE 1. Nothing has been written and nothing will be until this comes back and the officer
+    // says yes. The rows go back tagged so the screen can show WHICH ones it is about to skip.
+    return {
+      ok: true, preview: true,
+      newCount: fresh.length, duplicateCount, invalidCount, newTotal: total,
+      rows: tagged.map((x) => ({ ...x.row, _tag: x.tag, _why: x.why })),
+      required: _EXP_REQUIRED,
+    };
+  }
+  // PHASE 2. One insert per row, sequentially — the fake cannot represent an array insert, a bulk
+  // insert would report one outcome for many rows, and the tally has to be what actually landed
+  // rather than what was attempted. Stopping at the first refusal (rather than pressing on) means
+  // the officer is told exactly where it stopped and how much of the file is already in.
+  let added = 0;
+  for (const x of fresh) {
+    const { data: hit, error } = await sb.from("expenses").insert(_expensePayload(x.row)).select("id");
+    if (error) {
+      return { ok: false, error: "Import stopped after " + added + " of " + fresh.length + " new rows: " + error.message + " The " + added + " already added are in the ledger and will be seen as duplicates if you import again.", added, skipped_duplicates: duplicateCount, skipped_invalid: invalidCount };
+    }
+    if (!hit || !hit.length) {
+      return { ok: false, error: "Import stopped after " + added + " of " + fresh.length + " new rows — the database refused the next one. The " + added + " already added are in the ledger and will be seen as duplicates if you import again.", added, skipped_duplicates: duplicateCount, skipped_invalid: invalidCount };
+    }
+    added++;
+  }
+  // added is counted from rows the database actually gave an id back for, never from fresh.length.
+  return { ok: true, added, skipped_duplicates: duplicateCount, skipped_invalid: invalidCount };
+}
 /* ---- Expense category labels (save_expense_cats) ----
    The Categories modal in ExpensesPage (app.jsx:4088), which sends the WHOLE new list every time —
    this is a replacement, not an add or a remove, and the handler treats it as one.
@@ -1921,6 +2023,7 @@ const API = (action, payload) => {
         if (action === "financials") { return await _supaFinancials(); }
         if (action === "client_payments") { return await _supaClientPayments(payload); }
         if (action === "save_expense_cats") { return await _supaSaveExpenseCats(payload); }
+        if (action === "import_expenses") { return await _supaImportExpenses(payload); }
         if (action === "fin_range") {
           const inc = ((payload && payload.kind) || "income") === "income";
           const col = inc ? "paid_at" : "spent_at";
@@ -4208,6 +4311,8 @@ function ExpensesPage({ t }) {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [catModal, setCatModal] = useState(false);
+  const [impPreview, setImpPreview] = useState(null);   // Phase 1 result; non-null = the confirm dialog is up
+  const [importing, setImporting] = useState(false);
   const [cats, setCats] = useState(EXPENSE_CATS);
   const [newCat, setNewCat] = useState("");
   const addCat = () => { const v = newCat.trim(); if (!v || cats.some((c) => c.toLowerCase() === v.toLowerCase())) { setNewCat(""); return; } setCats([...cats, v]); setNewCat(""); };
@@ -4260,11 +4365,42 @@ function ExpensesPage({ t }) {
       user_name: iUser >= 0 ? (r[iUser] || "").trim() : "",
       invoice: iInv >= 0 ? (r[iInv] || "").trim() : "",
     }));
+    // PHASE 1 only. Nothing is written here — this asks what WOULD happen and puts it on screen.
     try {
       const res = await API("import_expenses", { rows });
-      if (res && res.ok) { setFlash(`Imported: ${res.added} added, ${res.updated} updated${res.skipped ? ", " + res.skipped + " skipped" : ""}`); setTimeout(() => setFlash(""), 6000); onSaved(); }
-      else { setFlash("Import failed"); setTimeout(() => setFlash(""), 3000); }
+      if (res && res.ok) { setImpPreview({ ...res, rows: res.rows || [], _src: rows }); }
+      else { setFlash("Import failed: " + ((res && res.error) || "the file could not be read.")); setTimeout(() => setFlash(""), 5000); }
     } catch (e) { setFlash("Import failed: " + (e.message || "")); setTimeout(() => setFlash(""), 4000); }
+  };
+  // PHASE 2. Only reachable from the Confirm button in the preview, and it re-sends the ORIGINAL
+  // parsed rows rather than the tagged copy: the handler decides again from scratch, so nothing the
+  // preview concluded is trusted on the way back in.
+  const commitImport = async () => {
+    if (!impPreview) return;
+    const src = impPreview._src || [];
+    setImporting(true);
+    try {
+      const res = await API("import_expenses", { rows: src, commit: true });
+      setImporting(false);
+      setImpPreview(null);
+      if (res && res.ok) {
+        const bits = [`${res.added} added`];
+        if (res.skipped_duplicates) bits.push(`${res.skipped_duplicates} duplicate${res.skipped_duplicates === 1 ? "" : "s"} skipped`);
+        if (res.skipped_invalid) bits.push(`${res.skipped_invalid} invalid skipped`);
+        setFlash("Import complete — " + bits.join(", "));
+        setTimeout(() => setFlash(""), 7000);
+        onSaved();
+        return;
+      }
+      // A partial import still added rows, and the officer has to know how many before deciding
+      // whether to retry — so the handler's real count is shown, not the one that was hoped for.
+      setFlash((res && res.error) || "Import failed — nothing was added.");
+      setTimeout(() => setFlash(""), 12000);
+      onSaved();
+    } catch (e) {
+      setImporting(false); setImpPreview(null);
+      setFlash("Import failed: " + (e.message || "")); setTimeout(() => setFlash(""), 5000);
+    }
   };
   const refresh = () => _finRefresh(null, setExps);
   const applyRange = async () => {
@@ -4331,7 +4467,7 @@ function ExpensesPage({ t }) {
             {canAdd("fin_expense") && <button onClick={() => setModal({ row: null })} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.warn, color: "#04222A", border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><IconCalendar size={15} />Add expense</button>}
             {canAdd("fin_expense") && <button onClick={() => { setCats(EXPENSE_CATS); setCatModal(true); }} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.surface2, color: t.text, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><Tags size={15} />Categories</button>}
             <button onClick={download} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.surface2, color: t.text, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><IconDownload size={15} />Download</button>
-            {canAdd("fin_expense") && <><input ref={impRef} type="file" accept=".csv,.xlsx,.xls,text/csv" style={{ display: "none" }} onChange={(e) => { const f = e.target.files && e.target.files[0]; importExpenses(f); e.target.value = ""; }} /><button onClick={() => impRef.current && impRef.current.click()} className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.surface2, color: t.text, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><Upload size={15} />Import</button></>}
+            {ME.role === "owner" && <><input ref={impRef} type="file" accept=".csv,.xlsx,.xls,text/csv" style={{ display: "none" }} onChange={(e) => { const f = e.target.files && e.target.files[0]; importExpenses(f); e.target.value = ""; }} /><button onClick={() => impRef.current && impRef.current.click()} title="Bulk-add expenses from a CSV (owner only) — shows a preview before anything is written" className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: t.surface2, color: t.text, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><Upload size={15} />Import</button></>}
             {ME.role === "owner" && <button onClick={deleteAll} title="Permanently delete all expenses (owner only)" className="inline-flex items-center gap-1.5 rounded-xl" style={{ background: "transparent", color: t.bad, border: `1px solid ${t.bad}66`, cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><IconX size={15} />Delete all</button>}
           </div>
         </div>
@@ -4412,6 +4548,64 @@ function ExpensesPage({ t }) {
         </div>
       </Card>
       {modal && <MoneyModal t={t} kind="expense" row={modal.row} onClose={() => setModal(null)} onSaved={onSaved} />}
+      {/* Import preview — Phase 1's answer, and the only place Phase 2 can be started from.
+          Closing it writes nothing, which is what makes the file picker safe to press by mistake. */}
+      {impPreview && (
+        <div style={{ position: "fixed", inset: 0, zIndex: 90, display: "grid", placeItems: "center", padding: 16 }}>
+          <div onClick={() => !importing && setImpPreview(null)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.6)" }} />
+          <Card t={t} style={{ position: "relative", zIndex: 91, width: "100%", maxWidth: 620, padding: 0, maxHeight: "88vh", overflowY: "auto" }}>
+            <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: `1px solid ${t.border}` }}>
+              <div style={{ color: t.text, fontWeight: 800, fontSize: 16 }}>Review this import</div>
+              <button onClick={() => !importing && setImpPreview(null)} className="grid place-items-center rounded-lg" style={{ width: 30, height: 30, background: t.surface2, border: `1px solid ${t.border}`, color: t.textMuted, cursor: "pointer" }}><IconX size={15} /></button>
+            </div>
+            <div className="px-5 py-4">
+              <div style={{ color: t.text, fontSize: 14, fontWeight: 700, marginBottom: 4 }}>
+                This will ADD {impPreview.newCount} new expense{impPreview.newCount === 1 ? "" : "s"} totalling {peso(impPreview.newTotal || 0)}.
+              </div>
+              <div style={{ color: t.textMuted, fontSize: 12.5, marginBottom: 12 }}>
+                Nothing has been written yet. Existing expenses are never changed by an import — rows are only ever added.
+              </div>
+              <div className="flex flex-wrap gap-2" style={{ marginBottom: 12 }}>
+                <span style={{ background: t.goodSoft, color: t.good, borderRadius: 8, padding: "5px 10px", fontSize: 12, fontWeight: 700 }}>{impPreview.newCount} to add</span>
+                {impPreview.duplicateCount > 0 && <span style={{ background: t.warnSoft, color: t.warn, borderRadius: 8, padding: "5px 10px", fontSize: 12, fontWeight: 700 }}>{impPreview.duplicateCount} duplicate{impPreview.duplicateCount === 1 ? "" : "s"} — skipped</span>}
+                {impPreview.invalidCount > 0 && <span style={{ background: t.badSoft || "#3a1620", color: t.bad, borderRadius: 8, padding: "5px 10px", fontSize: 12, fontWeight: 700 }}>{impPreview.invalidCount} invalid — skipped</span>}
+              </div>
+              {(impPreview.duplicateCount > 0 || impPreview.invalidCount > 0) && (
+                <div style={{ color: t.textFaint, fontSize: 11.5, marginBottom: 10 }}>
+                  A duplicate is a row already in the ledger with the same date, amount, supplier and description. Invalid rows are missing {impPreview.required || "required fields"}.
+                </div>
+              )}
+              <div style={{ maxHeight: 260, overflowY: "auto", border: `1px solid ${t.border}`, borderRadius: 10 }}>
+                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                  <thead><tr style={{ color: t.textFaint, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                    {["", "Date", "Supplier", "Amount", "Note"].map((h, i) => <th key={i} style={{ textAlign: "left", padding: "6px 8px", fontWeight: 700, borderBottom: `1px solid ${t.border}`, background: t.surface2, position: "sticky", top: 0 }}>{h}</th>)}
+                  </tr></thead>
+                  <tbody>
+                    {(impPreview.rows || []).map((r, i) => {
+                      const tone = r._tag === "new" ? t.good : r._tag === "duplicate" ? t.warn : t.bad;
+                      return (
+                        <tr key={i} style={{ borderBottom: `1px solid ${t.borderSoft}`, opacity: r._tag === "new" ? 1 : 0.6 }}>
+                          <td style={{ padding: "5px 8px", color: tone, fontSize: 10.5, fontWeight: 700, whiteSpace: "nowrap" }}>{r._tag === "new" ? "ADD" : r._tag === "duplicate" ? "DUP" : "BAD"}</td>
+                          <td style={{ padding: "5px 8px", color: t.text, fontSize: 12, whiteSpace: "nowrap" }}>{r.spent_at || "—"}</td>
+                          <td style={{ padding: "5px 8px", color: t.text, fontSize: 12 }}>{r.supplier || "—"}</td>
+                          <td style={{ padding: "5px 8px", color: t.text, fontSize: 12, whiteSpace: "nowrap" }}>{r.amount === "" || r.amount == null ? "—" : peso(r.amount)}</td>
+                          <td style={{ padding: "5px 8px", color: t.textFaint, fontSize: 11 }}>{r._why || r.description || ""}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 px-5 py-4" style={{ borderTop: `1px solid ${t.border}` }}>
+              <button onClick={() => setImpPreview(null)} disabled={importing} style={{ background: t.surface2, color: t.textMuted, border: `1px solid ${t.border}`, borderRadius: 10, padding: "9px 16px", fontSize: 13, fontWeight: 600, cursor: importing ? "default" : "pointer" }}>Cancel — write nothing</button>
+              <button onClick={commitImport} disabled={importing || !impPreview.newCount} style={{ background: t.good, color: "#04222A", border: "none", borderRadius: 10, padding: "9px 18px", fontSize: 13, fontWeight: 700, cursor: (importing || !impPreview.newCount) ? "default" : "pointer", opacity: (importing || !impPreview.newCount) ? 0.5 : 1 }}>
+                {importing ? "Adding…" : `Add ${impPreview.newCount} expense${impPreview.newCount === 1 ? "" : "s"}`}
+              </button>
+            </div>
+          </Card>
+        </div>
+      )}
       {catModal && (
         <div style={{ position: "fixed", inset: 0, zIndex: 80, display: "grid", placeItems: "center", padding: 16 }}>
           <div onClick={() => setCatModal(false)} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.6)" }} />

@@ -2074,6 +2074,137 @@ await t.test("finance writes: a delete that moved nothing says the row is STILL 
   t.ok(/still there/.test(res.error), `names the consequence, got: ${res.error}`);
 });
 
+/* ---------- import_expenses (bulk CSV import — owner only, ADD ONLY, two phase) ---------- */
+// The property these tests exist to hold: an import can never overwrite an existing expense. The
+// api.php version matched on an id column and upserted, so a stale export silently reverted real
+// edits. Here an incoming id is ignored and every row is an insert.
+const IMP_EXISTING = [
+  { id: 100, spent_at: "2026-07-01", supplier: "Fuel", description: "Diesel", amount: 1200 },
+  { id: 101, spent_at: "2026-07-02", supplier: "Rent", description: "July", amount: 8000 },
+];
+const IMP_NEW = { id: "", spent_at: "2026-07-05", supplier: "Power", description: "Meralco", amount: "3400", invoice: "INV-7", user_name: "luz" };
+const IMP_DUP = { id: "", spent_at: "2026-07-01", supplier: "Fuel", description: "Diesel", amount: "1200", invoice: "", user_name: "luz" };
+const imports = async (rows, { role = "owner", commit = false, existing = IMP_EXISTING.map((r) => ({ ...r })), opts } = {}) => {
+  const was = getME();
+  setME({ ...was, role, allowed_views: null });
+  try {
+    const sb = makeFakeSB({ expenses: existing }, opts);
+    window.SB = sb;
+    const res = await API("import_expenses", commit ? { rows, commit: true } : { rows });
+    return { sb, res };
+  } finally { setME(was); }
+};
+
+await t.test("import preview: counts new, duplicate and invalid, and writes NOTHING", async () => {
+  const rows = [{ ...IMP_NEW }, { ...IMP_DUP }, { id: "", spent_at: "", supplier: "X", description: "", amount: "5" }];
+  const { sb, res } = await imports(rows);
+  t.eq(res.ok, true, `previewed, got: ${res.error}`);
+  t.eq(res.preview, true, "flagged as a preview");
+  t.eq(res.newCount, 1, "one genuinely new row");
+  t.eq(res.duplicateCount, 1, "one already in the ledger");
+  t.eq(res.invalidCount, 1, "one missing a date");
+  t.eq(res.newTotal, 3400, "the total is of the rows it would ADD, not of the file");
+  t.eq(sb.calls.filter((c) => c.op !== "select").length, 0, "NOTHING was written — a preview is read-only");
+  t.eq(res.rows.map((r) => r._tag).join(","), "new,duplicate,invalid", "every row comes back tagged for the screen");
+});
+
+await t.test("import commit: inserts ONLY the new valid rows", async () => {
+  const rows = [{ ...IMP_NEW }, { ...IMP_DUP }, { id: "", spent_at: "", supplier: "X", description: "", amount: "5" }];
+  const { sb, res } = await imports(rows, { commit: true });
+  t.eq(res.ok, true, `imported, got: ${res.error}`);
+  t.eq(res.added, 1, "one row added");
+  t.eq(res.skipped_duplicates, 1, "the duplicate was skipped");
+  t.eq(res.skipped_invalid, 1, "the invalid row was skipped");
+  const ins = sb.calls.filter((c) => c.op === "insert");
+  t.eq(ins.length, 1, "exactly one insert — not three");
+  t.eq(ins[0].table, "expenses", "on expenses");
+  t.eq(ins[0].row.supplier, "Power", "the new row, not the duplicate");
+});
+
+await t.test("import: an incoming id is IGNORED — every row is a fresh insert, never an overwrite", async () => {
+  // The core safety property. A stale export carries the ids of rows already in the ledger; if any
+  // of them reached the write, an import would revert live edits instead of adding to them.
+  const rows = [{ ...IMP_NEW, id: "100" }];
+  const { sb, res } = await imports(rows, { commit: true });
+  t.eq(res.ok, true, `imported, got: ${res.error}`);
+  const w = sb.calls.filter((c) => c.op !== "select");
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].op, "insert", "an INSERT — never an update or an upsert");
+  t.ok(!("id" in w[0].row), "the client's id never reaches the database — it assigns its own");
+  t.eq(w.filter((c) => c.op === "update" || c.op === "upsert").length, 0, "nothing that could overwrite an existing expense");
+});
+
+await t.test("import: a file containing the same row twice adds it once", async () => {
+  const rows = [{ ...IMP_NEW }, { ...IMP_NEW }];
+  const { sb, res } = await imports(rows, { commit: true });
+  t.eq(res.added, 1, "the second copy is caught as a duplicate of the first");
+  t.eq(res.skipped_duplicates, 1, "and counted");
+  t.eq(sb.calls.filter((c) => c.op === "insert").length, 1, "one insert");
+});
+
+await t.test("import: re-running the same import adds nothing the second time", async () => {
+  // Idempotency in the only sense available here: once a row is in the ledger it matches on
+  // date+amount+supplier+description and is skipped.
+  const rows = [{ ...IMP_NEW }];
+  const after = IMP_EXISTING.concat([{ id: 102, spent_at: "2026-07-05", supplier: "Power", description: "Meralco", amount: 3400 }]);
+  const { sb, res } = await imports(rows, { commit: true, existing: after });
+  t.eq(res.added, 0, "nothing added");
+  t.eq(res.skipped_duplicates, 1, "recognised as already recorded");
+  t.eq(sb.calls.filter((c) => c.op === "insert").length, 0, "no insert attempted at all");
+});
+
+await t.test("import: every required field is enforced", async () => {
+  const bad = [
+    { id: "", spent_at: "", supplier: "X", description: "", amount: "5" },
+    { id: "", spent_at: "2026-07-09", supplier: "X", description: "", amount: "" },
+    { id: "", spent_at: "2026-07-09", supplier: "X", description: "", amount: "n/a" },
+    { id: "", spent_at: "2026-07-09", supplier: "  ", description: "", amount: "5" },
+  ];
+  const { res } = await imports(bad);
+  t.eq(res.invalidCount, 4, "date, amount, unparseable amount and supplier are each required");
+  t.eq(res.newCount, 0, "none of them would be written");
+});
+
+await t.test("import: a non-owner is refused before any read or write", async () => {
+  for (const role of ["cfo", "admin_officer", "payroll", "technician"]) {
+    const { sb, res } = await imports([{ ...IMP_NEW }], { role });
+    t.eq(res.ok, false, `${role} refused`);
+    t.eq(res.error, "Only the superadmin can import expenses.", `${role} message`);
+    t.eq(sb.calls.length, 0, `${role} touched nothing`);
+  }
+});
+
+await t.test("import: an empty file is refused", async () => {
+  const { res } = await imports([]);
+  t.eq(res.ok, false, "refused");
+  t.ok(/Nothing to import/.test(res.error), `message, got: ${res.error}`);
+});
+
+await t.test("import: a blocked insert reports what ACTUALLY landed, not what was intended", async () => {
+  // Three good rows, refused from the second write onward. The tally must say 1, not 3.
+  const rows = [
+    { id: "", spent_at: "2026-07-05", supplier: "A", description: "a", amount: "10" },
+    { id: "", spent_at: "2026-07-06", supplier: "B", description: "b", amount: "20" },
+    { id: "", spent_at: "2026-07-07", supplier: "C", description: "c", amount: "30" },
+  ];
+  const { res } = await imports(rows, { commit: true, opts: { blockWrites: (table, n) => n >= 2 } });
+  t.eq(res.ok, false, "an import that stopped part-way is not a success");
+  t.eq(res.added, 1, "the REAL count — one row landed before the refusal");
+  t.ok(/1 of 3/.test(res.error), `says how far it got, got: ${res.error}`);
+  t.ok(/duplicates if you import again/.test(res.error), "warns that a retry will see the added rows as duplicates");
+});
+
+await t.test("import: a 42501 mid-import is honest about the partial state too", async () => {
+  const rows = [
+    { id: "", spent_at: "2026-07-05", supplier: "A", description: "a", amount: "10" },
+    { id: "", spent_at: "2026-07-06", supplier: "B", description: "b", amount: "20" },
+  ];
+  const { res } = await imports(rows, { commit: true, opts: { errorWrites: (table, n) => n >= 2 } });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.added, 1, "one row is genuinely in the ledger");
+  t.ok(/Import stopped after 1 of 2/.test(res.error), `explains itself, got: ${res.error}`);
+});
+
 /* ---------- save_expense_cats (expense category labels, in SHARED app_config) ---------- */
 // app_config is one row per key and holds positions / job_types / issues / solutions / sla /
 // dashboard_verse / hero_goal_pin alongside expense_cats, so the tests that matter most here are
