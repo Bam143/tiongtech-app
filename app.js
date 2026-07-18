@@ -4409,7 +4409,9 @@ async function loadLiveData() {
       bill_date: c.bill_date || "",
       due_date: c.due_date || "",
       billing_status: c.billing_status || "",
-      active_profile: c.active_profile || ""
+      active_profile: c.active_profile || "",
+      pppoe_username: c.pppoe_username || "",
+      pppoe_password: c.pppoe_password || ""
     }));
     if (Array.isArray(d.vendos)) pisos = d.vendos.map(v => ({
       id: v.id,
