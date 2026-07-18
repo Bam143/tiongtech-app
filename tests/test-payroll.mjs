@@ -934,6 +934,105 @@ await t.test("a reply refused with 42501 surfaces what the database said", async
   t.ok(/new row violates/.test(res.error), `the database's own words reach the officer, got: ${res.error}`);
 });
 
+/* ---------- pr_request_print / pr_mark_printed (the print pair) ---------- */
+// Two single-flag writes kept in lockstep with RLS Piece A. Item status does NOT gate either one:
+// line 71 is pending, 73 approved, 74 contested, and all may be printed. The review helper carries
+// role + pr_employee_id (employee 5 is "me"), the item set and the period status, which is all
+// these need. LOCKED is passed as [{ id: 9, status: "locked" }] where a test wants the frozen case.
+const LOCKED9 = [{ id: 9, status: "locked" }];
+
+await t.test("request print: the row's OWN employee, on a non-locked week", async () => {
+  const { sb, res } = await review("pr_request_print", { id: 71 }, { role: "technician", empId: 5 }); // line 71 is employee 5's, pending
+  t.eq(res.ok, true, `requested, got: ${res.error}`);
+  const w = revWrites(sb);
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].table, "pr_items", "on pr_items");
+  t.eq(w[0].filters.id, 71, "the right line");
+  t.eq(w[0].row.print_requested, 1, "print_requested set to 1 (smallint, not boolean true — PostgREST would reject true)");
+  t.eq(Object.keys(w[0].row).sort().join(","), "print_requested", "request owns exactly this one column");
+});
+
+await t.test("request print: an officer may request on anybody's line", async () => {
+  // empId null: the officer path must not need a payroll row. Line 72 is employee 6's.
+  for (const role of ["owner", "payroll"]) {
+    const { sb, res } = await review("pr_request_print", { id: 72 }, { role, empId: null });
+    t.eq(res.ok, true, `${role} requested, got: ${res.error}`);
+    t.eq(revWrites(sb)[0].row.print_requested, 1, `${role} set the flag to 1`);
+  }
+});
+
+await t.test("request print: a DIFFERENT employee (not own, not officer) is refused", async () => {
+  const { sb, res } = await review("pr_request_print", { id: 72 }, { role: "technician", empId: 5 }); // line 72 is employee 6's; I am 5
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "You can only request a hard copy of your own payslip.", "message");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("request print: refused on a LOCKED week (pre-lock only)", async () => {
+  const { sb, res } = await review("pr_request_print", { id: 71 }, { role: "technician", empId: 5, periods: LOCKED9 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/locked/.test(res.error), `explains itself, got: ${res.error}`);
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("mark printed: owner or payroll on a non-locked week", async () => {
+  for (const role of ["owner", "payroll"]) {
+    const { sb, res } = await review("pr_mark_printed", { id: 71 }, { role, empId: null });
+    t.eq(res.ok, true, `${role} marked printed, got: ${res.error}`);
+    const w = revWrites(sb);
+    t.eq(w.length, 1, `${role}: one write`);
+    t.eq(w[0].row.printed, 1, `${role}: printed set to 1 (smallint)`);
+    t.eq(Object.keys(w[0].row).sort().join(","), "printed", `${role}: mark owns exactly this one column`);
+  }
+});
+
+await t.test("mark printed: the OWNER may mark a LOCKED week printed (owner override)", async () => {
+  const { sb, res } = await review("pr_mark_printed", { id: 71 }, { role: "owner", empId: null, periods: LOCKED9 });
+  t.eq(res.ok, true, `owner marked a locked line, got: ${res.error}`);
+  t.eq(revWrites(sb)[0].row.printed, 1, "printed set to 1 (smallint)");
+});
+
+await t.test("mark printed: PAYROLL is refused on a LOCKED week (owner-only there, matching RLS)", async () => {
+  const { sb, res } = await review("pr_mark_printed", { id: 71 }, { role: "payroll", empId: null, periods: LOCKED9 });
+  t.eq(res.ok, false, "refused");
+  t.ok(/only the superadmin/.test(res.error), `names the real cause, got: ${res.error}`);
+  t.eq(revWrites(sb).length, 0, "nothing written — refused before the write, not left to 42501");
+});
+
+await t.test("mark printed: a plain employee is refused", async () => {
+  const { sb, res } = await review("pr_mark_printed", { id: 71 }, { role: "technician", empId: 5 });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the payroll office can mark a payslip printed.", "message");
+  t.eq(revWrites(sb).length, 0, "nothing written");
+});
+
+await t.test("print pair: a line's status does not matter — an approved and a contested line both print", async () => {
+  for (const id of [73 /* approved */, 74 /* contested */]) {
+    const { res } = await review("pr_mark_printed", { id }, { role: "owner", empId: null });
+    t.eq(res.ok, true, `line ${id} printed regardless of status, got: ${res.error}`);
+  }
+});
+
+await t.test("request print: a silent refusal (200 + []) is an honest failure", async () => {
+  const { res } = await review("pr_request_print", { id: 71 }, { role: "technician", empId: 5, opts: { blockWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused — never 'request sent' over a write that never happened");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("mark printed: a silent refusal (200 + []) is an honest failure", async () => {
+  const { res } = await review("pr_mark_printed", { id: 71 }, { role: "owner", empId: null, opts: { blockWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused — never 'marked printed' over a write that never happened");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("mark printed: a payroll 42501 on the write is explained as superadmin-only", async () => {
+  // The belt-and-suspenders path: even if a payroll user reached the write on a locked row, the
+  // 42501 comes back named for what it is, not as raw policy text.
+  const { res } = await review("pr_mark_printed", { id: 71 }, { role: "payroll", empId: null, opts: { errorWrites: "pr_items" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/only the superadmin/.test(res.error), `names the real cause, got: ${res.error}`);
+});
+
 /* ---------- pr_lock ---------- */
 // One write, and the interesting part is the precondition: a week only locks once every line is
 // approved. Locking is final — _supaSaveItems refuses to edit a locked period and the review gate
@@ -1196,11 +1295,10 @@ await t.test("period-delete blocked AFTER lines removed → honest 'lines remove
 });
 
 const FALLTHROUGH = ["pr_apply_plans", "pr_set_dayoff",
-  "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan",
-  "pr_request_print", "pr_mark_printed"];
+  "pr_save_employee", "pr_delete_employee", "pr_save_plan", "pr_delete_plan"];
 
 await t.test(`the other ${FALLTHROUGH.length} payroll writes still fall through to "not connected"`, async () => {
-  t.eq(FALLTHROUGH.length, 8, "8 actions still deferred — pr_item_reply is wired now");
+  t.eq(FALLTHROUGH.length, 6, "6 actions still deferred — the print pair is wired now");
   for (const action of FALLTHROUGH) {
     const sb = makeFakeSB([]);
     window.SB = sb;

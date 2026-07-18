@@ -2578,6 +2578,153 @@ async function _supaItemReply(payload) {
     ok: true
   };
 }
+// The print pair. Both write a single boolean flag on pr_items and nothing else. They are kept
+// deliberately in step with RLS Piece A (is_owner() OR (period NOT locked AND (is_payroll() OR
+// item_is_mine()))) rather than trying to out-argue it: no database change, so the app must refuse
+// exactly what the policy would refuse, or a button offers a write the DB then rejects.
+// print_requested/printed are smallint 0/1 flags (confirmed against the live column type), so the
+// set value is the number 1, not boolean true — PostgREST would reject `true` for a smallint. They
+// are left out of _PR_ITEM_N's numeric coercion (app.jsx:695), but the grid reads them as plain
+// truthy values (1 truthy, 0 falsy), so the (_print_req && !_printed) attention filter is unaffected.
+async function _supaRequestPrint(payload) {
+  const sb = window.SB;
+  const id = Number(payload && payload.id || 0);
+  if (!id) return {
+    ok: false,
+    error: "Missing id"
+  };
+  const {
+    data: it,
+    error: readErr
+  } = await sb.from("pr_items").select("id,employee_id,period_id").eq("id", id).maybeSingle();
+  if (readErr) return {
+    ok: false,
+    error: readErr.message
+  };
+  if (!it) return {
+    ok: false,
+    error: "This payslip line no longer exists. Reload the page and try again."
+  };
+  const {
+    data: per,
+    error: perErr
+  } = await sb.from("pr_periods").select("status").eq("id", it.period_id).maybeSingle();
+  if (perErr) return {
+    ok: false,
+    error: perErr.message
+  };
+  if (!per) return {
+    ok: false,
+    error: "This payslip's week no longer exists. Reload the page and try again."
+  };
+  // Pre-lock only. A hard-copy request is raised while the week is still open, and RLS would block a
+  // non-owner on a locked row anyway (Piece A) — so refusing here keeps the app honest with the DB
+  // instead of letting the button 42501. Deliberately NOT gated on item status: any line may be
+  // requested, approved or not.
+  if (per.status === "locked") return {
+    ok: false,
+    error: "This week is locked; hard-copy requests are made before it's locked."
+  };
+  // The row's own employee, or an officer. Same shape as _prReviewGate (app.jsx:1246): the officer
+  // path needs no payroll row, an employee must match the line's employee_id, and a null id can
+  // never match a row.
+  const officer = !!ME && (ME.role === "owner" || ME.role === "payroll");
+  if (!officer) {
+    const myId = await _prMyEmployeeId(sb);
+    if (myId == null || Number(it.employee_id) !== myId) return {
+      ok: false,
+      error: "You can only request a hard copy of your own payslip."
+    };
+  }
+  // Owns exactly one column — the request flag. `printed` and everything else are left untouched.
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_items").update({
+    print_requested: 1
+  }).eq("id", id).select("id");
+  if (error) return {
+    ok: false,
+    error: "Could not send this request: " + error.message
+  };
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Sending this request was refused by the database. Nothing changed."
+  };
+  return {
+    ok: true
+  };
+}
+async function _supaMarkPrinted(payload) {
+  const sb = window.SB;
+  const id = Number(payload && payload.id || 0);
+  if (!id) return {
+    ok: false,
+    error: "Missing id"
+  };
+  const {
+    data: it,
+    error: readErr
+  } = await sb.from("pr_items").select("id,employee_id,period_id").eq("id", id).maybeSingle();
+  if (readErr) return {
+    ok: false,
+    error: readErr.message
+  };
+  if (!it) return {
+    ok: false,
+    error: "This payslip line no longer exists. Reload the page and try again."
+  };
+  const {
+    data: per,
+    error: perErr
+  } = await sb.from("pr_periods").select("status").eq("id", it.period_id).maybeSingle();
+  if (perErr) return {
+    ok: false,
+    error: perErr.message
+  };
+  if (!per) return {
+    ok: false,
+    error: "This payslip's week no longer exists. Reload the page and try again."
+  };
+  // Owner or payroll — but on a LOCKED week only the owner, mirroring RLS Piece A exactly: a locked
+  // row is writable by is_owner() alone, so a payroll write would come back 42501. is_owner() is
+  // unconditional; is_payroll() only while the week is not locked. Not gated on item status.
+  const isOwner = !!ME && ME.role === "owner";
+  const isPayroll = !!ME && ME.role === "payroll";
+  if (!isOwner && !(isPayroll && per.status !== "locked")) {
+    return {
+      ok: false,
+      error: isPayroll ? "This week is locked — only the superadmin can mark it printed." : "Only the payroll office can mark a payslip printed."
+    };
+  }
+  // Owns exactly one column — the printed flag. It supersedes print_requested in both grids
+  // (app.jsx:5219/5543), so the request flag is deliberately left as-is rather than cleared.
+  const {
+    data: hit,
+    error
+  } = await sb.from("pr_items").update({
+    printed: 1
+  }).eq("id", id).select("id");
+  if (error) {
+    // A payroll user who reached a locked-row write despite the gate lands here with 42501 — name
+    // the real cause rather than surfacing the raw policy error.
+    if (error.code === "42501" && isPayroll) return {
+      ok: false,
+      error: "This week is locked — only the superadmin can mark it printed."
+    };
+    return {
+      ok: false,
+      error: "Could not mark this printed: " + error.message
+    };
+  }
+  if (!hit || !hit.length) return {
+    ok: false,
+    error: "Marking this printed was refused by the database. Nothing changed."
+  };
+  return {
+    ok: true
+  };
+}
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -2650,6 +2797,12 @@ const API = (action, payload) => {
         }
         if (action === "pr_item_reply") {
           return await _supaItemReply(payload);
+        }
+        if (action === "pr_request_print") {
+          return await _supaRequestPrint(payload);
+        }
+        if (action === "pr_mark_printed") {
+          return await _supaMarkPrinted(payload);
         }
         if (action === "create_client") {
           const {
@@ -15480,6 +15633,9 @@ function PayrollPage({
   // the control is never offered where the write would be refused. The row's own 'pending' test
   // is applied per row at the call site.
   const canOfficerApprove = !!period && period.status === "published" && (isOwner || isPayroll);
+  // Who may Mark printed. Owner always; payroll only while the week is not locked — the same line
+  // RLS Piece A draws, so payroll never sees a button that would come back 42501 (_supaMarkPrinted).
+  const canMarkPrinted = !!period && (isOwner || isPayroll && !locked);
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-5"
   }, flash && /*#__PURE__*/React.createElement("div", {
@@ -15803,7 +15959,7 @@ function PayrollPage({
     }
   }, /*#__PURE__*/React.createElement(IconPrint, {
     size: 14
-  }), "Print") : null, r._print_req && !r._printed ? /*#__PURE__*/React.createElement("button", {
+  }), "Print") : null, r._print_req && !r._printed && canMarkPrinted ? /*#__PURE__*/React.createElement("button", {
     onClick: () => markPrinted(r._id),
     className: "rounded-lg",
     style: {
@@ -17119,7 +17275,7 @@ function SalaryPage({
         fontSize: 12,
         fontWeight: 600
       }
-    }, "Hard copy requested") : /*#__PURE__*/React.createElement("button", {
+    }, "Hard copy requested") : period.status !== "locked" ? /*#__PURE__*/React.createElement("button", {
       onClick: () => requestPrint(it.id),
       className: "inline-flex items-center gap-1.5 rounded-xl",
       style: {
@@ -17133,7 +17289,7 @@ function SalaryPage({
       }
     }, /*#__PURE__*/React.createElement(IconPrint, {
       size: 15
-    }), "Request hard copy"))), contestFor === it.id && /*#__PURE__*/React.createElement("div", {
+    }), "Request hard copy") : null)), contestFor === it.id && /*#__PURE__*/React.createElement("div", {
       style: {
         marginTop: 10
       }

@@ -428,6 +428,87 @@ const MUTATIONS = [
     from: `const stamp = new Date().toISOString();`,
     to: `const stamp = _stamp();`,
   },
+  // ---- pr_item_reply ---- (all scoped: the zero-rows and return shapes repeat in approve/contest)
+  {
+    name: "drop-reply-contested-guard",
+    why: "reply reopens a settled line — a pending or approved payslip can be reset to pending by 'replying' to it",
+    in: "_supaItemReply",
+    from: `if (it.status !== "contested") return {
+    ok: false,
+    error: "You can only reply to a contested line."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-reply-reset-pending",
+    why: "a reply stores the officer's text but leaves the line 'contested' — the employee is never asked to re-approve, so the discrepancy never closes",
+    in: "_supaItemReply",
+    from: `.update({
+    officer_reply: reply,
+    status: "pending"
+  })`,
+    to: `.update({
+    officer_reply: reply
+  })`,
+  },
+  {
+    name: "drop-reply-officer-gate",
+    why: "an ordinary employee can write officer_reply on their own line and reset it to pending — RLS does not stop them, so this app check is the only guard",
+    in: "_supaItemReply",
+    from: `if (!officer) return {
+    ok: false,
+    error: "Only the payroll office can reply."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-reply-zerorows",
+    why: "a reply silently refused by RLS (200 + []) reports 'Reply sent' — the line stays contested but the officer is told it reopened",
+    in: "_supaItemReply",
+    from: `if (!hit || !hit.length) return {
+    ok: false,
+    error: "Sending this reply was refused by the database. Nothing changed."
+  };`,
+    to: "",
+  },
+  // ---- pr_request_print / pr_mark_printed (the print pair) ----
+  {
+    name: "drop-request-own-or-officer",
+    why: "any employee can flag a hard-copy request on ANYBODY's payslip — the own-line/officer check is gone",
+    in: "_supaRequestPrint",
+    from: `if (myId == null || Number(it.employee_id) !== myId) return {
+      ok: false,
+      error: "You can only request a hard copy of your own payslip."
+    };`,
+    to: "",
+  },
+  {
+    name: "drop-request-locked-guard",
+    why: "a hard-copy request is accepted on a locked week — the app offers a write RLS will 42501, and the button lies to the employee",
+    in: "_supaRequestPrint",
+    from: `if (per.status === "locked") return {
+    ok: false,
+    error: "This week is locked; hard-copy requests are made before it's locked."
+  };`,
+    to: "",
+  },
+  {
+    name: "drop-markprinted-owner-only-on-locked",
+    why: "payroll is let through to mark a LOCKED week printed — RLS then 42501s the write, but the app thought it was allowed",
+    in: "_supaMarkPrinted",
+    from: `if (!isOwner && !(isPayroll && per.status !== "locked")) {`,
+    to: `if (!isOwner && !(isPayroll && true)) {`,
+  },
+  {
+    name: "drop-markprinted-zerorows",
+    why: "a mark-printed silently refused by RLS (200 + []) reports success — the payslip is recorded printed when the write never landed",
+    in: "_supaMarkPrinted",
+    from: `if (!hit || !hit.length) return {
+    ok: false,
+    error: "Marking this printed was refused by the database. Nothing changed."
+  };`,
+    to: "",
+  },
 ];
 
 const APP = process.argv[2] || "app.js";
