@@ -1134,7 +1134,7 @@ async function _supaBootstrap() {
     pr_employee_id: null
   };
   // core datasets
-  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password");
+  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password,last_seen");
   out.vendos = await _supaAll(sb, "vendos", "id,vlan_number,name,address,coordinates,area,phone,email,date_installed,port,nap,url_link,notes,nap_port_id");
   out.olts = await _supaAll(sb, "olt", "id,name,description,standard,total_pon_ports,areas_served");
   out.ponPorts = await _supaAll(sb, "pon_port", "id,olt_id,port_number");
@@ -4411,7 +4411,8 @@ async function loadLiveData() {
       billing_status: c.billing_status || "",
       active_profile: c.active_profile || "",
       pppoe_username: c.pppoe_username || "",
-      pppoe_password: c.pppoe_password || ""
+      pppoe_password: c.pppoe_password || "",
+      last_seen: c.last_seen || null
     }));
     if (Array.isArray(d.vendos)) pisos = d.vendos.map(v => ({
       id: v.id,
@@ -21517,7 +21518,6 @@ function ClientsView({
   const _CLIENT_ACC = {
     "Client": c => (fullName(c) || "").toLowerCase(),
     "Note": c => (clientNoteInfo(c).text || "").toLowerCase(),
-    "Coordinates": c => (c.coordinates || "").toLowerCase(),
     "Area": c => (c.area || "").toLowerCase(),
     "Plan / Profile": c => (c.profile || "").toLowerCase(),
     "MRC": c => Number(c.mrc) || 0,
@@ -21529,7 +21529,8 @@ function ClientsView({
       return d ? d.getTime() : 0;
     },
     "NAP": c => (c.nap || "").toLowerCase(),
-    "Phone": c => (c.phone || "").toLowerCase()
+    "Phone": c => (c.phone || "").toLowerCase(),
+    "Status": c => c.last_seen ? new Date(c.last_seen).getTime() : 0
   };
   const sorted = sortKey ? sortRows(filtered, _CLIENT_ACC[sortKey], sortDir) : filtered;
   const pg = prPaginate(sorted, size, page);
@@ -21811,7 +21812,7 @@ function ClientsView({
       textTransform: "uppercase",
       letterSpacing: "0.06em"
     }
-  }, ["Client", "Note", "Coordinates", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Phone"].map(h => /*#__PURE__*/React.createElement(SortTh, {
+  }, ["Client", "Note", "Phone", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Status"].map(h => /*#__PURE__*/React.createElement(SortTh, {
     key: h,
     t: t,
     label: h,
@@ -21918,11 +21919,9 @@ function ClientsView({
       style: {
         padding: "11px 16px",
         color: t.textMuted,
-        fontSize: 12,
-        fontFamily: "ui-monospace, monospace",
-        whiteSpace: "nowrap"
+        fontSize: 13
       }
-    }, c.coordinates || "—"), /*#__PURE__*/React.createElement("td", {
+    }, c.phone || "—"), /*#__PURE__*/React.createElement("td", {
       style: {
         padding: "11px 16px",
         color: t.textMuted,
@@ -21996,7 +21995,13 @@ function ClientsView({
         color: t.textMuted,
         fontSize: 13
       }
-    }, c.phone || "—"), /*#__PURE__*/React.createElement("td", {
+    }, (() => {
+      const ls = c.last_seen;
+      if (!ls) return /*#__PURE__*/React.createElement("span", { style: { color: t.textFaint, fontSize: 13 } }, "—");
+      const online = (Date.now() - new Date(ls).getTime()) / 60000 <= 10;
+      const col = online ? t.good : t.bad;
+      return /*#__PURE__*/React.createElement("span", { className: "rounded-full", style: { background: col + "22", color: col, fontSize: 11, fontWeight: 700, padding: "3px 9px" } }, online ? "Online" : "Offline");
+    })()), /*#__PURE__*/React.createElement("td", {
       style: {
         padding: "11px 10px",
         textAlign: "right"
@@ -22049,7 +22054,7 @@ function ClientsView({
       }
     }, "view"))));
   }), filtered.length === 0 && /*#__PURE__*/React.createElement("tr", null, /*#__PURE__*/React.createElement("td", {
-    colSpan: 12,
+    colSpan: 13,
     style: {
       padding: "24px 16px",
       textAlign: "center",
@@ -27006,5 +27011,5 @@ function App() {
 Promise.resolve(typeof loadLiveData === 'function' ? loadLiveData() : false).catch(function () {}).finally(function () {
   var _boot = document.getElementById('boot');
   if (_boot) _boot.remove();
-  createRoot(document.getElementById("root")).render( /*#__PURE__*/React.createElement(App, null));
+  createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(App, null));
 });
