@@ -2040,6 +2040,24 @@ await t.test("harness: the test VM has the real globals app.jsx depends on, not 
   t.eq(g.undef, true, "undefined resolves correctly through the Proxy — _cTxt's v === undefined depends on it");
 });
 
+await t.test("harness: the fake paginates with .range(), so _supaAll's loop can terminate", async () => {
+  // _supaAll reads a whole table 1000 rows at a time and stops when a page comes back SHORT. Without
+  // .range() here, any handler that sums a full table is untestable — and the tempting alternative,
+  // a plain .select(), silently truncates at PostgREST's default limit. On a payments ledger that
+  // means every total quietly understates itself the moment the table outgrows one page.
+  const rows = [];
+  for (let i = 1; i <= 2500; i++) rows.push({ id: i, spent_at: "2026-07-01", amount: 1 });
+  const sb = makeFakeSB({ expenses: rows });
+  const first = await sb.from("expenses").select("id").range(0, 999);
+  const last = await sb.from("expenses").select("id").range(2000, 2999);
+  t.eq(first.data.length, 1000, "a full page comes back full");
+  t.eq(first.data[0].id, 1, "starting at the first row");
+  t.eq(last.data.length, 500, "the final page is short — which is exactly how _supaAll knows to stop");
+  t.eq(last.data[0].id, 2001, "and it starts where the previous page ended");
+  const unranged = await sb.from("expenses").select("id");
+  t.eq(unranged.data.length, 2500, "a read with no .range() is unaffected — every existing test still sees the whole table");
+});
+
 /* ---------- the four live finance writes: edit / delete of a payment or an expense ---------- */
 // These have been wired since before this suite existed and reported success unconditionally: an
 // UPDATE or DELETE hidden by an RLS USING policy comes back 200 + [], so `error` stayed null and a

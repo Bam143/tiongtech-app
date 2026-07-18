@@ -164,6 +164,12 @@ export function makeFakeSB(tables = {}, opts = {}) {
         // overwrite the op. Without a select(), a write resolves data:null, same as the real one.
         select(cols) { q.cols = cols; if (q.op) q.returning = true; else q.op = "select"; return b; },
         eq(col, val) { q.filters[col] = val; return b; },
+        // PostgREST row-range pagination, which _supaAll (app.jsx) loops over 1000 rows at a time.
+        // Without this a handler that reads a whole table is untestable, and the alternative — a
+        // plain .select() — silently truncates at PostgREST's default limit, which on a payments
+        // ledger means every total quietly understates itself once the table outgrows one page.
+        // INCLUSIVE at both ends, like the real thing: .range(0, 999) is the first thousand rows.
+        range(from, to) { q.from = Number(from) || 0; q.to = Number(to); return b; },
         update(row) { q.op = "update"; q.row = row; return b; },
         insert(row) { q.op = "insert"; q.row = row; return b; },
         delete() { q.op = "delete"; return b; },
@@ -178,7 +184,9 @@ export function makeFakeSB(tables = {}, opts = {}) {
           let data = null;
           if (q.op === "select") {
             const h = hits();
-            data = q.one ? (h[0] || null) : h;
+            // A ranged read returns that slice, so _supaAll's loop terminates the way it does in
+            // production: it stops when a page comes back shorter than the step it asked for.
+            data = q.one ? (h[0] || null) : (q.to === undefined ? h : h.slice(q.from, q.to + 1));
           } else if (WRITES.includes(q.op)) {
             const n = ++writeNo;
             // A raise beats a return: 42501 arrives with data null whether or not the caller asked
