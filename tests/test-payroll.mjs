@@ -2255,6 +2255,18 @@ await t.test("harness: the test VM has the real globals app.jsx depends on, not 
   t.eq(g.undef, true, "undefined resolves correctly through the Proxy — _cTxt's v === undefined depends on it");
 });
 
+await t.test("harness: the fake understands .gte(), so a whole-table delete is expressible", async () => {
+  // PostgREST refuses an unfiltered DELETE on purpose. "Delete everything" is therefore written as
+  // a filter matching everything, and without .gte() here the most destructive action in the app
+  // could not be tested at all.
+  const sb = makeFakeSB({ expenses: [{ id: 1, amount: 10 }, { id: 2, amount: 20 }, { id: 3, amount: 30 }] });
+  const all = await sb.from("expenses").delete().gte("id", 0).select("id");
+  t.eq(all.data.length, 3, "gte(id,0) matches every row — that is what makes it a wipe");
+  const some = await makeFakeSB({ expenses: [{ id: 1 }, { id: 2 }, { id: 3 }] }).from("expenses").select("id").gte("id", 2);
+  t.eq(some.data.length, 2, "and it is a real comparison, not a match-all stub");
+  t.eq(some.data[0].id, 2, "starting at the boundary, inclusive");
+});
+
 await t.test("harness: the fake paginates with .range(), so _supaAll's loop can terminate", async () => {
   // _supaAll reads a whole table 1000 rows at a time and stops when a page comes back SHORT. Without
   // .range() here, any handler that sums a full table is untestable — and the tempting alternative,

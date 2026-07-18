@@ -149,7 +149,9 @@ export function makeFakeSB(tables = {}, opts = {}) {
     calls,
     from(table) {
       const q = { table, filters: {} };
-      const hits = () => (db[q.table] || []).filter((r) => Object.entries(q.filters).every(([k, v]) => r[k] === v));
+      const hits = () => (db[q.table] || []).filter((r) =>
+        Object.entries(q.filters).every(([k, v]) => r[k] === v) &&
+        Object.entries(q.gte || {}).every(([k, v]) => Number(r[k]) >= Number(v)));
       // An upsert resolves against its CONFLICT KEY, not against .eq() filters — it carries none.
       // Falling through to hits() would match every row in the table (an empty filter set matches
       // everything) and, against an empty fixture, return [] — which is byte-for-byte what
@@ -168,6 +170,11 @@ export function makeFakeSB(tables = {}, opts = {}) {
         // overwrite the op. Without a select(), a write resolves data:null, same as the real one.
         select(cols) { q.cols = cols; if (q.op) q.returning = true; else q.op = "select"; return b; },
         eq(col, val) { q.filters[col] = val; return b; },
+        // PostgREST REFUSES an unfiltered DELETE — a deliberate guard against wiping a table by
+        // accident. So "delete everything" has to be written as a filter that happens to match
+        // everything, and .gte("id", 0) is the usual way. Without this the fake cannot express a
+        // whole-table delete, and the most destructive action in the app would be untestable.
+        gte(col, val) { (q.gte = q.gte || {})[col] = val; return b; },
         // PostgREST row-range pagination, which _supaAll (app.jsx) loops over 1000 rows at a time.
         // Without this a handler that reads a whole table is untestable, and the alternative — a
         // plain .select() — silently truncates at PostgREST's default limit, which on a payments
@@ -184,7 +191,11 @@ export function makeFakeSB(tables = {}, opts = {}) {
         // PostgREST semantics: one row or null, and no error when there is no match.
         maybeSingle() { q.one = true; return b; },
         then(res, rej) {
-          calls.push({ table: q.table, op: q.op, row: q.row, filters: { ...q.filters }, cols: q.cols, opts: q.opts });
+          // gte is recorded alongside filters for the same reason opts is: a test has to be able to
+          // assert WHAT was sent, not just that something was. On a whole-table delete the filter
+          // is the entire safety story — an unfiltered one is refused by PostgREST, and a wrongly
+          // filtered one quietly sweeps the wrong rows.
+          calls.push({ table: q.table, op: q.op, row: q.row, filters: { ...q.filters }, gte: q.gte ? { ...q.gte } : undefined, cols: q.cols, opts: q.opts });
           let data = null;
           if (q.op === "select") {
             const h = hits();
