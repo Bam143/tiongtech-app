@@ -638,6 +638,44 @@ const MUTATIONS = [
     active: false
   })`,
   },
+  // ---- the four live finance writes (edit / delete a payment or an expense) ----
+  // These live inline in the API dispatcher rather than in named functions, so they cannot be
+  // `in:`-scoped. The error strings carry the `what` variable, which makes each compiled pattern
+  // unique across the whole file on its own.
+  {
+    name: "drop-finance-update-zerorows",
+    why: "an edit to a payment or an expense that RLS silently refused reports 'Saved' — the officer sees a corrected amount on screen, the ledger still holds the old one, and the books and the database disagree until somebody reloads",
+    from: `          if (!hit || !hit.length) return {
+            ok: false,
+            error: "Saving this " + what + " was refused by the database. Nothing changed."
+          };
+`,
+    to: "",
+  },
+  {
+    name: "drop-finance-delete-zerorows",
+    why: "a payment or expense the database refused to delete reports 'Deleted' — the officer stops looking, the row is still on the books, and it keeps counting toward every total the finance page prints",
+    from: `          if (!gone || !gone.length) return {
+            ok: false,
+            error: "Deleting this " + what + " was refused by the database. It is still there."
+          };
+`,
+    to: "",
+  },
+  {
+    name: "drop-finance-update-select",
+    // Anchored on the whole statement: ".eq(\"id\", payload.id).select(\"id\")" alone appears in
+    // the delete branch too, and the harness rightly refuses a pattern that matches twice.
+    why: "without asking for the affected row back, a refused edit is undetectable: PostgREST answers 200 with an empty array and the zero-rows check below has nothing to test",
+    from: `await sb.from(inc ? "payments" : "expenses").update(inc ? _paymentPayload(payload) : _expensePayload(payload)).eq("id", payload.id).select("id");`,
+    to: `await sb.from(inc ? "payments" : "expenses").update(inc ? _paymentPayload(payload) : _expensePayload(payload)).eq("id", payload.id);`,
+  },
+  {
+    name: "drop-finance-delete-select",
+    why: "same blind spot on the delete side: without the affected row coming back, a refusal and a real deletion are the same 200, and the row stays on the books reported as gone",
+    from: `await sb.from(inc ? "payments" : "expenses").delete().eq("id", payload.id).select("id");`,
+    to: `await sb.from(inc ? "payments" : "expenses").delete().eq("id", payload.id);`,
+  },
   // ---- save_expense_cats (config-only, but app_config is SHARED with half the app) ----
   {
     name: "drop-savecats-permission",

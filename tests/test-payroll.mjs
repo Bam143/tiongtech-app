@@ -2016,6 +2016,64 @@ await t.test("client payments: is wired — it no longer falls through", async (
   t.ok(!/is not connected to Supabase yet/.test(res.error || ""), "reaches the handler, not the fallthrough");
 });
 
+/* ---------- the four live finance writes: edit / delete of a payment or an expense ---------- */
+// These have been wired since before this suite existed and reported success unconditionally: an
+// UPDATE or DELETE hidden by an RLS USING policy comes back 200 + [], so `error` stayed null and a
+// row that never moved read as edited or removed. .select("id") is what tells the two apart.
+const FIN_ROWS = {
+  payments: [{ id: 7, paid_at: "2026-07-11", account: "ACC-001", source: "Cash", amount: 900, reference: "R-2", user_name: "luz" }],
+  expenses: [{ id: 9, spent_at: "2026-07-11", supplier: "Fuel", description: "Diesel", amount: 1200, invoice: "INV-3", user_name: "luz" }],
+};
+const finWrite = async (action, payload, opts) => {
+  const sb = makeFakeSB({ payments: FIN_ROWS.payments.map((r) => ({ ...r })), expenses: FIN_ROWS.expenses.map((r) => ({ ...r })) }, opts);
+  window.SB = sb;
+  const res = await API(action, payload);
+  return { sb, res };
+};
+const FIN_CASES = [
+  { action: "update_payment", table: "payments", op: "update", payload: { id: 7, paid_at: "2026-07-12", account: "ACC-001", source: "GCash", amount: 950, reference: "R-2", user_name: "luz" } },
+  { action: "update_expense", table: "expenses", op: "update", payload: { id: 9, spent_at: "2026-07-12", supplier: "Fuel", description: "Diesel", amount: 1250, invoice: "INV-3", user_name: "luz" } },
+  { action: "delete_payment", table: "payments", op: "delete", payload: { id: 7 } },
+  { action: "delete_expense", table: "expenses", op: "delete", payload: { id: 9 } },
+];
+
+for (const c of FIN_CASES) {
+  await t.test(`${c.action}: succeeds when a row is actually affected`, async () => {
+    const { sb, res } = await finWrite(c.action, c.payload);
+    t.eq(res.ok, true, `ok, got: ${res.error}`);
+    const w = sb.calls.filter((x) => x.op === c.op);
+    t.eq(w.length, 1, `one ${c.op}`);
+    t.eq(w[0].table, c.table, `on ${c.table}`);
+    t.eq(w[0].filters.id, c.payload.id, "the right row");
+    t.eq(w[0].cols, "id", ".select(\"id\") is asked for — without it a silent refusal is undetectable");
+  });
+
+  await t.test(`${c.action}: a silently refused write (200 + []) is an honest failure`, async () => {
+    const { res } = await finWrite(c.action, c.payload, { blockWrites: c.table });
+    t.eq(res.ok, false, "refused — never a false success");
+    t.ok(/refused by the database/.test(res.error), `says so plainly, got: ${res.error}`);
+  });
+
+  await t.test(`${c.action}: a 42501 is an honest failure too`, async () => {
+    const { res } = await finWrite(c.action, c.payload, { errorWrites: c.table });
+    t.eq(res.ok, false, "refused");
+    t.ok(/Could not (save|delete) this (payment|expense)/.test(res.error), `explains itself, got: ${res.error}`);
+  });
+
+  await t.test(`${c.action}: a missing id is refused before any write`, async () => {
+    const { sb, res } = await finWrite(c.action, {});
+    t.eq(res.ok, false, "refused");
+    t.eq(sb.calls.length, 0, "nothing touched");
+  });
+}
+
+await t.test("finance writes: a delete that moved nothing says the row is STILL THERE", async () => {
+  // The wording matters more than the ok flag here: an officer told "deleted" stops looking, and
+  // the row is still on the books.
+  const { res } = await finWrite("delete_expense", { id: 9 }, { blockWrites: "expenses" });
+  t.ok(/still there/.test(res.error), `names the consequence, got: ${res.error}`);
+});
+
 /* ---------- save_expense_cats (expense category labels, in SHARED app_config) ---------- */
 // app_config is one row per key and holds positions / job_types / issues / solutions / sla /
 // dashboard_verse / hero_goal_pin alongside expense_cats, so the tests that matter most here are

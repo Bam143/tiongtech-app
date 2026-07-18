@@ -1944,18 +1944,29 @@ const API = (action, payload) => {
           if (error) return { ok: false, error: error.message };
           return { ok: true, id: data ? data.id : null };
         }
+        // .select("id") on both of these for the same reason every payroll write carries one
+        // (app.jsx:888): Postgres does not error when an RLS USING policy hides a row from an
+        // UPDATE or a DELETE — PostgREST answers 200 with an empty array — so `error` stays null
+        // and money that was never touched reports as edited or removed. On a ledger that is the
+        // worst possible place to guess: the row is still there, the screen says it is not, and
+        // the books disagree with the database until somebody reloads.
         if (action === "update_payment" || action === "update_expense") {
           if (!payload || !payload.id) return { ok: false, error: "Missing id" };
           const inc = action === "update_payment";
-          const { error } = await sb.from(inc ? "payments" : "expenses")
-            .update(inc ? _paymentPayload(payload) : _expensePayload(payload)).eq("id", payload.id);
-          if (error) return { ok: false, error: error.message };
+          const what = inc ? "payment" : "expense";
+          const { data: hit, error } = await sb.from(inc ? "payments" : "expenses")
+            .update(inc ? _paymentPayload(payload) : _expensePayload(payload)).eq("id", payload.id).select("id");
+          if (error) return { ok: false, error: "Could not save this " + what + ": " + error.message };
+          if (!hit || !hit.length) return { ok: false, error: "Saving this " + what + " was refused by the database. Nothing changed." };
           return { ok: true };
         }
         if (action === "delete_payment" || action === "delete_expense") {
           if (!payload || !payload.id) return { ok: false, error: "Missing id" };
-          const { error } = await sb.from(action === "delete_payment" ? "payments" : "expenses").delete().eq("id", payload.id);
-          if (error) return { ok: false, error: error.message };
+          const inc = action === "delete_payment";
+          const what = inc ? "payment" : "expense";
+          const { data: gone, error } = await sb.from(inc ? "payments" : "expenses").delete().eq("id", payload.id).select("id");
+          if (error) return { ok: false, error: "Could not delete this " + what + ": " + error.message };
+          if (!gone || !gone.length) return { ok: false, error: "Deleting this " + what + " was refused by the database. It is still there." };
           return { ok: true };
         }
         if (action === "add_renewal_note") {
@@ -3971,8 +3982,18 @@ function MoneyModal({ t, kind, row, onClose, onSaved }) {
     const payload = isInc
       ? { id: row && row.id, paid_at: form.paid_at, account: form.account, source: form.source, amount: form.amount, reference: form.reference, user_name: form.user_name }
       : { id: row && row.id, spent_at: form.spent_at, supplier: form.supplier, description: form.description, amount: form.amount, invoice: form.invoice, user_name: form.user_name };
-    try { await API(action, payload); } catch (e) {}
-    setBusy(false); onSaved();
+    // The handler now tells the truth about whether a row moved; this is what lets the screen say
+    // so. Without it the .select() behind these actions would be invisible — a refused edit would
+    // still close the modal and flash "Saved", which is the exact failure the check was added for.
+    let res = null;
+    try { res = await API(action, payload); }
+    catch (e) { res = { ok: false, error: (e && e.message) || "Save failed." }; }
+    setBusy(false);
+    if (res && res.ok) { onSaved(); return; }
+    // The modal stays OPEN on failure, deliberately: closing it would throw away what was typed,
+    // and the entry did not land, so there is nothing to go back to. Leaving it up means the
+    // officer can retry or copy the figures out.
+    alert((res && res.error) || "This entry was not saved.");
   };
   const fields = isInc
     ? [["Date", "paid_at", "date"], ["Amount (₱)", "amount", "number"], ["Account # (optional)", "account", "text"], ["Source (e.g. GCash, Cash)", "source", "text"], ["Reference (optional)", "reference", "text"], ["Posted by", "user_name", "text"]]
@@ -4042,8 +4063,15 @@ function IncomePage({ t }) {
   const onSaved = () => { setModal(null); setFlash("Saved"); setTimeout(() => setFlash(""), 2500); refresh(); };
   const del = async (row) => {
     if (!row.id || !window.confirm("Delete this payment?")) return;
-    try { await API("delete_payment", { id: row.id }); } catch (e) {}
-    setFlash("Deleted"); setTimeout(() => setFlash(""), 2500); refresh();
+    let res = null;
+    try { res = await API("delete_payment", { id: row.id }); }
+    catch (e) { res = { ok: false, error: (e && e.message) || "Delete failed." }; }
+    // refresh() runs either way: on success the row goes, on failure the true ledger comes back,
+    // so the list can never keep showing a deletion the database refused.
+    refresh();
+    if (res && res.ok) { setFlash("Deleted"); setTimeout(() => setFlash(""), 2500); return; }
+    setFlash("NOT deleted — " + ((res && res.error) || "the database refused it."));
+    setTimeout(() => setFlash(""), 7000);
   };
   const s = q.trim().toLowerCase();
   const shown = pays.filter((p) => !s || [p.date, p.account, p.source, p.reference, p.user, String(p.amount)].some((v) => (v || "").toString().toLowerCase().includes(s)));
@@ -4247,8 +4275,15 @@ function ExpensesPage({ t }) {
   const onSaved = () => { setModal(null); setFlash("Saved"); setTimeout(() => setFlash(""), 2500); refresh(); };
   const del = async (row) => {
     if (!row.id || !window.confirm("Delete this expense?")) return;
-    try { await API("delete_expense", { id: row.id }); } catch (e) {}
-    setFlash("Deleted"); setTimeout(() => setFlash(""), 2500); refresh();
+    let res = null;
+    try { res = await API("delete_expense", { id: row.id }); }
+    catch (e) { res = { ok: false, error: (e && e.message) || "Delete failed." }; }
+    // refresh() runs either way: on success the row goes, on failure the true ledger comes back,
+    // so the list can never keep showing a deletion the database refused.
+    refresh();
+    if (res && res.ok) { setFlash("Deleted"); setTimeout(() => setFlash(""), 2500); return; }
+    setFlash("NOT deleted — " + ((res && res.error) || "the database refused it."));
+    setTimeout(() => setFlash(""), 7000);
   };
   const s = q.trim().toLowerCase();
   const shown = exps.filter((e) => !s || [e.date, e.supplier, e.description, e.invoice, e.user, String(e.amount)].some((v) => (v || "").toString().toLowerCase().includes(s)));
