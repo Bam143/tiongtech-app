@@ -1478,9 +1478,8 @@ async function _supaDeleteEmployee(payload) {
   return { ok: true };
 }
 /* ---- Loan / installment plans (pr_save_plan add/edit, pr_delete_plan) ----
-   LoanManagement's Save (app.jsx:5109 via persist), its interest-only toggle (5096) and Delete
-   (5128). PlansModal (4913) sends the same two actions and is DEAD CODE — defined, never rendered
-   — so LoanManagement is the only screen these serve; wiring here covers both regardless.
+   LoanManagement's Save (via persist), its interest-only toggle, and Delete — the only screen
+   that sends either action.
 
    Owner or payroll, enforced HERE and ONLY here. pr_plans carries the permissive `staff_all`
    policy — verified 2026-07-18 — so the database accepts a plan write from any signed-in staff
@@ -5191,165 +5190,13 @@ function PeriodModal({ t, period, onClose, onSaved }) {
   );
 }
 
-/* ---- Installment / loan plans manager (officer) ---- */
+/* ---- Loan plan vocabulary: the kinds the form offers, the categories they file under, and the
+   default mapping between them. PR_KIND_CAT is only a DEFAULT — category is its own stored column
+   the officer can override, and it is category, not kind, that decides which pr_items column a
+   plan deducts into (_PR_CAT_DED, app.jsx:1600). ---- */
 const PR_KINDS = [["tshirt", "T-shirt"], ["coop", "Coop"], ["ca", "Cash advance"], ["fines", "Fines"]];
 const PR_CATS = [["loan", "Loan"], ["uniform", "Uniform"], ["government", "Government"], ["other", "Other"]];
 const PR_KIND_CAT = { tshirt: "uniform", coop: "loan", ca: "loan", fines: "other" };
-function PlansModal({ t, employees, plans, onClose, onChanged, inline }) {
-  const [rows, setRows] = useState(plans);
-  const [editing, setEditing] = useState({});
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState(null);
-  // Keep saved rows in sync with the database (so created loans never disappear on
-  // tab switch/reload), while preserving unsaved new rows and any just-saved row not yet echoed back.
-  useEffect(() => { setRows((cur) => { const ids = {}; plans.forEach((p) => { ids[p.id] = 1; }); return [...plans, ...cur.filter((r) => r._new || !ids[r.id])]; }); }, [plans]);
-  const inp = { width: "100%", background: t.surface2, color: t.text, border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 9px", fontSize: 12.5, outline: "none" };
-  const cellTxt = { color: t.text, fontSize: 12.5 };
-  const flash = (ok, text) => { setMsg({ ok, text }); if (ok) setTimeout(() => setMsg(null), 3500); };
-  const empName = (id) => { const e = employees.find((x) => x.id == id); return e ? e.full_name : "?"; };
-  const kindLabel = (k) => (PR_KINDS.find((x) => x[0] === k) || [null, k])[1];
-  const set = (id, k, v) => setRows((r) => r.map((x) => (x.id === id ? { ...x, [k]: v } : x)));
-  const isEdit = (row) => row._new || editing[row.id];
-  const perWeek = (row) => { const tt = Number(row.terms_total) || 0; const tot = Number(row.total_amount) || 0; return tt > 0 ? Math.round((tot / tt) * 100) / 100 : 0; };
-  const wkInterest = (row) => { const tot = Number(row.total_amount) || 0; const r = Number(row.interest_rate) || 0; return Math.round((tot * r / 100) * 100) / 100; };
-  const wkPayment = (row) => (row.interest_only ? wkInterest(row) : Math.round((perWeek(row) + wkInterest(row)) * 100) / 100);
-  const toggleIntOnly = async (row) => {
-    if (row._new) return;
-    const nv = row.interest_only ? 0 : 1;
-    if (!window.confirm(nv ? `Switch "${kindLabel(row.kind)}" to INTEREST ONLY?\nOnly the weekly interest (${peso(wkInterest(row))}) will be deducted until you switch it back — the payment term extends.` : "Resume normal payments (principal + interest)?")) return;
-    setBusy(true);
-    try {
-      await prWrite("pr_save_plan", { id: row.id, employee_id: row.employee_id, kind: row.kind, category: row.category || PR_KIND_CAT[row.kind] || "loan", label: kindLabel(row.kind), total_amount: row.total_amount, terms_total: row.terms_total, interest_rate: row.interest_rate || 0, interest_only: nv, start_date: row.start_date || null, active: row.active ? 1 : 0 });
-      flash(true, nv ? "Now interest-only (extension)." : "Resumed normal payments.");
-      if (typeof onChanged === "function") onChanged();
-    } catch (e) { flash(false, e.message); }
-    setBusy(false);
-  };
-  const startEdit = (row) => { if (!window.confirm(`Edit this ${row.label} plan for ${empName(row.employee_id)}?`)) return; setMsg(null); setEditing((e) => ({ ...e, [row.id]: true })); };
-  const cancelEdit = (row) => {
-    if (row._new) { setRows((r) => r.filter((x) => x.id !== row.id)); return; }
-    const orig = plans.find((x) => x.id === row.id);
-    if (orig) setRows((r) => r.map((x) => (x.id === row.id ? { ...orig } : x)));
-    setEditing((e) => { const n = { ...e }; delete n[row.id]; return n; });
-  };
-  const addRow = () => { setMsg(null); const today = new Date().toISOString().slice(0, 10); setRows((r) => [...r, { id: "new_" + Date.now(), employee_id: (employees[0] && employees[0].id) || "", kind: "ca", category: "loan", label: "Cash advance", total_amount: "", terms_total: "", interest_rate: "", interest_only: 0, start_date: today, terms_done: 0, active: 1, _new: true }]); };
-  const saveRow = async (row) => {
-    if (!row.employee_id) { flash(false, "Pick an employee."); return; }
-    if (!(Number(row.total_amount) > 0) || !(Number(row.terms_total) > 0)) { flash(false, "Enter a total amount and number of weeks."); return; }
-    if (!window.confirm(row._new ? `Add this ${row.label} plan for ${empName(row.employee_id)}?` : `Save changes to this plan?`)) return;
-    setBusy(true);
-    try {
-      const r = await prWrite("pr_save_plan", { id: row._new ? null : row.id, employee_id: row.employee_id, kind: row.kind, category: row.category || PR_KIND_CAT[row.kind] || "loan", label: kindLabel(row.kind), total_amount: row.total_amount, terms_total: row.terms_total, interest_rate: row.interest_rate || 0, interest_only: row.interest_only ? 1 : 0, start_date: row.start_date || null, active: row.active ? 1 : 0 });
-      setRows((rs) => rs.map((x) => (x.id === row.id ? { ...x, _new: false, id: r.id || x.id } : x)));
-      setEditing((e) => { const n = { ...e }; delete n[row.id]; return n; });
-      flash(true, "Saved."); onChanged();
-    } catch (err) { flash(false, err.message); }
-    setBusy(false);
-  };
-  const delRow = async (row) => {
-    if (row._new) { setRows((r) => r.filter((x) => x.id !== row.id)); return; }
-    if (!window.confirm(`Delete this ${row.label} plan for ${empName(row.employee_id)}? This cannot be undone.`)) return;
-    setBusy(true);
-    try { await prWrite("pr_delete_plan", { id: row.id }); setRows((r) => r.filter((x) => x.id !== row.id)); flash(true, "Deleted."); onChanged(); }
-    catch (err) { flash(false, err.message); }
-    setBusy(false);
-  };
-  const editBtn = { background: t.violet + "22", color: t.violet, border: "none", cursor: "pointer", fontSize: 11.5, fontWeight: 700, padding: "5px 10px", borderRadius: 8, marginRight: 6 };
-  const saveBtn = { background: t.goodSoft, color: t.good, border: "none", cursor: "pointer", fontSize: 11.5, fontWeight: 700, padding: "5px 10px", borderRadius: 8, marginRight: 6 };
-  const cancelBtn = { background: "transparent", color: t.textMuted, border: `1px solid ${t.border}`, cursor: "pointer", fontSize: 11.5, fontWeight: 700, padding: "5px 10px", borderRadius: 8, marginRight: 6 };
-  const done = (row) => (row.terms_done || 0) >= (Number(row.terms_total) || 0) && !row._new;
-  const inner = (
-    <div className="px-5 py-4">
-          <div style={{ color: t.textFaint, fontSize: 12, marginBottom: 10 }}>Set a debt once — e.g. T-shirt ₱250 over 5 weeks, with a <b style={{ color: t.textMuted }}>Payment start</b> date. From that date, every new payroll week automatically deducts the weekly share (labelled “n of N”) and stops when fully paid. You can also re-sync a week manually with <b style={{ color: t.textMuted }}>Apply plans</b>. Saved loans stay here until you delete them.</div>
-          {msg && <div style={{ marginBottom: 10, padding: "8px 11px", borderRadius: 9, fontSize: 12.5, fontWeight: 600, background: msg.ok ? t.goodSoft : (t.badSoft || "#3a1620"), color: msg.ok ? t.good : t.bad, border: `1px solid ${msg.ok ? t.good : t.bad}33` }}>{msg.text}</div>}
-          <div style={{ overflowX: "auto" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 780 }}>
-              <thead><tr style={{ color: t.textFaint, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.05em" }}>
-                {[["Employee"], ["Type"], ["Category"], ["Total ₱"], ["Weeks", "Payment terms"], ["Interest", "% per week"], ["Weekly pay", "Deducted / week"], ["Payment start", "First deduction"], ["Progress", "Times paid"], ["Remaining", "Balance left"], ["Active"], [""]].map(([h, sub], i) => <th key={i} style={{ textAlign: "left", padding: "6px 8px", fontWeight: 700, borderBottom: `1px solid ${t.border}` }}>{h}{sub ? <div style={{ fontWeight: 500, fontSize: 8.5, textTransform: "none", letterSpacing: 0, color: t.textFaint }}>{sub}</div> : null}</th>)}
-              </tr></thead>
-              <tbody>
-                {rows.length === 0 && <tr><td colSpan={12} style={{ padding: "14px 8px", textAlign: "center", color: t.textFaint, fontSize: 12.5 }}>No plans yet — add one below.</td></tr>}
-                {rows.map((row) => (
-                  <tr key={row.id} style={{ borderBottom: `1px solid ${t.borderSoft}` }}>
-                    {isEdit(row) ? (<>
-                      <td style={{ padding: "5px 8px" }}>
-                        <select value={row.employee_id} onChange={(e) => set(row.id, "employee_id", e.target.value)} style={{ ...inp, minWidth: 150 }}>
-                          {employees.map((e) => <option key={e.id} value={e.id} style={{ background: t.surface, color: t.text }}>{e.full_name}</option>)}
-                        </select>
-                      </td>
-                      <td style={{ padding: "5px 8px" }}>
-                        <select value={row.kind} onChange={(e) => { const k = e.target.value; set(row.id, "kind", k); set(row.id, "label", kindLabel(k)); set(row.id, "category", PR_KIND_CAT[k] || "loan"); }} style={{ ...inp, minWidth: 110 }}>
-                          {PR_KINDS.map(([v, l]) => <option key={v} value={v} style={{ background: t.surface, color: t.text }}>{l}</option>)}
-                        </select>
-                      </td>
-                      <td style={{ padding: "5px 8px" }}>
-                        <select value={row.category || "loan"} onChange={(e) => set(row.id, "category", e.target.value)} style={{ ...inp, minWidth: 110 }}>
-                          {PR_CATS.map(([v, l]) => <option key={v} value={v} style={{ background: t.surface, color: t.text }}>{l}</option>)}
-                        </select>
-                      </td>
-                      <td style={{ padding: "5px 8px" }}><input type="number" value={row.total_amount} onChange={(e) => set(row.id, "total_amount", e.target.value)} style={{ ...inp, width: 80 }} /></td>
-                      <td style={{ padding: "5px 8px" }}><input type="number" value={row.terms_total} onChange={(e) => set(row.id, "terms_total", e.target.value)} style={{ ...inp, width: 60 }} /></td>
-                      <td style={{ padding: "5px 8px", whiteSpace: "nowrap" }}>
-                        <div className="flex items-center gap-1"><input type="number" step="0.01" value={row.interest_rate} onChange={(e) => set(row.id, "interest_rate", e.target.value)} placeholder="0" style={{ ...inp, width: 58 }} /><span style={{ color: t.textFaint, fontSize: 11 }}>%</span></div>
-                        <label style={{ display: "flex", alignItems: "center", gap: 4, marginTop: 4, color: t.textMuted, fontSize: 10.5, cursor: "pointer" }}><input type="checkbox" checked={!!row.interest_only} onChange={(e) => set(row.id, "interest_only", e.target.checked ? 1 : 0)} />interest only (extend)</label>
-                      </td>
-                      <td style={{ padding: "5px 8px", color: t.text, fontSize: 12.5, fontWeight: 700, whiteSpace: "nowrap" }}>{peso(wkPayment(row))}{Number(row.interest_rate) > 0 ? <div style={{ color: t.textFaint, fontSize: 9.5, fontWeight: 500 }}>{peso(perWeek(row))} + {peso(wkInterest(row))} int</div> : null}</td>
-                      <td style={{ padding: "5px 8px" }}><input type="date" value={row.start_date || ""} onChange={(e) => set(row.id, "start_date", e.target.value)} style={{ ...inp, width: 138 }} /></td>
-                      <td style={{ padding: "5px 8px", color: t.textMuted, fontSize: 12.5, whiteSpace: "nowrap" }}>{row._new ? "—" : (row.terms_done || 0) + " / " + row.terms_total}</td>
-                      <td style={{ padding: "5px 8px", color: t.textFaint, fontSize: 12 }}>—</td>
-                      <td style={{ padding: "5px 8px", textAlign: "center" }}><input type="checkbox" checked={!!row.active} onChange={(e) => set(row.id, "active", e.target.checked ? 1 : 0)} /></td>
-                      <td style={{ padding: "5px 8px", whiteSpace: "nowrap" }}>
-                        <button onClick={() => saveRow(row)} disabled={busy} style={saveBtn}>Save</button>
-                        <button onClick={() => cancelEdit(row)} disabled={busy} style={cancelBtn}>Cancel</button>
-                      </td>
-                    </>) : (<>
-                      <td style={{ padding: "7px 8px", ...cellTxt, fontWeight: 600 }}>{empName(row.employee_id)}</td>
-                      <td style={{ padding: "7px 8px", ...cellTxt }}>{kindLabel(row.kind)}</td>
-                      <td style={{ padding: "7px 8px" }}><span style={{ fontSize: 11, fontWeight: 700, color: t.textMuted }}>{(PR_CATS.find((c) => c[0] === (row.category || "loan")) || [null, "Loan"])[1]}</span></td>
-                      <td style={{ padding: "7px 8px", ...cellTxt }}>{peso(row.total_amount)}</td>
-                      <td style={{ padding: "7px 8px", ...cellTxt }}>{row.terms_total}</td>
-                      <td style={{ padding: "7px 8px", whiteSpace: "nowrap" }}>
-                        {Number(row.interest_rate) > 0 ? <span style={{ color: t.text, fontSize: 12.5, fontWeight: 600 }}>{row.interest_rate}% <span style={{ color: t.textFaint, fontWeight: 400 }}>({peso(row.weekly_interest != null ? row.weekly_interest : wkInterest(row))})</span></span> : <span style={{ color: t.textFaint, fontSize: 12 }}>—</span>}
-                        {can("payroll") && !done(row) ? (
-                          <button onClick={() => toggleIntOnly(row)} disabled={busy} title="Toggle interest-only (extend / waive the principal for now)" style={{ display: "block", marginTop: 3, background: row.interest_only ? t.warnSoft : "transparent", color: row.interest_only ? t.warn : t.textFaint, border: `1px solid ${row.interest_only ? t.warn : t.border}`, borderRadius: 6, fontSize: 9.5, fontWeight: 700, padding: "1px 6px", cursor: busy ? "default" : "pointer" }}>{row.interest_only ? "● interest only — resume" : "○ set interest only"}</button>
-                        ) : (row.interest_only ? <div style={{ color: t.warn, fontSize: 9.5, fontWeight: 700 }}>interest only</div> : null)}
-                      </td>
-                      <td style={{ padding: "7px 8px", color: t.text, fontSize: 12.5, fontWeight: 700, whiteSpace: "nowrap" }}>{peso(row.weekly_payment != null ? row.weekly_payment : wkPayment(row))}</td>
-                      <td style={{ padding: "7px 8px", ...cellTxt, whiteSpace: "nowrap" }}>{row.start_date || <span style={{ color: t.textFaint }}>immediately</span>}</td>
-                      <td style={{ padding: "7px 8px", color: done(row) ? t.good : t.textMuted, fontSize: 12.5, fontWeight: done(row) ? 700 : 400, whiteSpace: "nowrap" }}>{(row.terms_done || 0) + " / " + row.terms_total}{done(row) ? " ✓" : ""}</td>
-                      <td style={{ padding: "7px 8px", whiteSpace: "nowrap" }}>
-                        <div style={{ color: t.text, fontSize: 12.5, fontWeight: 600 }}>{row.remaining_balance != null ? peso(row.remaining_balance) : "—"}</div>
-                        {row.remaining_weeks > 0 && row.next_deduction_date ? <div style={{ color: t.textFaint, fontSize: 10 }}>next {row.next_deduction_date}</div> : null}
-                        {row.remaining_weeks > 0 && row.completion_date ? <div style={{ color: t.textFaint, fontSize: 10 }}>ends {row.completion_date}</div> : null}
-                      </td>
-                      <td style={{ padding: "7px 8px", textAlign: "center" }}>{row.active ? <span style={{ color: t.good, fontSize: 12, fontWeight: 700 }}>Yes</span> : <span style={{ color: t.textFaint, fontSize: 12 }}>No</span>}</td>
-                      <td style={{ padding: "5px 8px", whiteSpace: "nowrap" }}>
-                        <button onClick={() => startEdit(row)} style={editBtn}>Edit</button>
-                        <button onClick={() => delRow(row)} title="Delete" style={{ background: "transparent", border: "none", color: t.bad, cursor: "pointer", padding: 2 }}><IconX size={15} /></button>
-                      </td>
-                    </>)}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-          {canAdd("payroll") && <button onClick={addRow} className="inline-flex items-center gap-1.5 rounded-xl mt-3" style={{ background: t.accentSoft, color: t.accent, border: "none", cursor: "pointer", fontSize: 12.5, fontWeight: 700, padding: "8px 13px" }}><Plus size={15} />Add loan</button>}
-    </div>
-  );
-  if (inline) return inner;
-  return (
-    <div style={{ position: "fixed", inset: 0, zIndex: 80, display: "grid", placeItems: "center", padding: 16 }}>
-      <div onClick={onClose} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,0.6)" }} />
-      <Card t={t} style={{ position: "relative", zIndex: 81, width: "100%", maxWidth: 900, padding: 0, maxHeight: "90vh", overflowY: "auto" }}>
-        <div className="flex items-center justify-between px-5 py-4" style={{ borderBottom: `1px solid ${t.border}` }}>
-          <div style={{ color: t.text, fontWeight: 800, fontSize: 16 }}>Loans &amp; installment deductions</div>
-          <button onClick={onClose} className="grid place-items-center rounded-lg" style={{ width: 30, height: 30, background: t.surface2, border: `1px solid ${t.border}`, color: t.textMuted, cursor: "pointer" }}><IconX size={15} /></button>
-        </div>
-        {inner}
-      </Card>
-    </div>
-  );
-}
 
 /* ---- Loan Management page (Payroll → Loan Management) ---- */
 function LoanManagement({ t }) {
