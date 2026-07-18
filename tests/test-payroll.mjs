@@ -2016,6 +2016,134 @@ await t.test("client payments: is wired — it no longer falls through", async (
   t.ok(!/is not connected to Supabase yet/.test(res.error || ""), "reaches the handler, not the fallthrough");
 });
 
+/* ---------- save_expense_cats (expense category labels, in SHARED app_config) ---------- */
+// app_config is one row per key and holds positions / job_types / issues / solutions / sla /
+// dashboard_verse / hero_goal_pin alongside expense_cats, so the tests that matter most here are
+// the ones proving the write cannot reach any key but its own.
+const CFG_ROWS = [
+  { config_key: "positions", config_value: '["Technician","Lineman"]' },
+  { config_key: "expense_cats", config_value: '["Old Cat"]' },
+  { config_key: "job_types", config_value: '["Installation"]' },
+  { config_key: "sla", config_value: '{"h":24}' },
+];
+const cfgSave = async (payload, { role = "owner", rows = CFG_ROWS.map((r) => ({ ...r })), opts } = {}) => {
+  const was = getME();
+  // allowed_views cleared so canAdd() resolves through ROLE_EDIT rather than a per-user grant —
+  // otherwise whatever ME happened to carry would decide the permission cases.
+  setME({ ...was, role, allowed_views: null });
+  try {
+    const sb = makeFakeSB({ app_config: rows }, opts);
+    window.SB = sb;
+    const res = await API("save_expense_cats", payload);
+    return { sb, res };
+  } finally { setME(was); }
+};
+const cfgWrites = (sb) => sb.calls.filter((c) => c.op === "update" || c.op === "insert" || c.op === "upsert" || c.op === "delete");
+
+await t.test("save cats: the owner replaces the list, writing only the expense_cats row", async () => {
+  const { sb, res } = await cfgSave({ cats: ["Fuel", "Rent", "Power"] }, { role: "owner" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  const w = cfgWrites(sb);
+  t.eq(w.length, 1, "one write");
+  t.eq(w[0].table, "app_config", "on app_config");
+  t.eq(w[0].filters.config_key, "expense_cats", "keyed to expense_cats and nothing else");
+  t.eq(w[0].row.config_value, '["Fuel","Rent","Power"]', "the list is stored as a JSON string — the read parses it");
+  t.ok(!("config_key" in w[0].row), "the key column is not rewritten, only the value");
+});
+
+await t.test("save cats: the CFO may save", async () => {
+  const { res } = await cfgSave({ cats: ["Fuel"] }, { role: "cfo" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+});
+
+await t.test("save cats: the admin officer may save", async () => {
+  const { res } = await cfgSave({ cats: ["Fuel"] }, { role: "admin_officer" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+});
+
+await t.test("save cats: a technician is refused before any write", async () => {
+  const { sb, res } = await cfgSave({ cats: ["Sneaky"] }, { role: "technician" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "Only the finance office can change expense categories.", "message");
+  t.eq(sb.calls.length, 0, "nothing touched — refused before any DB call");
+});
+
+await t.test("save cats: payroll is refused too — finance access is not payroll access", async () => {
+  const { sb, res } = await cfgSave({ cats: ["Sneaky"] }, { role: "payroll" });
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "nothing touched");
+});
+
+await t.test("save cats: NO OTHER config key is ever touched", async () => {
+  const { sb } = await cfgSave({ cats: ["Fuel"] }, { role: "owner" });
+  for (const c of sb.calls) {
+    const key = (c.filters && c.filters.config_key) || (c.row && c.row.config_key);
+    t.eq(key, "expense_cats", `every call names expense_cats, got: ${JSON.stringify(key)}`);
+  }
+  const touched = sb.calls.map((c) => (c.filters && c.filters.config_key) || (c.row && c.row.config_key));
+  t.ok(!touched.includes("positions") && !touched.includes("sla") && !touched.includes("job_types"),
+    "positions / sla / job_types are never named — a shared table must not be clobbered wholesale");
+});
+
+await t.test("save cats: a payload cannot redirect the UPDATE to another config key", async () => {
+  // The key is a module constant, so a caller naming one has nowhere to put it. This is the case
+  // that keeps app_config's other rows out of reach of this action however the payload is shaped.
+  const { sb, res } = await cfgSave({ cats: ["Fuel"], config_key: "positions", key: "sla" }, { role: "owner" });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  const w = cfgWrites(sb)[0];
+  t.eq(w.filters.config_key, "expense_cats", "still expense_cats — the payload's key is ignored entirely");
+});
+
+await t.test("save cats: a payload cannot redirect the INSERT either", async () => {
+  // The two paths are pinned by DIFFERENT things — the update by its .eq(), the insert only by the
+  // constant in the row it builds — so covering one proves nothing about the other. Found by a
+  // surviving mutation: the test above passed while the insert's key was taken from the payload,
+  // which is the path a FIRST save takes, and the one that could create a rogue config row.
+  const rows = CFG_ROWS.filter((r) => r.config_key !== "expense_cats").map((r) => ({ ...r }));
+  const { sb, res } = await cfgSave({ cats: ["Fuel"], config_key: "sla", key: "positions" }, { role: "owner", rows });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  const ins = sb.calls.filter((c) => c.op === "insert");
+  t.eq(ins.length, 1, "the insert path ran");
+  t.eq(ins[0].row.config_key, "expense_cats", "still expense_cats — a payload key cannot clobber or create another row");
+  t.ok(ins[0].row.config_value !== '{"h":24}', "and the sla row's value is nowhere near it");
+});
+
+await t.test("save cats: entries are trimmed, blanks dropped, duplicates collapsed", async () => {
+  const { sb } = await cfgSave({ cats: ["  Fuel  ", "", "Rent", "fuel", "   ", "Rent"] }, { role: "owner" });
+  t.eq(cfgWrites(sb)[0].row.config_value, '["Fuel","Rent"]',
+    "trimmed, blanks gone, and 'fuel' collapsed into 'Fuel' — two spellings would split a report in two");
+});
+
+await t.test("save cats: a first-ever save INSERTs when the key has no row yet", async () => {
+  const rows = CFG_ROWS.filter((r) => r.config_key !== "expense_cats").map((r) => ({ ...r }));
+  const { sb, res } = await cfgSave({ cats: ["Fuel"] }, { role: "owner", rows });
+  t.eq(res.ok, true, `saved, got: ${res.error}`);
+  const ins = sb.calls.filter((c) => c.op === "insert");
+  t.eq(ins.length, 1, "it fell through to an insert");
+  t.eq(ins[0].row.config_key, "expense_cats", "creating the expense_cats row, not another");
+  t.eq(ins[0].row.config_value, '["Fuel"]', "with the new list");
+});
+
+await t.test("save cats: a non-list payload is refused before any write", async () => {
+  for (const bad of [undefined, "Fuel", 42, { 0: "Fuel" }]) {
+    const { sb, res } = await cfgSave({ cats: bad }, { role: "owner" });
+    t.eq(res.ok, false, `${JSON.stringify(bad)} refused`);
+    t.eq(sb.calls.length, 0, `${JSON.stringify(bad)} touched nothing`);
+  }
+});
+
+await t.test("save cats: a silently blocked write (200 + []) is an honest failure", async () => {
+  const { res } = await cfgSave({ cats: ["Fuel"] }, { role: "owner", opts: { blockWrites: "app_config" } });
+  t.eq(res.ok, false, "refused — never a false 'Categories saved'");
+  t.ok(/Nothing changed/.test(res.error), `says so plainly, got: ${res.error}`);
+});
+
+await t.test("save cats: a 42501 on the write is an honest failure", async () => {
+  const { res } = await cfgSave({ cats: ["Fuel"] }, { role: "owner", opts: { errorWrites: "app_config" } });
+  t.eq(res.ok, false, "refused");
+  t.ok(/Could not save the expense categories/.test(res.error), `explains itself, got: ${res.error}`);
+});
+
 const FALLTHROUGH = [];
 
 await t.test("every payroll write is wired — nothing falls through to \"not connected\" any more", async () => {
@@ -2029,7 +2157,7 @@ await t.test("every payroll write is wired — nothing falls through to \"not co
   const PR_ACTIONS = ["pr_save_items", "pr_unlock", "pr_publish", "pr_lock", "pr_save_period",
     "pr_delete_period", "pr_item_approve", "pr_item_contest", "pr_item_reply", "pr_request_print",
     "pr_mark_printed", "pr_set_dayoff", "pr_save_employee", "pr_delete_employee", "pr_save_plan",
-    "pr_delete_plan", "pr_apply_plans", "client_payments"];
+    "pr_delete_plan", "pr_apply_plans", "client_payments", "save_expense_cats"];
   for (const action of PR_ACTIONS) {
     const sb = makeFakeSB({});
     window.SB = sb;

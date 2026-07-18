@@ -662,6 +662,68 @@ async function _supaClientPayments(payload) {
   // Zero payments is a perfectly good answer, and an ok one: the client simply has not paid yet.
   return { ok: true, payments };
 }
+/* ---- Expense category labels (save_expense_cats) ----
+   The Categories modal in ExpensesPage (app.jsx:4088), which sends the WHOLE new list every time —
+   this is a replacement, not an add or a remove, and the handler treats it as one.
+
+   THE CATEGORIES ARE ONLY LABELS. They populate a datalist on the expense form (app.jsx:3882) and
+   nothing else reads them. Removing one does NOT touch a single expense: the category lives on the
+   expense row as its own text (expenses.supplier), so a spent row keeps saying what it said. That
+   is why a destructive-looking edit here is safe, and why this handler never goes near the
+   expenses table.
+
+   app_config IS SHARED, AND THAT IS THE RISK HERE. One row per key, and the other keys are
+   positions, job_types, issues, solutions, sla, dashboard_verse and hero_goal_pin (app.jsx:471) —
+   the Job Orders screens and Settings all read from the same table. So the write is pinned to ONE
+   key: _CFG_EXPENSE_CATS is a module constant, never anything off the payload. A caller cannot
+   name the row it writes, which means no payload can reach `positions` or `sla` through this
+   action however it is shaped.
+
+   config_value is TEXT holding JSON, not a json column — the read parses it (app.jsx:470) — so the
+   list goes out stringified or it comes back as "[object Object]".
+
+   UPDATE THEN INSERT, not upsert. A real .upsert(onConflict: "config_key") is the better shape and
+   is what this should become, but it needs a UNIQUE constraint on config_key to resolve against,
+   and that constraint is unconfirmed — pr_plan_applied's was verified before being relied on and
+   this one has not been. Update-then-insert is correct either way. It degrades safely too: if RLS
+   refuses the update, zero rows come back, the insert is attempted and is refused in turn, and the
+   caller gets an honest failure rather than a false success. */
+const _CFG_EXPENSE_CATS = "expense_cats";
+async function _supaSaveExpenseCats(payload) {
+  const sb = window.SB;
+  // Matches the button that opens this modal (app.jsx:4234) exactly, rather than reading ME.role
+  // the way the payroll handlers do. That difference is deliberate: those mirror an RLS policy that
+  // reads erp_users.role, so can() would have rendered buttons the database then refused. There is
+  // no such policy on app_config, so the app IS the rule here, and the rule the user can see is the
+  // one that should apply — gating tighter than the button would leave a Settings-granted finance
+  // user staring at a Categories button that always fails.
+  if (!canAdd("fin_expense")) return { ok: false, error: "Only the finance office can change expense categories." };
+  const raw = payload && payload.cats;
+  if (!Array.isArray(raw)) return { ok: false, error: "Expense categories must be a list." };
+  // The modal already trims and drops blanks (app.jsx:4088); doing it again here is not distrust of
+  // that screen but of the assumption it is the only caller. Dedupe is case-insensitive because two
+  // spellings of one category split an expense report in two without ever looking wrong.
+  const seen = {};
+  const cats = [];
+  raw.forEach((c) => {
+    const s = String(c == null ? "" : c).trim();
+    const k = s.toLowerCase();
+    if (s && !seen[k]) { seen[k] = 1; cats.push(s); }
+  });
+  const value = JSON.stringify(cats);
+  const { data: hit, error } = await sb.from("app_config")
+    .update({ config_value: value }).eq("config_key", _CFG_EXPENSE_CATS).select("config_key");
+  if (error) return { ok: false, error: "Could not save the expense categories: " + error.message };
+  if (hit && hit.length) return { ok: true, cats };
+  // Nothing updated. Either the key has never been saved, or RLS hid the row from the write — and
+  // the two are indistinguishable from here (200 + [] both ways). The insert settles it: a genuine
+  // first save lands, and a refusal is refused again and reported below rather than passing as ok.
+  const { data: ins, error: insErr } = await sb.from("app_config")
+    .insert({ config_key: _CFG_EXPENSE_CATS, config_value: value }).select("config_key");
+  if (insErr) return { ok: false, error: "Could not save the expense categories: " + insErr.message };
+  if (!ins || !ins.length) return { ok: false, error: "Saving the expense categories was refused by the database. Nothing changed." };
+  return { ok: true, cats };
+}
 // Renewals. Two owners share the renewal_stages row: set_renewal_stage owns `stage`, and
 // set_renewal_followup owns the five follow-up columns. Each writes only its own, so an
 // upsert from one never blanks the other's. account_number is the row key, never a value.
@@ -1858,6 +1920,7 @@ const API = (action, payload) => {
         }
         if (action === "financials") { return await _supaFinancials(); }
         if (action === "client_payments") { return await _supaClientPayments(payload); }
+        if (action === "save_expense_cats") { return await _supaSaveExpenseCats(payload); }
         if (action === "fin_range") {
           const inc = ((payload && payload.kind) || "income") === "income";
           const col = inc ? "paid_at" : "spent_at";

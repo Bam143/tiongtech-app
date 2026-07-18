@@ -638,6 +638,39 @@ const MUTATIONS = [
     active: false
   })`,
   },
+  // ---- save_expense_cats (config-only, but app_config is SHARED with half the app) ----
+  {
+    name: "drop-savecats-permission",
+    why: "any signed-in user rewrites the finance team's expense categories — a technician can empty the list every finance screen picks from, and app_config is the app's only enforcement here",
+    in: "_supaSaveExpenseCats",
+    from: `if (!canAdd("fin_expense")) return {
+    ok: false,
+    error: "Only the finance office can change expense categories."
+  };`,
+    to: "",
+  },
+  {
+    name: "savecats-key-from-payload",
+    why: "the caller names the app_config row it writes, so a save aimed at expense categories can land on positions, job_types, issues, solutions or sla instead — one action becomes a write primitive over every shared setting in the app",
+    in: "_supaSaveExpenseCats",
+    from: `    config_key: _CFG_EXPENSE_CATS,
+    config_value: value
+  }).select("config_key");`,
+    to: `    config_key: payload && payload.config_key || _CFG_EXPENSE_CATS,
+    config_value: value
+  }).select("config_key");`,
+  },
+  {
+    name: "drop-savecats-insert-zerorows",
+    why: "a first-ever save the database silently refused reports 'Categories saved' — the finance team sees their list on screen, it is gone on the next reload, and nothing ever said so",
+    in: "_supaSaveExpenseCats",
+    from: `  if (!ins || !ins.length) return {
+    ok: false,
+    error: "Saving the expense categories was refused by the database. Nothing changed."
+  };
+`,
+    to: "",
+  },
   // ---- client_payments (read-only, but the failure mode is silent and expensive) ----
   {
     name: "clientpays-swallow-error",
