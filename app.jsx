@@ -2223,6 +2223,51 @@ async function _supaApplyPlans(payload) {
   }
   return { ok: true, applied };
 }
+/* ---- update_user (Settings → edit user) ----
+   Writes erp_users and NOTHING ELSE. In particular it does not touch pr_employees, and that is a
+   deliberate refusal rather than an omission. The Settings users read (app.jsx:473) selects only
+   id,username,full_name,role,position,allowed_views — per_day, schedule_id and the pr_employees
+   link are NOT in it — so the edit modal loads every user with per_day 0 and no payroll link. A
+   handler that believed those form fields would overwrite a real daily rate with 0, and would read
+   an unticked box as "remove from payroll" for somebody it had never actually looked up. Pay rate,
+   schedule and roster membership are edited in Payroll → Roster, which loads the real row and goes
+   through _supaSaveEmployee (1878) with its owner/payroll guard. This handler is the wrong place.
+
+   allowed_views is serialised with JSON.stringify because the column is TEXT — the same shape
+   _normPerms parses on the way back in (257) and the same shape login reads. Writing a raw object
+   would let PostgREST send "[object Object]" for a TEXT column, which parses back to null, which
+   means "no grant", which falls back to the ROLE — and for role 'admin' ROLE_VIEWS is "*". A
+   restricted user would be silently promoted to full access by the act of saving them. So the
+   grant is normalised through _normPerms FIRST and refused if it is empty: this handler will not
+   write a value that reads back as "no restrictions".
+
+   Passwords are not here at all. Changing another account's password needs Supabase's admin API
+   (service_role), which cannot exist in a browser client. Rather than ignore a typed password, the
+   caller is told it was not applied — see the flash in UserModal.save. */
+async function _supaUpdateUser(payload) {
+  const sb = window.SB;
+  const id = Number((payload && payload.id) || 0);
+  if (!id) return { ok: false, error: "Missing id" };
+  const fullName = String((payload && payload.full_name) || "").trim();
+  if (!fullName) return { ok: false, error: "A user needs a full name." };
+  // The SAME parse the read uses, so what is stored is what _normPerms will hand back.
+  const av = _normPerms(payload && payload.allowed_views);
+  if (!av) return { ok: false, error: "Refusing to save an empty permission set — a user with no grant falls back to their role, which for an admin is every menu. Pick at least one menu, or choose Full access." };
+  const row = {
+    full_name: fullName,
+    position: String((payload && payload.position) || ""),
+    allowed_views: JSON.stringify(av),
+  };
+  // .select("id") for the reason every write in this file carries one (2305): an RLS USING policy
+  // hides the row from the UPDATE, PostgREST answers 200 with [], and `error` stays null on a write
+  // that never happened. On permissions that is the dangerous direction — the screen would report a
+  // restriction that the database never applied.
+  const { data: hit, error } = await sb.from("erp_users").update(row).eq("id", id).select("id");
+  if (error) return { ok: false, error: "Could not save this user: " + error.message };
+  if (!hit || !hit.length) return { ok: false, error: "Saving this user was refused by the database — your account may not have permission. Nothing changed." };
+  return { ok: true, id, password_ignored: !!String((payload && payload.password) || "").trim() };
+}
+
 const API = (action, payload) => {
   if (window.SB) {
     const sb = window.SB;
@@ -2256,6 +2301,12 @@ const API = (action, payload) => {
         if (action === "pr_save_plan") { return await _supaSavePlan(payload); }
         if (action === "pr_delete_plan") { return await _supaDeletePlan(payload); }
         if (action === "pr_apply_plans") { return await _supaApplyPlans(payload); }
+        if (action === "update_user") { return await _supaUpdateUser(payload); }
+        // create_user stays UNWIRED on purpose, and falls through to the honest "not connected"
+        // error below. A new login needs an auth.users account created alongside the erp_users row,
+        // and signUp() would sign the owner OUT of their own session into the new one. That needs
+        // the admin API (service_role), which cannot be shipped in a browser. Writing only the
+        // erp_users half would produce a user row nobody can ever log in as.
         if (action === "create_client") {
           const { data, error } = await sb.from("clients").insert(_clientPayload(payload || {})).select("id").single();
           if (error) return { ok: false, error: error.message };
@@ -5321,12 +5372,13 @@ const ROLE_OPTIONS = [
 const roleLabel = (r) => (ROLE_OPTIONS.find((x) => x[0] === r) || [r, r])[1];
 
 function UserModal({ t, user, onClose, onSaved }) {
-  const hasPayroll = !!(user && (user.pr_employee_id || Number(user.per_day) > 0));
+  // No payroll fields here any more. This modal never had the data to edit them: the users read
+  // (app.jsx:473) does not select per_day, schedule_id or the pr_employees link, so a "daily rate"
+  // input loaded 0 for everyone and an "Include in weekly payroll" tick was inferred from role
+  // alone. Saving that would have written 0 over a real rate. Payroll → Roster owns those fields.
   const init = {
     username: (user && user.username) || "", password: "", full_name: (user && user.full_name) || "",
     role: (user && user.role) || "admin", position: (user && user.position) || (POSITIONS[0] || ""),
-    in_payroll: user ? (hasPayroll || (user.role === "technician")) : true,
-    per_day: (user && user.per_day) || 0, schedule_id: (user && user.schedule_id) || 1,
   };
   const [form, setForm] = useState(init);
   const _av = _normPerms(user && user.allowed_views);   // parses the TEXT column; null = no grant
@@ -5336,18 +5388,53 @@ function UserModal({ t, user, onClose, onSaved }) {
   const setCap = (id, present, caps) => setPerms((p) => { const cur = { ...(p || {}) }; if (!present) { delete cur[id]; } else { cur[id] = { a: 0, e: 0, d: 0, ...(cur[id] || {}), ...(caps || {}) }; } return cur; });
   const fullPerms = () => { const o = {}; ALL_MENU_IDS.forEach((id) => { o[id] = { a: 1, e: 1, d: 1 }; }); return o; };
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");   // shown IN the modal, which stays open — see save()
   const set = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const lbl = { display: "block", color: t.textFaint, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.05em", fontWeight: 700, marginBottom: 4 };
   const inp = { width: "100%", background: t.surface2, color: t.text, border: `1px solid ${t.border}`, borderRadius: 10, padding: "9px 11px", fontSize: 13, outline: "none" };
+  // Reports what actually happened, and nothing else. This used to `catch (e) {}` the call, throw
+  // the result away, and then call onSaved() — which flashes "Saved" — no matter what came back.
+  // Against Supabase that was a guaranteed lie: update_user had no branch in the dispatcher, so it
+  // RESOLVED { ok:false, "… is not connected to Supabase yet." } rather than throwing, the catch
+  // never fired, and every save announced success while writing nothing. The same rule the rest of
+  // this screen already follows (delUser, resetPw, savePositions at 5455): success is flashed only
+  // when the call SAYS it succeeded.
   const save = async () => {
+    setErr("");
     if (!form.username.trim()) { alert("Username required."); return; }
     if (!user && !form.password.trim()) { alert("Password required for a new user."); return; }
-    if (form.in_payroll && !(Number(form.per_day) > 0)) { alert("Enter a daily rate, or untick “Include in weekly payroll”."); return; }
     if (restricted && Object.keys(perms).length === 0) { alert("Pick at least one menu this user can open, or switch to Full access."); return; }
     if (!window.confirm(user && user.id ? `Save changes to “${form.username}”?` : `Create user “${form.username}”?`)) return;
     setBusy(true);
-    try { await API(user && user.id ? "update_user" : "create_user", { ...form, in_payroll: form.in_payroll ? 1 : 0, allowed_views: restricted ? perms : fullPerms(), id: user && user.id }); } catch (e) {}
-    setBusy(false); onSaved();
+    let res = null;
+    // An explicit whitelist, not `...form`. The spread is how per_day / schedule_id / in_payroll
+    // reached a handler that must never see them, and it would carry any field a future edit adds
+    // to this form straight into a database write without anyone deciding that it should.
+    try {
+      res = await API(user && user.id ? "update_user" : "create_user", {
+        id: user && user.id,
+        username: form.username.trim(),
+        full_name: form.full_name,
+        position: form.position,
+        password: form.password,
+        allowed_views: restricted ? perms : fullPerms(),
+      });
+    } catch (e) { res = { ok: false, error: (e && e.message) || "Save failed." }; }
+    setBusy(false);
+    if (res && res.ok) {
+      // The password caveat rides on the SUCCESS path because the rest of the save did land. Saying
+      // only "Saved" would leave an owner believing they had just changed someone's credential.
+      onSaved(res.password_ignored
+        ? `Saved — but the password was NOT changed. Use the Reset password button on ${form.username}'s row.`
+        : "");
+      return;
+    }
+    // The modal stays OPEN and keeps the edits. Closing it is itself a success signal, and it would
+    // also discard the permission set the owner just built — making them do the work twice to find
+    // out whether it takes the second time.
+    const msg = (res && res.error) || "The server refused the change.";
+    try { console.error("update_user failed:", { id: user && user.id, username: form.username, error: msg }); } catch (e) {}
+    setErr(msg + " Nothing was saved — this user's access is unchanged.");
   };
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 80, display: "grid", placeItems: "center", padding: 16 }}>
@@ -5365,21 +5452,9 @@ function UserModal({ t, user, onClose, onSaved }) {
             <select value={form.position} onChange={(e) => set("position", e.target.value)} style={inp}>{POSITIONS.map((p) => <option key={p} style={{ background: t.surface, color: t.text }}>{p}</option>)}</select>
           </div>
           <div style={{ gridColumn: "1 / -1", marginTop: 2, paddingTop: 10, borderTop: `1px solid ${t.borderSoft}` }}>
-            <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", color: t.text, fontSize: 13, fontWeight: 600 }}>
-              <input type="checkbox" checked={!!form.in_payroll} onChange={(e) => set("in_payroll", e.target.checked)} />
-              Include in weekly payroll
-            </label>
-            <div style={{ color: t.textFaint, fontSize: 11, marginTop: 3 }}>Turn on for anyone paid weekly. This creates/links their payroll record automatically — no separate roster needed.</div>
+            <div style={{ color: t.textMuted, fontSize: 12.5, fontWeight: 600 }}>Payroll</div>
+            <div style={{ color: t.textFaint, fontSize: 11, marginTop: 3 }}>Weekly payroll membership, daily rate and work schedule are managed in <b style={{ color: t.textMuted }}>Payroll → Roster</b>. This screen does not load a user's real pay rate, so it cannot safely edit one.</div>
           </div>
-          {form.in_payroll && (<>
-            <div><label style={lbl}>Daily rate (₱)</label><input type="number" value={form.per_day} onChange={(e) => set("per_day", e.target.value)} style={inp} /></div>
-            <div><label style={lbl}>Work schedule</label>
-              <select value={form.schedule_id} onChange={(e) => set("schedule_id", Number(e.target.value))} style={inp}>
-                <option value={1} style={{ background: t.surface, color: t.text }}>A · Mon–Sat (Sunday duty)</option>
-                <option value={2} style={{ background: t.surface, color: t.text }}>B · Sun–Fri (Sunday regular)</option>
-              </select>
-            </div>
-          </>)}
           <div style={{ gridColumn: "1 / -1", marginTop: 2, paddingTop: 10, borderTop: `1px solid ${t.borderSoft}` }}>
             <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", color: t.text, fontSize: 13, fontWeight: 600 }}>
               <input type="checkbox" checked={!restricted} onChange={(e) => setPerms(e.target.checked ? null : {})} />
@@ -5425,6 +5500,11 @@ function UserModal({ t, user, onClose, onSaved }) {
             )}
           </div>
         </div>
+        {err && (
+          <div style={{ margin: "0 20px", padding: "9px 11px", borderRadius: 10, background: (t.bad || "#b4232a") + "1A", border: `1px solid ${t.bad || "#b4232a"}`, color: t.bad || "#b4232a", fontSize: 12, fontWeight: 600, lineHeight: 1.45 }}>
+            Not saved — {err}
+          </div>
+        )}
         <div className="flex justify-end gap-2 px-5 py-4" style={{ borderTop: `1px solid ${t.border}` }}>
           <button onClick={onClose} style={{ background: t.surface2, color: t.textMuted, border: `1px solid ${t.border}`, borderRadius: 10, padding: "9px 16px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
           <button onClick={save} disabled={busy} style={{ background: t.accent, color: "#04222A", border: "none", borderRadius: 10, padding: "9px 18px", fontSize: 13, fontWeight: 700, cursor: busy ? "default" : "pointer", opacity: busy ? 0.6 : 1 }}>{busy ? "Saving…" : "Save user"}</button>
@@ -5451,7 +5531,10 @@ function SettingsPage({ t }) {
     return () => { alive = false; };
   }, [users]);
   const refresh = async () => { try { const d = await API("bootstrap"); if (d && d.ok) { if (Array.isArray(d.users)) { USERS = d.users; setUsers(d.users); } if (Array.isArray(d.positions)) { POSITIONS = d.positions; setPositions(d.positions); } } } catch (e) {} };
-  const onSaved = () => { setModal(null); setFlash("Saved"); setTimeout(() => setFlash(""), 2500); refresh(); };
+  // Takes a message so a save that landed with a caveat (a typed password that could not be
+  // applied) can say so, instead of a bare "Saved" that overstates what happened. Only ever called
+  // on a confirmed success — UserModal.save keeps the modal open and reports the error otherwise.
+  const onSaved = (msg) => { setModal(null); setFlash(msg || "Saved"); setTimeout(() => setFlash(""), msg ? 8000 : 2500); refresh(); };
   /* delete_user, reset_password and save_positions ALL still fall through to api.php — none of the
      three is in the Supabase dispatcher. That matters for how success is reported, because an
      unwired action does not throw: it RESOLVES { ok:false, "… is not connected to Supabase yet." }

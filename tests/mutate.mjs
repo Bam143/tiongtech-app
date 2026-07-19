@@ -71,6 +71,78 @@ const MUTATIONS = [
     to: `  if (av) return {
     full: true,`,
   },
+  // ---- update_user: saving permissions without widening them (tests/test-access.mjs) ----
+  // The read half is above. This is the write half, and it fails in the more dangerous direction.
+  // allowed_views is TEXT: any grant that does not survive the round trip reads back through
+  // _normPerms as null, which means "no grant", which falls back to the ROLE — and every restricted
+  // user in this database carries role "admin", whose ROLE_VIEWS is "*". So a broken save does not
+  // lock somebody out; it silently hands a restricted technician the whole app. Each mutation here
+  // restores a shape that failure actually took, or could take.
+  {
+    name: "drop-updateuser-branch",
+    suite: "test-access.mjs",
+    why: "the exact shipped bug — update_user has no dispatcher branch, resolves { ok:false, 'not connected' } without throwing, and Save flashes 'Saved' over a write that never happened",
+    from: `        if (action === "update_user") {
+          return await _supaUpdateUser(payload);
+        }
+`,
+    to: "",
+  },
+  {
+    name: "updateuser-writes-raw-object",
+    suite: "test-access.mjs",
+    why: "a raw object into a TEXT column renders '[object Object]', which parses back to null — the saved user silently becomes full-access",
+    from: `    allowed_views: JSON.stringify(av)`,
+    to: `    allowed_views: av`,
+  },
+  {
+    name: "updateuser-allows-empty-grant",
+    suite: "test-access.mjs",
+    why: "an empty permission set stores as '{}', reads back as 'no grant', and falls through to ROLE_VIEWS.admin === '*' — saving 'no menus' would grant every menu",
+    in: "_supaUpdateUser",
+    from: `  if (!av) return {`,
+    to: `  if (false) return {`,
+  },
+  {
+    name: "drop-updateuser-zerorows",
+    suite: "test-access.mjs",
+    in: "_supaUpdateUser",
+    why: "an RLS-blocked write (200 + []) leaves `error` null, so a permission change that never landed is reported as saved",
+    from: `!hit || !hit.length`,
+    to: `false`,
+  },
+  {
+    name: "drop-updateuser-select",
+    suite: "test-access.mjs",
+    why: "without return=representation a silent RLS refusal is undetectable — the screen shows a restriction the database never applied",
+    from: `await sb.from("erp_users").update(row).eq("id", id).select("id")`,
+    to: `await sb.from("erp_users").update(row).eq("id", id)`,
+  },
+  {
+    name: "updateuser-writes-payroll-cols",
+    suite: "test-access.mjs",
+    why: "per_day reaches erp_users from a form that loads 0 for everyone (the users read never selects it), so editing permissions would zero a real daily rate",
+    in: "_supaUpdateUser",
+    from: `    allowed_views: JSON.stringify(av)`,
+    to: `    allowed_views: JSON.stringify(av),
+    per_day: Number(payload && payload.per_day || 0),
+    role: payload && payload.role`,
+  },
+  {
+    name: "drop-updateuser-name-check",
+    suite: "test-access.mjs",
+    in: "_supaUpdateUser",
+    why: "a blank full name is written over a real one, and the Settings list loses the person's name",
+    from: `  if (!fullName) return {`,
+    to: `  if (false) return {`,
+  },
+  {
+    name: "updateuser-hides-password-caveat",
+    suite: "test-access.mjs",
+    why: "a typed password cannot be applied from a browser client; hardcoding the flag false means 'Saved' implies a credential change that never happened",
+    from: `    password_ignored: !!String(payload && payload.password || "").trim()`,
+    to: `    password_ignored: false`,
+  },
   // ---- the write actually landing (silent-write fix) ----
   {
     name: "drop-save-zerorows",
