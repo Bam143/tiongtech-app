@@ -4460,6 +4460,8 @@ async function loadLiveData() {
       due_date: c.due_date || "",
       billing_status: c.billing_status || "",
       active_profile: c.active_profile || "",
+      // last_seen stays NULL rather than "" — the Status column distinguishes "never seen" (—)
+      // from a real timestamp, and "" would parse to an Invalid Date and read as Offline.
       pppoe_username: c.pppoe_username || "",
       pppoe_password: c.pppoe_password || "",
       last_seen: c.last_seen || null
@@ -21586,6 +21588,9 @@ function ClientsView({
     },
     "NAP": c => (c.nap || "").toLowerCase(),
     "Phone": c => (c.phone || "").toLowerCase(),
+    // Sorts by RECENCY, not by the rendered word: a client seen 2 minutes ago and one seen 9
+    // minutes ago both render "Online", and sorting on the label would make them interchangeable.
+    // Never-seen rows sort as 0, so they group at the far end rather than scattering.
     "Status": c => c.last_seen ? new Date(c.last_seen).getTime() : 0
   };
   const sorted = sortKey ? sortRows(filtered, _CLIENT_ACC[sortKey], sortDir) : filtered;
@@ -22053,10 +22058,24 @@ function ClientsView({
       }
     }, (() => {
       const ls = c.last_seen;
-      if (!ls) return /*#__PURE__*/React.createElement("span", { style: { color: t.textFaint, fontSize: 13 } }, "—");
+      if (!ls) return /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.textFaint,
+          fontSize: 13
+        }
+      }, "\u2014");
       const online = (Date.now() - new Date(ls).getTime()) / 60000 <= 10;
       const col = online ? t.good : t.bad;
-      return /*#__PURE__*/React.createElement("span", { className: "rounded-full", style: { background: col + "22", color: col, fontSize: 11, fontWeight: 700, padding: "3px 9px" } }, online ? "Online" : "Offline");
+      return /*#__PURE__*/React.createElement("span", {
+        className: "rounded-full",
+        style: {
+          background: col + "22",
+          color: col,
+          fontSize: 11,
+          fontWeight: 700,
+          padding: "3px 9px"
+        }
+      }, online ? "Online" : "Offline");
     })()), /*#__PURE__*/React.createElement("td", {
       style: {
         padding: "11px 10px",
