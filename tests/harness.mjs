@@ -53,6 +53,18 @@ export function loadApp(appJsPath) {
       // is pinning the enforcement too. canView is captured alongside them for exactly that: the
       // point of the Access column is that it agrees with what the user meets at login.
       +  " _normPerms, _userAccess, canView,"
+      // isAdminOfficer is the position gate, captured alongside canView for the same reason the
+      // pair above is: canView("areas") is defined in terms of it, so a test that pins one without
+      // the other can pass while they disagree. loadLiveData comes out because it is the ONLY
+      // writer of AREAS_ROWS — the mapping is unreachable otherwise, and it is exactly where an id
+      // gets dropped or a blank row survives.
+      +  " isAdminOfficer, loadLiveData,"
+      // Arrows for the same reason as __charts directly above: both are `let` bindings that
+      // loadLiveData reassigns, so a captured value would freeze the empty array they hold at load
+      // and every assertion about the mapping would be made against nothing. Both shapes are
+      // returned together deliberately — AREA_LIST feeding the client-form dropdown unchanged is
+      // the regression this pairing exists to catch.
+      +  " __areas: () => ({ rows: AREAS_ROWS, names: AREA_LIST }),"
       +  " setME: (v) => { ME = v; }, getME: () => ME };\n";
 
   const windowObj = { SB: null, __LIVE__: true, addEventListener() {}, location: { href: "" }, matchMedia: () => ({ matches: false, addEventListener() {} }) };
@@ -149,7 +161,26 @@ export function makeFakeSB(tables = {}, opts = {}) {
     return false;
   };
   const blocked = (table, n) => matches(opts.blockWrites, table, n);
-  const errored = (table, n) => matches(opts.errorWrites, table, n);
+  // The three ways a write fails, and they are genuinely different events rather than three names
+  // for one:
+  //   blockWrites    — 200 + [], the SILENT refusal. RLS hid the row from the returning clause.
+  //                    No error object at all, which is what makes it dangerous: a handler that
+  //                    only checks `error` reads it as success.
+  //   errorWrites    — 42501, a RAISED refusal. RLS WITH CHECK rejected the row outright.
+  //   conflictWrites — 23505, unique_violation. NOT a permission failure — the write was allowed
+  //                    and the data was refused. A handler should turn this into "already exists"
+  //                    rather than a raw database string, so it needs its own simulation.
+  // conflictWrites is checked FIRST: a row can violate a constraint and a policy at once, and
+  // Postgres reports the constraint, so a test that sets both should see 23505.
+  const raiseFor = (table, n) => {
+    if (matches(opts.conflictWrites, table, n)) {
+      return { code: "23505", message: `duplicate key value violates unique constraint "${table}_name_key"` };
+    }
+    if (matches(opts.errorWrites, table, n)) {
+      return { code: "42501", message: `new row violates row-level security policy for table "${table}"` };
+    }
+    return null;
+  };
   return {
     calls,
     // _supaBootstrap opens with sb.auth.getUser(), so a fake without this cannot reach the reads
@@ -224,14 +255,10 @@ export function makeFakeSB(tables = {}, opts = {}) {
             data = q.one ? (h[0] || null) : (q.limit === undefined ? page : page.slice(0, q.limit));
           } else if (WRITES.includes(q.op)) {
             const n = ++writeNo;
-            // A raise beats a return: 42501 arrives with data null whether or not the caller asked
-            // for the rows back, so this cannot live inside the q.returning branch.
-            if (errored(q.table, n)) {
-              return Promise.resolve({
-                data: null,
-                error: { code: "42501", message: `new row violates row-level security policy for table "${q.table}"` },
-              }).then(res, rej);
-            }
+            // A raise beats a return: an error arrives with data null whether or not the caller
+            // asked for the rows back, so this cannot live inside the q.returning branch.
+            const raised = raiseFor(q.table, n);
+            if (raised) return Promise.resolve({ data: null, error: raised }).then(res, rej);
             if (q.returning) {
               data = blocked(q.table, n) ? []                                   // <- the silent refusal
                 : q.op === "insert" ? [{ id: nextId++, ...q.row }]

@@ -1095,6 +1095,68 @@ const MUTATIONS = [
     from: `  row.active = 1;`,
     to: `  row.active = payload && payload.active ? 1 : 0;`,
   },
+
+  // ---- the Areas position gate and add path (tests/test-areas.mjs) ----
+  // The first two are the ones that matter most. Areas is gated on `position` precisely because
+  // `role` cannot carry the decision — ROLE_VIEWS.admin is "*" and most of the company holds role
+  // "admin" — so both mutations below restore the exact leak the gate exists to prevent, and
+  // neither would show up as an error anywhere. The screen would simply appear for the wrong
+  // people, silently.
+  {
+    name: "drop-areas-position-gate",
+    suite: "test-areas.mjs",
+    why: "the guard clause goes and canView falls through to ROLE_VIEWS, whose 'admin' entry is '*' — every technician on role 'admin' gets the Areas screen, and nothing errors to say so",
+    from: `  if (id === "areas") return ME.role === "owner" || isAdminOfficer();\n`,
+    to: "",
+  },
+  {
+    name: "areas-gate-reads-role-not-position",
+    suite: "test-areas.mjs",
+    why: "the position check becomes a role check — the loose role='admin' that means nothing about authority now opens a screen only two people should have, which is the bug the whole feature was shaped to avoid",
+    from: `  return String(ME && ME.position || "").trim() === "Admin Officer";`,
+    to: `  return String(ME && ME.role || "").trim() === "admin";`,
+  },
+  {
+    name: "areas-dup-check-case-sensitive",
+    suite: "test-areas.mjs",
+    why: "'basag' is accepted alongside 'Basag' — the area list shows one place twice, the client-form dropdown splits in two, and every by-area report quietly halves",
+    from: `  const clash = AREAS_ROWS.find(a => a.name.toLowerCase() === name.toLowerCase());`,
+    to: `  const clash = AREAS_ROWS.find(a => a.name === name);`,
+  },
+  {
+    name: "drop-areas-23505-translation",
+    suite: "test-areas.mjs",
+    why: "a duplicate caught by the database shows the raw constraint string instead of 'That area already exists' — the user is handed a Postgres internal and cannot tell what they did wrong",
+    from: `    if (error.code === "23505" || /duplicate key|unique/i.test(error.message || "")) return {
+      ok: false,
+      error: "That area already exists."
+    };\n`,
+    to: "",
+  },
+  {
+    name: "drop-areas-empty-insert-check",
+    suite: "test-areas.mjs",
+    why: "a silently refused insert (200 + [], RLS hid the row) reports success — the screen flashes 'Added' for a row that does not exist, and the area is gone on the next reload",
+    from: `  if (!data || !data.length) return {
+    ok: false,
+    error: "Adding the area was refused by the database. Nothing changed."
+  };\n`,
+    to: "",
+  },
+  {
+    name: "drop-areas-row-ids",
+    suite: "test-areas.mjs",
+    why: "AREAS_ROWS loses the ids it exists to carry — AREA_LIST already holds the names, so rename and delete would have no row key to write against",
+    from: `      id: a && a.id != null ? a.id : null,\n`,
+    to: "",
+  },
+  {
+    name: "areas-mapping-keeps-blanks",
+    suite: "test-areas.mjs",
+    why: "a blank or null area name survives into the list — it renders as an empty row on the Areas screen and as an empty option in the client-form dropdown, which is selectable and saves an empty area",
+    from: `    })).filter(a => a.name).sort((a, b) => a.name.localeCompare(b.name));`,
+    to: `    })).sort((a, b) => a.name.localeCompare(b.name));`,
+  },
 ];
 
 const APP = process.argv[2] || "app.js";

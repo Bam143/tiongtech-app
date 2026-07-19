@@ -4,8 +4,8 @@
 
 ```sh
 npm install     # once
-npm test        # 47 tests, ~1 second
-npm run mutate  # 14 mutations — proves the suite can actually fail (~20s)
+npm test        # 323 tests, ~2 seconds
+npm run mutate  # 114 mutations — proves the suites can actually fail (~2 min)
 ```
 
 To rebuild `app.js` after editing `app.jsx`:
@@ -19,7 +19,23 @@ Supabase project and needs credentials. See "The live RLS test" below.
 
 ## What this covers
 
-One suite today: **`pr_save_items`** — the Payroll screen's Save button, wired to Supabase in
+Three suites:
+
+- **`test-payroll.mjs`** — `pr_save_items` and the payroll writes around it (detailed below).
+- **`test-access.mjs`** — the Settings "Access" column and the rule that it must agree with what
+  `canView()` enforces at login. It exists because `erp_users.allowed_views` is a TEXT column, so
+  an unparsed grant read as "no restrictions" and showed a restricted user as *Full access*.
+- **`test-areas.mjs`** — the Areas screen: the `position` gate, and the add path behind it. Areas
+  is the first screen gated on **position** rather than role or an `allowed_views` grant, because
+  role cannot carry the decision — `ROLE_VIEWS.admin` is `"*"` and most of the company holds role
+  `admin` with their real job title in `position`. One guard clause in `canView` is the whole
+  barrier, and a regression there is silent: the nav item just appears for someone it shouldn't.
+  The suite also covers the three ways the database can refuse a write, two of which don't raise
+  (a silent 200 + `[]`, and a 23505 unique violation).
+
+### The payroll suite in detail
+
+**`pr_save_items`** — the Payroll screen's Save button, wired to Supabase in
 `API()` inside `app.jsx`. It checks that a Save:
 
 - **updates** an existing row and **inserts** a draft one, keyed by `(period_id, employee_id)`
@@ -127,8 +143,24 @@ does this for you: it breaks one guard at a time and asserts the suite goes red 
 mutation reported **SURVIVED** is a hole — that behaviour is unprotected. Add a mutation whenever
 you add a guard worth keeping.
 
-One thing about the **fake Supabase** (`makeFakeSB`) is worth knowing before you write a test
-against an upsert:
+**A write can fail three ways, and the fake simulates each separately.** They are different
+events, not three names for one, and a handler usually has to treat them differently:
+
+| option | what it simulates | shape |
+| --- | --- | --- |
+| `blockWrites` | RLS `USING` hid the row from the returning clause | 200 + `[]`, **no error object** |
+| `errorWrites` | RLS `WITH CHECK` rejected the row | raises **42501** |
+| `conflictWrites` | a UNIQUE constraint rejected the data | raises **23505** |
+
+`blockWrites` is the dangerous one: there is no error to check, so a handler that only tests
+`error` reports success for a write that never landed. `conflictWrites` is not a permission
+failure at all — the write was allowed and the *data* was refused — so a handler should usually
+translate it into something a user can act on ("that already exists") rather than surfacing the
+constraint name. When both `conflictWrites` and `errorWrites` match, the conflict wins, because
+that is what Postgres reports.
+
+Two more things about the **fake Supabase** (`makeFakeSB`) are worth knowing before you write a
+test against an upsert:
 
 **It resolves on the conflict key.** An upsert is matched against the columns named in
 `{ onConflict: "a,b" }` — not against `.eq()` filters, which an upsert does not carry. A match
