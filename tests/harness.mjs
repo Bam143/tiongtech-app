@@ -48,6 +48,11 @@ export function loadApp(appJsPath) {
       // reassigns, so capturing them by value would freeze whatever they held at load. These are
       // the three that used to carry demo chart data, and the only way to assert it is gone.
       +  " __charts: () => ({ cashFlow, income, expenses }),"
+      // The access resolvers. _normPerms/_userAccess are what the Settings screen renders from and
+      // what canView() enforces with — the same pair, deliberately, so a test that pins the label
+      // is pinning the enforcement too. canView is captured alongside them for exactly that: the
+      // point of the Access column is that it agrees with what the user meets at login.
+      +  " _normPerms, _userAccess, canView,"
       +  " setME: (v) => { ME = v; }, getME: () => ME };\n";
 
   const windowObj = { SB: null, __LIVE__: true, addEventListener() {}, location: { href: "" }, matchMedia: () => ({ matches: false, addEventListener() {} }) };
@@ -147,6 +152,11 @@ export function makeFakeSB(tables = {}, opts = {}) {
   const errored = (table, n) => matches(opts.errorWrites, table, n);
   return {
     calls,
+    // _supaBootstrap opens with sb.auth.getUser(), so a fake without this cannot reach the reads
+    // at all — it dies on `undefined.getUser` and the dispatcher reports it as a failed bootstrap,
+    // which looks like a bug in the code under test rather than a gap in the fake.
+    // opts.uid is the signed-in auth_uid; omit it to exercise the signed-out branch.
+    auth: { getUser: async () => ({ data: { user: opts.uid ? { id: opts.uid } : null } }) },
     from(table) {
       const q = { table, filters: {} };
       const hits = () => (db[q.table] || []).filter((r) =>
@@ -181,6 +191,10 @@ export function makeFakeSB(tables = {}, opts = {}) {
         // ledger means every total quietly understates itself once the table outgrows one page.
         // INCLUSIVE at both ends, like the real thing: .range(0, 999) is the first thousand rows.
         range(from, to) { q.from = Number(from) || 0; q.to = Number(to); return b; },
+        // PostgREST's LIMIT. _supaBootstrap's payroll-link read (app.jsx:429) uses .limit(1) rather
+        // than .single(), because "this user has no pr_employees row" is an ordinary answer there,
+        // not an error — so it wants [] back, not a raise.
+        limit(n) { q.limit = Number(n); return b; },
         update(row) { q.op = "update"; q.row = row; return b; },
         insert(row) { q.op = "insert"; q.row = row; return b; },
         delete() { q.op = "delete"; return b; },
@@ -190,6 +204,11 @@ export function makeFakeSB(tables = {}, opts = {}) {
         upsert(row, opts) { q.op = "upsert"; q.row = row; q.opts = opts; return b; },
         // PostgREST semantics: one row or null, and no error when there is no match.
         maybeSingle() { q.one = true; return b; },
+        // The real .single() RAISES when the match isn't exactly one row, where .maybeSingle()
+        // returns null. Nothing under test depends on that difference — _supaBootstrap's `me`
+        // read is keyed on auth_uid, which is unique — so this deliberately behaves like
+        // maybeSingle. If a handler ever relies on single() erroring, this has to grow teeth.
+        single() { q.one = true; return b; },
         then(res, rej) {
           // gte is recorded alongside filters for the same reason opts is: a test has to be able to
           // assert WHAT was sent, not just that something was. On a whole-table delete the filter
@@ -201,7 +220,8 @@ export function makeFakeSB(tables = {}, opts = {}) {
             const h = hits();
             // A ranged read returns that slice, so _supaAll's loop terminates the way it does in
             // production: it stops when a page comes back shorter than the step it asked for.
-            data = q.one ? (h[0] || null) : (q.to === undefined ? h : h.slice(q.from, q.to + 1));
+            const page = q.to === undefined ? h : h.slice(q.from, q.to + 1);
+            data = q.one ? (h[0] || null) : (q.limit === undefined ? page : page.slice(0, q.limit));
           } else if (WRITES.includes(q.op)) {
             const n = ++writeNo;
             // A raise beats a return: 42501 arrives with data null whether or not the caller asked
