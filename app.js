@@ -507,6 +507,16 @@ function _permHas(p, cap) {
     return !!(c && c[cap]);
   });
 }
+// Mirrors the database's is_admin_officer(), which is the WITH CHECK half of the write policy on
+// `areas`. Exact match on the label: Settings sets `position` from a <select> over POSITIONS
+// (app.jsx:5524), so a stored value is one of those strings verbatim, and a looser compare here
+// would only ever admit a hand-edited row that the policy then refuses anyway.
+// `role` is deliberately NOT consulted. Most staff carry role "admin" while their real job title
+// lives in `position` (see the _userAccess comment), so role "admin" says almost nothing about
+// authority — keying off it is exactly the leak this helper exists to avoid.
+function isAdminOfficer() {
+  return String(ME && ME.position || "").trim() === "Admin Officer";
+}
 function canView(id) {
   if (id === "salary" && ME.pr_employee_id) return true;
   if (typeof id === "string" && id.slice(0, 3) === "rn_") id = "renew"; // pipeline stages inherit Renewals access
@@ -516,6 +526,15 @@ function canView(id) {
     const own = _myPerms();
     return own ? "owner" in own : false; // everyone else (incl. admins) only if granted in Settings
   }
+  // Areas is position-gated, not grant-gated. It is deliberately absent from ACCESS_MENUS, so no
+  // allowed_views entry can ever exist for it — which means without this line the ROLE_VIEWS
+  // fallback below would answer, and ROLE_VIEWS.admin is "*", handing the screen to most of the
+  // company. Answering here, ahead of both, is what holds it to the two people the RLS policy on
+  // `areas` will actually let write. Same shape as the `owner` special case directly above.
+  // Every gate downstream reads through canView — the nav item (app.jsx:9780), the route guard
+  // and the TITLES lookup (9823-9824), and the effect that evicts an illegal view (9706) — so a
+  // stale localStorage "tt_view" cannot render this screen for someone who may not see it.
+  if (id === "areas") return ME.role === "owner" || isAdminOfficer();
   if (ME.role === "owner") return true;
   const av = _myPerms();
   if (av) return id in av;
@@ -786,6 +805,11 @@ let CFG_SLA = {
 // Managed area names from the `areas` table, filled by bootstrap. Empty until then —
 // there is no seeded fallback on purpose, so a stale hardcoded list can never resurface.
 let AREA_LIST = [];
+// The same rows with their ids kept, for the Areas management screen. AREA_LIST stays names-only
+// and untouched: it feeds the client/PESOWiFi form dropdowns (app.jsx:8021, 8293), which store
+// clients.area as TEXT and have no use for an id. Two shapes rather than one so the management
+// screen can grow row-keyed edits later without every form consumer having to change with it.
+let AREAS_ROWS = [];
 const PLANS = ["25MBPS-ISP1", "50MBPS-ISP1", "100MBPS-ISP1", "200MBPS-BIZ"];
 const OLT_STANDARDS = ["IEEE 802.3ah (EPON)", "ITU-T G.984 (GPON)", "ITU-T G.9807 (XGS-PON)"];
 let techAccounts = [{
@@ -2102,6 +2126,66 @@ async function _supaSaveExpenseCats(payload) {
   return {
     ok: true,
     cats
+  };
+}
+// Add one area. ADD ONLY — rename and delete are not wired yet, so nothing here updates or
+// removes a row.
+//
+// Unlike _supaSaveExpenseCats above, this gate MIRRORS the database rather than the button:
+// `areas` carries a real policy (owner + is_admin_officer()), so a looser app gate would render an
+// Add button the database then refuses. That is the case the comment on that function calls out as
+// the reason the two differ — there is no policy on app_config, so the app is the rule there; here
+// it is not, and the app's job is to agree with the rule rather than invent one.
+async function _supaSaveArea(payload) {
+  const sb = window.SB;
+  if (!(ME.role === "owner" || isAdminOfficer())) return {
+    ok: false,
+    error: "Only the owner or an Admin Officer can add areas."
+  };
+  const name = String((payload && payload.name) != null ? payload.name : "").trim();
+  if (!name) return {
+    ok: false,
+    error: "Enter an area name."
+  };
+  // Case-insensitive, and so deliberately stricter than the UNIQUE constraint, which compares
+  // exactly and would happily hold both "Anabu" and "anabu". Two casings of one area is not a
+  // duplicate to Postgres but it is to a human: it splits the client-form dropdown into two
+  // entries that look like a bug and silently splits every by-area report in half.
+  const clash = AREAS_ROWS.find(a => a.name.toLowerCase() === name.toLowerCase());
+  if (clash) return {
+    ok: false,
+    error: "That area already exists."
+  };
+  const {
+    data,
+    error
+  } = await sb.from("areas").insert({
+    name
+  }).select("id,name");
+  // 23505 = unique_violation. Reached when the local check above missed it — an exact-case
+  // duplicate added by someone else since this tab last loaded. Same message either way; from the
+  // user's side the two are the same event.
+  if (error) {
+    if (error.code === "23505" || /duplicate key|unique/i.test(error.message || "")) return {
+      ok: false,
+      error: "That area already exists."
+    };
+    return {
+      ok: false,
+      error: "Could not add the area: " + error.message
+    };
+  }
+  // The insert half of the expense-cats pattern, and the reason it is here: an empty 200 is not
+  // success. There is no update half to try first — an add has nothing to fall back to — so a
+  // returning clause that comes back empty means the row was not confirmed written, and saying so
+  // is the whole point. Reporting ok here would flash "Added" over a row that does not exist.
+  if (!data || !data.length) return {
+    ok: false,
+    error: "Adding the area was refused by the database. Nothing changed."
+  };
+  return {
+    ok: true,
+    area: data[0]
   };
 }
 // Renewals. Two owners share the renewal_stages row: set_renewal_stage owns `stage`, and
@@ -4137,6 +4221,9 @@ const API = (action, payload) => {
         if (action === "save_expense_cats") {
           return await _supaSaveExpenseCats(payload);
         }
+        if (action === "save_area") {
+          return await _supaSaveArea(payload);
+        }
         if (action === "import_expenses") {
           return await _supaImportExpenses(payload);
         }
@@ -4614,6 +4701,12 @@ async function loadLiveData() {
     }));
     // Names only — the client form stores clients.area as text, so the id is not needed yet.
     if (Array.isArray(d.areas)) AREA_LIST = d.areas.map(a => a && a.name != null ? String(a.name).trim() : "").filter(Boolean).sort((a, b) => a.localeCompare(b));
+    // Same rows, ids kept, for the Areas screen. Derived separately from the line above rather than
+    // by mapping over it, so a future change to one shape cannot silently reshape the other.
+    if (Array.isArray(d.areas)) AREAS_ROWS = d.areas.map(a => ({
+      id: a && a.id != null ? a.id : null,
+      name: a && a.name != null ? String(a.name).trim() : ""
+    })).filter(a => a.name).sort((a, b) => a.name.localeCompare(b.name));
     if (Array.isArray(d.jobTypes) && d.jobTypes.length) CFG_JOBTYPES = d.jobTypes;
     if (Array.isArray(d.issues) && d.issues.length) CFG_ISSUES = d.issues;
     if (Array.isArray(d.solutions) && d.solutions.length) CFG_SOLUTIONS = d.solutions;
@@ -25213,6 +25306,188 @@ function TechniciansView({
     }
   }, "Only the first name from \"Full name\" appears in job-order dropdowns and the scorecard. The technician signs in with the username and password set here."))));
 }
+
+/* Areas — the managed list behind the area dropdown on the client and PESOWiFi forms.
+   ADD ONLY for now: no rename, no delete. Both are follow-up steps, and delete especially needs a
+   decision about the clients already carrying the name (clients.area is TEXT, not an FK, so
+   removing a row here would orphan the label rather than cascade). Not offering the buttons is
+   better than offering ones that do not work yet.
+
+   Not a CatalogList: that component persists a whole array into an app_config JSON blob, whereas
+   these are real rows with ids and a UNIQUE constraint, added one at a time. */
+function AreasView({
+  t
+}) {
+  const [val, setVal] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [flash, setFlash] = useState(null); // { ok, text } — never set except from a settled save
+  // Read the module global at render instead of seeding useState from it. The confirmed-save path
+  // below leaves the refresh to _save, which re-runs the bootstrap, rewrites AREAS_ROWS and
+  // re-renders this screen; a useState copy would freeze the list at mount and the newly added
+  // area would never show up in it.
+  const rows = [...AREAS_ROWS].sort((a, b) => a.name.localeCompare(b.name));
+  const mayAdd = ME.role === "owner" || isAdminOfficer();
+  const inUse = name => clients.filter(c => (c.area || "") === name).length;
+  const say = (ok, text, ms) => {
+    setFlash({
+      ok,
+      text
+    });
+    setTimeout(() => setFlash(null), ms);
+  };
+  const add = async () => {
+    const name = val.trim();
+    if (!name || busy) return;
+    setBusy(true);
+    let res = null;
+    try {
+      res = await _save("save_area", {
+        name
+      });
+    } catch (e) {
+      res = {
+        ok: false,
+        error: e && e.message || "Add failed."
+      };
+    }
+    setBusy(false);
+    // Only a confirmed write flashes success, and nothing optimistic is put into the list at any
+    // point — the refresh _save schedules is what makes the row appear. So what is on screen is
+    // always what came back from the database, never what was hoped for.
+    if (res && res.ok) {
+      setVal("");
+      say(true, `“${name}” added`, 2500);
+      return;
+    }
+    const why = res && res.offline ? "the app is not connected to the database." : res && res.error || "the server refused the change.";
+    say(false, "NOT added — " + why, 7000);
+  };
+  return /*#__PURE__*/React.createElement("div", {
+    className: "space-y-4"
+  }, flash && /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 rounded-xl",
+    style: {
+      background: flash.ok ? t.goodSoft : t.badSoft,
+      color: flash.ok ? t.good : t.bad,
+      padding: "10px 14px",
+      fontSize: 13,
+      fontWeight: 600
+    }
+  }, flash.ok ? /*#__PURE__*/React.createElement(CheckCircle2, {
+    size: 16
+  }) : /*#__PURE__*/React.createElement(AlertTriangle, {
+    size: 16
+  }), flash.text), /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-2 md:grid-cols-3 gap-3.5"
+  }, /*#__PURE__*/React.createElement(StatTile, {
+    t: t,
+    label: "Areas",
+    value: rows.length,
+    icon: MapPin,
+    tone: "accent"
+  }), /*#__PURE__*/React.createElement(StatTile, {
+    t: t,
+    label: "In use",
+    value: rows.filter(a => inUse(a.name) > 0).length,
+    icon: CheckCircle2,
+    tone: "good",
+    sub: "on \u22651 client"
+  }), /*#__PURE__*/React.createElement(StatTile, {
+    t: t,
+    label: "Unused",
+    value: rows.filter(a => inUse(a.name) === 0).length,
+    icon: Clock,
+    tone: "warn"
+  })), /*#__PURE__*/React.createElement(Card, {
+    t: t,
+    style: {
+      padding: 0,
+      overflow: "hidden"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "px-5 pt-4 pb-3",
+    style: {
+      borderBottom: `1px solid ${t.border}`
+    }
+  }, /*#__PURE__*/React.createElement(SectionTitle, {
+    t: t
+  }, "Areas")), /*#__PURE__*/React.createElement("ul", {
+    style: {
+      listStyle: "none",
+      margin: 0,
+      padding: 0
+    }
+  }, rows.map((a, i) => {
+    const n = inUse(a.name);
+    return /*#__PURE__*/React.createElement("li", {
+      key: a.id != null ? a.id : a.name + i,
+      className: "flex items-center justify-between px-5 gap-3",
+      style: {
+        padding: "12px 20px",
+        borderBottom: i === rows.length - 1 ? "none" : `1px solid ${t.borderSoft}`
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        minWidth: 0
+      }
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: t.text,
+        fontWeight: 600,
+        fontSize: 13.5
+      }
+    }, a.name), /*#__PURE__*/React.createElement("div", {
+      style: {
+        color: t.textFaint,
+        fontSize: 11.5
+      }
+    }, n, " client", n === 1 ? "" : "s")));
+  }), rows.length === 0 && /*#__PURE__*/React.createElement("li", {
+    style: {
+      padding: "20px",
+      textAlign: "center",
+      color: t.textFaint,
+      fontSize: 13
+    }
+  }, "No areas yet \u2014 add the first one below.")), mayAdd && /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-2 px-5 py-3",
+    style: {
+      borderTop: `1px solid ${t.border}`
+    }
+  }, /*#__PURE__*/React.createElement("input", {
+    value: val,
+    onChange: e => setVal(e.target.value),
+    onKeyDown: e => e.key === "Enter" && add(),
+    placeholder: "New area name",
+    disabled: busy,
+    className: "flex-1 rounded-xl outline-none",
+    style: {
+      background: t.surface2,
+      color: t.text,
+      border: `1px solid ${t.border}`,
+      padding: "9px 12px",
+      fontSize: 13,
+      opacity: busy ? 0.6 : 1
+    }
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: add,
+    disabled: busy || !val.trim(),
+    className: "inline-flex items-center gap-1.5",
+    style: {
+      ...adminBtn(t, true),
+      opacity: busy || !val.trim() ? 0.55 : 1,
+      cursor: busy || !val.trim() ? "default" : "pointer"
+    }
+  }, /*#__PURE__*/React.createElement(Plus, {
+    size: 15
+  }), busy ? "Adding…" : "Add"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: t.textFaint,
+      fontSize: 11.5,
+      lineHeight: 1.5
+    }
+  }, "Areas added here appear in the area dropdown on the client and PESOWiFi forms. Renaming and deleting are not available yet."));
+}
 function JobTypesView({
   t
 }) {
@@ -25449,6 +25724,15 @@ const NAV = [{
   id: "coverage",
   label: "Map Coverage",
   icon: MapIcon
+},
+// Position-gated, not grant-gated: canView("areas") answers on role/position alone and is
+// deliberately not backed by an ACCESS_MENUS entry, so this item renders for the owner and
+// Admin Officers and for nobody else. The generic `if (!canView(n.id)) return null` below is
+// what enforces it — no special case in the sidebar.
+{
+  id: "areas",
+  label: "Areas",
+  icon: MapPin
 }, {
   id: "nap",
   label: "PON Management",
@@ -25521,6 +25805,7 @@ const TITLES = {
   solutions: ["Solutions", "Standard fixes linked to each issue"],
   sla: ["SLA Rules", "Response and resolution targets per job type"],
   coverage: ["Map Coverage", "Fiber footprint across the service area"],
+  areas: ["Areas", "The managed area list behind the client area dropdown"],
   nap: ["PON Management", "OLT, PON and NAP capacity across the network"],
   fin: ["Financial Dashboard", "Cash, revenue, expenses and margin"],
   income: ["Income", "Payments received — search, add, edit"],
@@ -26886,6 +27171,7 @@ function App() {
     solutions: SolutionsView,
     sla: SlaView,
     coverage: MapCoverage,
+    areas: AreasView,
     nap: PonNap,
     fin: Financials,
     income: IncomePage,
