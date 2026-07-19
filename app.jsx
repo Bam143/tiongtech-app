@@ -7934,6 +7934,11 @@ function ClientsView({ t }) {
   const [editing, setEditing] = useState(null);
 
   const fullName = (c) => `${c.first_name} ${c.last_name}`.trim();
+  // Area options come from the loaded clients, not a fixed list, so the dropdown
+  // always covers what is actually in the data (and stays right after imports).
+  // Raw values, not trimmed: the filter below compares c.area exactly, so an option
+  // must be a value some row actually holds or it would match nothing.
+  const areas = Array.from(new Set(rows.map((c) => c.area).filter((a) => a && String(a).trim()))).sort();
   const filtered = rows.filter((c) => {
     if (areaF !== "All" && c.area !== areaF) return false;
     if (statusF !== "All") {
@@ -8057,7 +8062,7 @@ function ClientsView({ t }) {
           </div>
           <select value={areaF} onChange={(e) => { setAreaF(e.target.value); setPage(0); }} style={{ ...selStyle, width: "auto", marginTop: 0 }}>
             <option value="All">All areas</option>
-            {AREAS.map((a) => <option key={a}>{a}</option>)}
+            {areas.map((a) => <option key={a}>{a}</option>)}
           </select>
           <select value={statusF} onChange={(e) => { setStatusF(e.target.value); setPage(0); }} style={{ ...selStyle, width: "auto", marginTop: 0 }}>
             <option value="All">All statuses</option>
