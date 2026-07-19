@@ -1157,6 +1157,78 @@ const MUTATIONS = [
     from: `    })).filter(a => a.name).sort((a, b) => a.name.localeCompare(b.name));`,
     to: `    })).sort((a, b) => a.name.localeCompare(b.name));`,
   },
+
+  // ---- the Areas rename cascade (tests/test-areas.mjs) ----
+  // The first is the one that matters: renaming is two tables kept in step, and the ONLY thing
+  // holding them together is that the app makes a single call into a function that owns both
+  // updates. Everything else here is the honest-reporting layer around it.
+  {
+    name: "rename-does-two-updates-not-one-rpc",
+    suite: "test-areas.mjs",
+    why: "the rename stops being atomic — areas is updated in one round trip and clients in another, so a dropped connection between them leaves every client on that area pointing at a name that no longer exists, and nothing reports it",
+    in: "_supaRenameArea",
+    from: `  const {
+    data,
+    error
+  } = await sb.rpc("rename_area", {
+    old_name: oldName,
+    new_name: newName
+  });`,
+    to: `  await sb.from("areas").update({ name: newName }).eq("name", oldName);
+  const {
+    data,
+    error
+  } = await sb.from("clients").update({ area: newName }).eq("area", oldName).select("id");`,
+  },
+  {
+    name: "rename-zero-clients-reads-falsy",
+    suite: "test-areas.mjs",
+    why: "renaming an area no client is on yet reports 'refused by the database' — but the rename DID happen, so the screen contradicts the database until the next reload and the user renames it again",
+    in: "_supaRenameArea",
+    from: `  if (data == null) return {`,
+    to: `  if (!data) return {`,
+  },
+  {
+    name: "drop-rename-null-guard",
+    suite: "test-areas.mjs",
+    why: "an rpc that comes back null with no error reads as a successful rename of 0 clients — the RPC equivalent of the empty-200 the add path guards against",
+    in: "_supaRenameArea",
+    from: `  if (data == null) return {
+    ok: false,
+    error: "Renaming the area was refused by the database. Nothing changed."
+  };\n`,
+    to: "",
+  },
+  {
+    name: "drop-rename-permission",
+    suite: "test-areas.mjs",
+    why: "anyone reaching the handler can rename an area and rewrite the area column on every client carrying it — the app stops agreeing with the function's own gate, so the refusal only ever arrives from the database",
+    in: "_supaRenameArea",
+    from: `  if (!(ME.role === "owner" || isAdminOfficer())) return {
+    ok: false,
+    error: "Only the owner or an Admin Officer can rename an area."
+  };\n`,
+    to: "",
+  },
+  {
+    name: "rename-selfcollision-blocks-case-fix",
+    suite: "test-areas.mjs",
+    why: "the row being renamed is no longer excluded from the duplicate check, so correcting the CASE of a name ('basag' to 'Basag') collides with itself and can never be fixed from the screen",
+    in: "_supaRenameArea",
+    from: `  const clash = AREAS_ROWS.find(a => a.name.toLowerCase() === newName.toLowerCase() && a.name !== oldName);`,
+    to: `  const clash = AREAS_ROWS.find(a => a.name.toLowerCase() === newName.toLowerCase());`,
+  },
+  {
+    name: "drop-rename-23505-translation",
+    suite: "test-areas.mjs",
+    why: "a rename that collides in the database shows the raw constraint string instead of 'That area already exists' — a Postgres internal the user cannot act on",
+    in: "_supaRenameArea",
+    from: `    if (error.code === "23505" || /already exists|duplicate key|unique/i.test(error.message || "")) return {
+      ok: false,
+      error: "That area already exists."
+    };\n`,
+    to: "",
+  },
 ];
 
 const APP = process.argv[2] || "app.js";

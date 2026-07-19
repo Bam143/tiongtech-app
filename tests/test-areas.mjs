@@ -20,7 +20,7 @@ import { loadApp, makeFakeSB, makeSuite } from "./harness.mjs";
 
 const APP_JS = process.argv[2] || "app.js";
 const { API, window, canView, isAdminOfficer, loadLiveData, __areas, setME } = loadApp(APP_JS);
-const t = makeSuite("areas / position gate + add");
+const t = makeSuite("areas / position gate + add + rename");
 
 // As the live database actually holds them: an Admin Officer carries role "admin" — the same role
 // as almost everyone — and is distinguished ONLY by position. That is the whole point of the gate,
@@ -233,16 +233,202 @@ await t.test("a RAISED refusal (RLS WITH CHECK, 42501) reports failure too", asy
   t.ok(/Could not add the area/.test(res.error || ""), `expected the DB reason, got: ${res.error}`);
 });
 
-// Rename and delete are not built yet. If either arrives without its own tests, this is the line
-// that should fail and say so.
-await t.test("rename and delete are still unwired — no action pretends to work", async () => {
+// Deliberately narrowed when rename was built: rename_area used to be listed here and now has its
+// own section below. delete_area stays, and stays for the same reason — clients.area is TEXT, not
+// an FK, so deleting an area orphans the label on every client carrying it rather than cascading.
+// When delete is built, move it out of this list the same way, do not delete the test.
+await t.test("delete is still unwired — no action pretends to work", async () => {
   setME(owner);
   arm();
-  for (const action of ["update_area", "delete_area", "rename_area"]) {
+  for (const action of ["update_area", "delete_area"]) {
     const res = await API(action, { id: 1, name: "X" });
     t.eq(res.ok, false, `${action} must not claim success`);
     t.ok(/not connected/i.test(res.error || ""), `${action} should say it is unwired, got: ${res.error}`);
   }
+});
+
+/* ---- 5. rename, and the cascade to clients -------------------------------------------------
+   WHAT THESE CAN AND CANNOT PROVE. Atomicity is a property of Postgres, and there are no
+   transactions in this file — makeFakeSB has none. So the rollback case below models the OUTCOME
+   of a rollback (the function raises, and neither table moved) rather than proving one occurred.
+   What IS proved here, and what actually protects the data from this side, is that the app makes
+   exactly ONE database call: a second round trip is how a browser produces a half-applied rename,
+   and no amount of care in the SQL prevents the app from reintroducing it. Genuine transactional
+   proof needs the real database — tests/rls-live.mjs — against tests/sql/rename_area.sql.        */
+
+// Stands in for the function body, applied to the fixture the fake reads from. Mirrors
+// tests/sql/rename_area.sql: both tables move together, and the count returned is the clients row
+// count. Raising BEFORE any mutation is what a rollback looks like from the client's side.
+const renameFn = (db, fail) => (params) => {
+  if (fail) return { error: fail };
+  const { old_name: from, new_name: to } = params;
+  (db.areas || []).forEach((a) => { if (a.name === from) a.name = to; });
+  let n = 0;
+  (db.clients || []).forEach((c) => { if (c.area === from) { c.area = to; n++; } });
+  return n;
+};
+
+// A fixture both tables share, so an assertion can look at each after the call.
+const renameFixture = () => ({
+  areas: [{ id: 1, name: "Basag" }, { id: 2, name: "Anabu" }],
+  clients: [
+    { id: 10, area: "Basag" }, { id: 11, area: "Basag" }, { id: 12, area: "Basag" },
+    { id: 13, area: "Anabu" }, { id: 14, area: null },
+  ],
+});
+
+await t.test("a rename updates BOTH tables and returns the client count", async () => {
+  await seed([{ id: 1, name: "Basag" }, { id: 2, name: "Anabu" }]);
+  setME(officer);
+  const db = renameFixture();
+  window.SB = makeFakeSB(db, { rpcs: { rename_area: renameFn(db) } });
+  const res = await API("rename_area", { old_name: "Basag", new_name: "Basag Proper" });
+  t.eq(res.ok, true, "renamed");
+  t.eq(res.clients, 3, "and reports the three clients it moved");
+  t.eq(db.areas.find((a) => a.id === 1).name, "Basag Proper", "the areas row moved");
+  t.eq(db.clients.filter((c) => c.area === "Basag Proper").length, 3, "and so did every client on it");
+  t.eq(db.clients.filter((c) => c.area === "Basag").length, 0, "none left behind on the old name");
+  t.eq(db.clients.find((c) => c.id === 13).area, "Anabu", "a client on another area is untouched");
+});
+
+// The app's half of atomicity, and the only half it controls. Two round trips is how a browser
+// produces a half-applied rename — areas renamed, clients not — and the SQL cannot prevent that.
+await t.test("the rename is ONE rpc call — never two updates that could half-succeed", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  const db = renameFixture();
+  const sb = makeFakeSB(db, { rpcs: { rename_area: renameFn(db) } });
+  window.SB = sb;
+  await API("rename_area", { old_name: "Basag", new_name: "Basag Proper" });
+  t.eq(sb.calls.length, 1, "exactly one call to the database");
+  t.eq(sb.calls[0].rpc, "rename_area", "and it is the rpc, not a table write");
+  t.eq(sb.calls[0].params.old_name, "Basag", "old name sent");
+  t.eq(sb.calls[0].params.new_name, "Basag Proper", "new name sent");
+  t.ok(!sb.calls.some((c) => c.op === "update"), "no direct UPDATE was issued alongside it");
+});
+
+// The rollback case. Models the outcome, per the note above — the function raises, nothing moved.
+await t.test("a failed rename leaves BOTH tables unchanged, and says so", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  const db = renameFixture();
+  window.SB = makeFakeSB(db, {
+    rpcs: { rename_area: renameFn(db, { code: "P0001", message: "boom, mid-transaction" }) },
+  });
+  const res = await API("rename_area", { old_name: "Basag", new_name: "Basag Proper" });
+  t.eq(res.ok, false, "must not claim success");
+  t.eq(db.areas.find((a) => a.id === 1).name, "Basag", "the areas row did not move");
+  t.eq(db.clients.filter((c) => c.area === "Basag").length, 3, "and neither did any client");
+  t.eq(db.clients.filter((c) => c.area === "Basag Proper").length, 0, "nothing landed on the new name");
+});
+
+// 0 is a real answer — an area nobody is on. Reading it as falsy would report "refused" for a
+// rename that DID happen, leaving the screen contradicting the database until the next reload.
+await t.test("renaming an area with NO clients still succeeds — 0 is a count, not a failure", async () => {
+  await seed([{ id: 3, name: "Talacogon" }]);
+  setME(officer);
+  const db = { areas: [{ id: 3, name: "Talacogon" }], clients: [] };
+  window.SB = makeFakeSB(db, { rpcs: { rename_area: renameFn(db) } });
+  const res = await API("rename_area", { old_name: "Talacogon", new_name: "Talakogon" });
+  t.eq(res.ok, true, "renamed");
+  t.eq(res.clients, 0, "zero clients moved, and that is fine");
+  t.eq(db.areas[0].name, "Talakogon", "the area really did move");
+});
+
+await t.test("a non-officer cannot rename, and the database is never called", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(technician);
+  const sb = arm();
+  const res = await API("rename_area", { old_name: "Basag", new_name: "X" });
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "not even asked");
+});
+
+await t.test("a blank new name is refused before the round trip", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  const sb = arm();
+  const res = await API("rename_area", { old_name: "Basag", new_name: "   " });
+  t.eq(res.ok, false, "refused");
+  t.eq(sb.calls.length, 0, "no call");
+});
+
+await t.test("renaming onto another existing area is refused, case-insensitively", async () => {
+  await seed([{ id: 1, name: "Basag" }, { id: 2, name: "Anabu" }]);
+  setME(officer);
+  const sb = arm();
+  const res = await API("rename_area", { old_name: "Basag", new_name: "anabu" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "That area already exists.", "in the screen's own words");
+  t.eq(sb.calls.length, 0, "caught locally");
+});
+
+// The case-only rename has to survive the check above, or fixing a typo'd capital is impossible.
+await t.test("changing only the CASE of a name is a real rename, not a self-collision", async () => {
+  await seed([{ id: 1, name: "basag" }]);
+  setME(officer);
+  const db = { areas: [{ id: 1, name: "basag" }], clients: [{ id: 10, area: "basag" }] };
+  window.SB = makeFakeSB(db, { rpcs: { rename_area: renameFn(db) } });
+  const res = await API("rename_area", { old_name: "basag", new_name: "Basag" });
+  t.eq(res.ok, true, "allowed through");
+  t.eq(db.areas[0].name, "Basag", "and applied");
+  t.eq(db.clients[0].area, "Basag", "cascading as usual");
+});
+
+await t.test("renaming a name to itself is a no-op that touches nothing", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  const sb = arm();
+  const res = await API("rename_area", { old_name: "Basag", new_name: "  Basag  " });
+  t.eq(res.ok, true, "not an error");
+  t.eq(sb.calls.length, 0, "but no round trip either");
+});
+
+await t.test("a 23505 from the database is translated, not shown raw", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  window.SB = makeFakeSB({}, {
+    rpcs: { rename_area: { error: { code: "23505", message: 'duplicate key value violates unique constraint "areas_name_key"' } } },
+  });
+  const res = await API("rename_area", { old_name: "Basag", new_name: "Whatever" });
+  t.eq(res.ok, false, "refused");
+  t.eq(res.error, "That area already exists.", "translated");
+  t.ok(!/constraint/i.test(res.error), "the constraint name never reaches the user");
+});
+
+await t.test("a 42501 from the function's own gate reports an honest refusal", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  window.SB = makeFakeSB({}, {
+    rpcs: { rename_area: { error: { code: "42501", message: "Only the owner or an Admin Officer can rename an area." } } },
+  });
+  const res = await API("rename_area", { old_name: "Basag", new_name: "Whatever" });
+  t.eq(res.ok, false, "refused");
+  t.ok(/refused the rename/i.test(res.error || ""), `expected an honest refusal, got: ${res.error}`);
+});
+
+// A null return with no error is not success. It is the RPC equivalent of the empty-200 the add
+// path guards against, and it must not read as "renamed, 0 clients".
+await t.test("a null return with no error is NOT read as a successful rename", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  window.SB = makeFakeSB({}, { rpcs: { rename_area: { data: null } } });
+  const res = await API("rename_area", { old_name: "Basag", new_name: "Whatever" });
+  t.eq(res.ok, false, "must not claim success");
+  t.ok(/refused by the database/i.test(res.error || ""), `expected an honest refusal, got: ${res.error}`);
+});
+
+// The function name is the whole contract with the database, and a typo in it is not detectable
+// any other way from in here — the fake answers 42883 for anything it was not given.
+await t.test("the handler calls the rpc by the name the SQL actually defines", async () => {
+  await seed([{ id: 1, name: "Basag" }]);
+  setME(officer);
+  const db = renameFixture();
+  const sb = makeFakeSB(db, { rpcs: { rename_area: renameFn(db) } });
+  window.SB = sb;
+  const res = await API("rename_area", { old_name: "Basag", new_name: "Basag Proper" });
+  t.eq(res.ok, true, "the name resolved — a typo would have come back 42883");
+  t.eq(sb.calls[0].rpc, "rename_area", "matches tests/sql/rename_area.sql");
 });
 
 console.log(`\n${t.results.name}: ${t.results.pass} passed, ${t.results.fail} failed`);

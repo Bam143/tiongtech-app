@@ -188,6 +188,31 @@ export function makeFakeSB(tables = {}, opts = {}) {
     // which looks like a bug in the code under test rather than a gap in the fake.
     // opts.uid is the signed-in auth_uid; omit it to exercise the signed-out branch.
     auth: { getUser: async () => ({ data: { user: opts.uid ? { id: opts.uid } : null } }) },
+    // sb.rpc(fn, params) — a Postgres function called over PostgREST. Stub one with
+    // opts.rpcs = { fn_name: handler }, where the handler is either a value (becomes `data`), an
+    // envelope ({ data } / { error }), or a function of the params returning one of those.
+    //
+    // An UNSTUBBED name resolves to 42883 "does not exist" rather than to an empty success. That
+    // asymmetry is deliberate: a fake that answers { data: null, error: null } for a function
+    // nobody wired would let a handler calling the WRONG NAME pass, and the name is the entire
+    // contract with the database — a typo there is not detectable any other way from in here.
+    //
+    // A handler that mutates the fixture tables models a function that writes, and one that raises
+    // WITHOUT mutating them models a rollback. That models the OUTCOME of a transaction; it is not
+    // proof of one. Nothing in this file has transactions, so atomicity itself can only be
+    // established against the real database (see tests/rls-live.mjs).
+    rpc(fn, params) {
+      calls.push({ rpc: fn, params: { ...(params || {}) } });
+      const h = opts.rpcs && opts.rpcs[fn];
+      if (h === undefined) {
+        return Promise.resolve({ data: null, error: { code: "42883", message: `function public.${fn}(...) does not exist` } });
+      }
+      let r;
+      try { r = typeof h === "function" ? h(params || {}) : h; }
+      catch (e) { return Promise.resolve({ data: null, error: { code: e.code || "P0001", message: e.message || String(e) } }); }
+      const enveloped = r && typeof r === "object" && ("data" in r || "error" in r);
+      return Promise.resolve(enveloped ? { data: r.data === undefined ? null : r.data, error: r.error || null } : { data: r, error: null });
+    },
     from(table) {
       const q = { table, filters: {} };
       const hits = () => (db[q.table] || []).filter((r) =>

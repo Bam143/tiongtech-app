@@ -2128,8 +2128,7 @@ async function _supaSaveExpenseCats(payload) {
     cats
   };
 }
-// Add one area. ADD ONLY — rename and delete are not wired yet, so nothing here updates or
-// removes a row.
+// Add one area. Rename lives in _supaRenameArea below; delete is not wired yet.
 //
 // Unlike _supaSaveExpenseCats above, this gate MIRRORS the database rather than the button:
 // `areas` carries a real policy (owner + is_admin_officer()), so a looser app gate would render an
@@ -2186,6 +2185,81 @@ async function _supaSaveArea(payload) {
   return {
     ok: true,
     area: data[0]
+  };
+}
+// Rename one area, cascading to every client carrying the old name.
+//
+// THIS IS ONE RPC CALL ON PURPOSE, and that is the whole design. clients.area is TEXT, not a
+// foreign key, so nothing in the schema keeps the two tables agreeing — renaming the `areas` row
+// without rewriting `clients.area` leaves every one of those clients pointing at a value that is
+// no longer an area, which is invisible until someone opens the client form and finds the dropdown
+// blank. Doing it as two statements from here would make that state reachable for real: the first
+// update commits, the connection drops, and the data is split with no way to tell it happened.
+// public.rename_area() does both inside one function body, so Postgres commits them together or
+// rolls both back. The app's only job is to not undermine that by adding a second round trip.
+async function _supaRenameArea(payload) {
+  const sb = window.SB;
+  if (!(ME.role === "owner" || isAdminOfficer())) return {
+    ok: false,
+    error: "Only the owner or an Admin Officer can rename an area."
+  };
+  const oldName = String((payload && payload.old_name) != null ? payload.old_name : "").trim();
+  const newName = String((payload && payload.new_name) != null ? payload.new_name : "").trim();
+  if (!oldName) return {
+    ok: false,
+    error: "The area to rename was not given."
+  };
+  if (!newName) return {
+    ok: false,
+    error: "Enter an area name."
+  };
+  // Nothing to do, and worth answering here rather than spending a round trip to be told so. NOT
+  // folded into the clash check below: a change of CASE only ("basag" → "Basag") is a real rename
+  // and must go through, which is why this compares exactly while the next one does not.
+  if (newName === oldName) return {
+    ok: true,
+    clients: 0,
+    unchanged: true
+  };
+  // Same case-insensitive rule as adding, minus the row being renamed — otherwise fixing the case
+  // of an existing name would collide with itself.
+  const clash = AREAS_ROWS.find(a => a.name.toLowerCase() === newName.toLowerCase() && a.name !== oldName);
+  if (clash) return {
+    ok: false,
+    error: "That area already exists."
+  };
+  const {
+    data,
+    error
+  } = await sb.rpc("rename_area", {
+    old_name: oldName,
+    new_name: newName
+  });
+  if (error) {
+    if (error.code === "23505" || /already exists|duplicate key|unique/i.test(error.message || "")) return {
+      ok: false,
+      error: "That area already exists."
+    };
+    if (error.code === "42501") return {
+      ok: false,
+      error: "The database refused the rename. Nothing changed."
+    };
+    return {
+      ok: false,
+      error: "Could not rename the area: " + error.message
+    };
+  }
+  // `data == null`, NOT `!data`. The function returns the number of clients updated, and 0 is a
+  // real, ordinary answer — an area nobody is on yet. Testing falsiness would turn that perfectly
+  // good rename into "refused by the database", and the area WOULD have been renamed, so the
+  // screen would contradict the database until the next reload.
+  if (data == null) return {
+    ok: false,
+    error: "Renaming the area was refused by the database. Nothing changed."
+  };
+  return {
+    ok: true,
+    clients: Number(data) || 0
   };
 }
 // Renewals. Two owners share the renewal_stages row: set_renewal_stage owns `stage`, and
@@ -4223,6 +4297,9 @@ const API = (action, payload) => {
         }
         if (action === "save_area") {
           return await _supaSaveArea(payload);
+        }
+        if (action === "rename_area") {
+          return await _supaRenameArea(payload);
         }
         if (action === "import_expenses") {
           return await _supaImportExpenses(payload);
@@ -25308,10 +25385,9 @@ function TechniciansView({
 }
 
 /* Areas — the managed list behind the area dropdown on the client and PESOWiFi forms.
-   ADD ONLY for now: no rename, no delete. Both are follow-up steps, and delete especially needs a
-   decision about the clients already carrying the name (clients.area is TEXT, not an FK, so
-   removing a row here would orphan the label rather than cascade). Not offering the buttons is
-   better than offering ones that do not work yet.
+   ADD and RENAME. Delete is still a follow-up step: clients.area is TEXT, not an FK, so removing a
+   row orphans the label on every client carrying it rather than cascading, and that needs a
+   decision rather than a button. Not offering it is better than offering one that half works.
 
    Not a CatalogList: that component persists a whole array into an app_config JSON blob, whereas
    these are real rows with ids and a UNIQUE constraint, added one at a time. */
@@ -25320,6 +25396,8 @@ function AreasView({
 }) {
   const [val, setVal] = useState("");
   const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(null); // id of the row being renamed
+  const [editVal, setEditVal] = useState("");
   const [flash, setFlash] = useState(null); // { ok, text } — never set except from a settled save
   // Read the module global at render instead of seeding useState from it. The confirmed-save path
   // below leaves the refresh to _save, which re-runs the bootstrap, rewrites AREAS_ROWS and
@@ -25361,6 +25439,52 @@ function AreasView({
     }
     const why = res && res.offline ? "the app is not connected to the database." : res && res.error || "the server refused the change.";
     say(false, "NOT added — " + why, 7000);
+  };
+  const startEdit = a => {
+    setEditing(a.id);
+    setEditVal(a.name);
+  };
+  const cancelEdit = () => {
+    setEditing(null);
+    setEditVal("");
+  };
+  const rename = async a => {
+    const next = editVal.trim();
+    if (!next || busy) return;
+    if (next === a.name) {
+      cancelEdit();
+      return;
+    } // nothing to confirm and nothing to save
+    // Confirmed with the COUNT, because the cascade is the part that is not obvious. Renaming an
+    // area silently rewrites a column on every client carrying it, and "139 clients" is the only
+    // thing on screen that says so before it happens. The count comes from the clients already
+    // loaded, so it is what this user can see — the database may know of more, and the result
+    // flash reports what actually changed rather than what was promised here.
+    const n = inUse(a.name);
+    const warn = n === 0 ? "No clients carry this area, so only the area list changes." : `This will update ${n} client${n === 1 ? "" : "s"}.`;
+    if (!window.confirm(`Rename “${a.name}” to “${next}”?\n\n${warn}`)) return;
+    setBusy(true);
+    let res = null;
+    try {
+      res = await _save("rename_area", {
+        old_name: a.name,
+        new_name: next
+      });
+    } catch (e) {
+      res = {
+        ok: false,
+        error: e && e.message || "Rename failed."
+      };
+    }
+    setBusy(false);
+    if (res && res.ok) {
+      const c = res.clients || 0;
+      cancelEdit();
+      say(true, `Renamed to “${next}”` + (c ? ` · ${c} client${c === 1 ? "" : "s"} updated` : ""), 3000);
+      return;
+    }
+    const why = res && res.offline ? "the app is not connected to the database." : res && res.error || "the server refused the change.";
+    say(false, "NOT renamed — " + why, 7000);
   };
   return /*#__PURE__*/React.createElement("div", {
     className: "space-y-4"
@@ -25419,6 +25543,7 @@ function AreasView({
     }
   }, rows.map((a, i) => {
     const n = inUse(a.name);
+    const isEd = editing === a.id;
     return /*#__PURE__*/React.createElement("li", {
       key: a.id != null ? a.id : a.name + i,
       className: "flex items-center justify-between px-5 gap-3",
@@ -25426,7 +25551,25 @@ function AreasView({
         padding: "12px 20px",
         borderBottom: i === rows.length - 1 ? "none" : `1px solid ${t.borderSoft}`
       }
-    }, /*#__PURE__*/React.createElement("div", {
+    }, isEd ? /*#__PURE__*/React.createElement("input", {
+      value: editVal,
+      autoFocus: true,
+      disabled: busy,
+      onChange: e => setEditVal(e.target.value),
+      onKeyDown: e => {
+        if (e.key === "Enter") rename(a);
+        if (e.key === "Escape") cancelEdit();
+      },
+      className: "flex-1 rounded-lg outline-none",
+      style: {
+        background: t.surface2,
+        color: t.text,
+        border: `1px solid ${t.accent}`,
+        padding: "7px 10px",
+        fontSize: 13,
+        opacity: busy ? 0.6 : 1
+      }
+    }) : /*#__PURE__*/React.createElement("div", {
       style: {
         minWidth: 0
       }
@@ -25441,7 +25584,54 @@ function AreasView({
         color: t.textFaint,
         fontSize: 11.5
       }
-    }, n, " client", n === 1 ? "" : "s")));
+    }, n, " client", n === 1 ? "" : "s")), mayAdd && /*#__PURE__*/React.createElement("div", {
+      className: "flex items-center gap-2 shrink-0"
+    }, isEd ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("button", {
+      onClick: () => rename(a),
+      disabled: busy || !editVal.trim(),
+      className: "grid place-items-center rounded-lg",
+      title: "Save",
+      style: {
+        width: 30,
+        height: 30,
+        background: t.goodSoft,
+        border: "none",
+        color: t.good,
+        cursor: busy || !editVal.trim() ? "default" : "pointer",
+        opacity: busy || !editVal.trim() ? 0.55 : 1
+      }
+    }, /*#__PURE__*/React.createElement(CheckCircle2, {
+      size: 15
+    })), /*#__PURE__*/React.createElement("button", {
+      onClick: cancelEdit,
+      disabled: busy,
+      className: "grid place-items-center rounded-lg",
+      title: "Cancel",
+      style: {
+        width: 30,
+        height: 30,
+        background: t.surface2,
+        border: `1px solid ${t.border}`,
+        color: t.textMuted,
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement(X, {
+      size: 14
+    }))) : /*#__PURE__*/React.createElement("button", {
+      onClick: () => startEdit(a),
+      className: "grid place-items-center rounded-lg",
+      title: "Rename",
+      style: {
+        width: 30,
+        height: 30,
+        background: t.surface2,
+        border: `1px solid ${t.border}`,
+        color: t.textMuted,
+        cursor: "pointer"
+      }
+    }, /*#__PURE__*/React.createElement(IconPencil, {
+      size: 15
+    }))));
   }), rows.length === 0 && /*#__PURE__*/React.createElement("li", {
     style: {
       padding: "20px",
@@ -25486,7 +25676,7 @@ function AreasView({
       fontSize: 11.5,
       lineHeight: 1.5
     }
-  }, "Areas added here appear in the area dropdown on the client and PESOWiFi forms. Renaming and deleting are not available yet."));
+  }, "Areas added here appear in the area dropdown on the client and PESOWiFi forms. Renaming an area also updates every client carrying it. Deleting is not available yet."));
 }
 function JobTypesView({
   t

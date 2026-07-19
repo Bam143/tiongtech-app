@@ -4,8 +4,8 @@
 
 ```sh
 npm install     # once
-npm test        # 323 tests, ~2 seconds
-npm run mutate  # 114 mutations — proves the suites can actually fail (~2 min)
+npm test        # 336 tests, ~2 seconds
+npm run mutate  # 120 mutations — proves the suites can actually fail (~2 min)
 ```
 
 To rebuild `app.js` after editing `app.jsx`:
@@ -25,13 +25,25 @@ Three suites:
 - **`test-access.mjs`** — the Settings "Access" column and the rule that it must agree with what
   `canView()` enforces at login. It exists because `erp_users.allowed_views` is a TEXT column, so
   an unparsed grant read as "no restrictions" and showed a restricted user as *Full access*.
-- **`test-areas.mjs`** — the Areas screen: the `position` gate, and the add path behind it. Areas
+- **`test-areas.mjs`** — the Areas screen: the `position` gate, and the add and rename paths behind
+  it. Areas
   is the first screen gated on **position** rather than role or an `allowed_views` grant, because
   role cannot carry the decision — `ROLE_VIEWS.admin` is `"*"` and most of the company holds role
   `admin` with their real job title in `position`. One guard clause in `canView` is the whole
   barrier, and a regression there is silent: the nav item just appears for someone it shouldn't.
   The suite also covers the three ways the database can refuse a write, two of which don't raise
   (a silent 200 + `[]`, and a 23505 unique violation).
+
+  **On the rename tests and atomicity.** Renaming an area also rewrites `clients.area` on every
+  client carrying it, and the two must move together — `clients.area` is TEXT, not a foreign key,
+  so nothing in the schema keeps them agreeing. That is done by a Postgres function,
+  `tests/sql/rename_area.sql`, which owns both `UPDATE`s in one body and therefore one
+  transaction. **These tests cannot prove that transaction exists**: `makeFakeSB` has no
+  transactions, so the rollback case models the *outcome* of one (the function raises, neither
+  table moved) rather than demonstrating one. What they *do* prove is the half the app controls —
+  that it makes exactly **one** call. A second round trip is how a browser produces a half-applied
+  rename, and no amount of care in the SQL can stop the app reintroducing it. Real transactional
+  proof belongs in `rls-live.mjs`, against the real database.
 
 ### The payroll suite in detail
 
@@ -158,6 +170,26 @@ failure at all — the write was allowed and the *data* was refused — so a han
 translate it into something a user can act on ("that already exists") rather than surfacing the
 constraint name. When both `conflictWrites` and `errorWrites` match, the conflict wins, because
 that is what Postgres reports.
+
+**Postgres functions are stubbed per name.** `sb.rpc(fn, params)` resolves against
+`opts.rpcs = { fn_name: handler }`, where the handler is a value (becomes `data`), an envelope
+(`{ data }` / `{ error }`), or a function of the params returning either. A handler that mutates
+the fixture tables models a function that writes; one that raises *without* mutating them models a
+rollback. An **unstubbed** name comes back `42883 does not exist` rather than an empty success —
+deliberately, because a fake that answered `{ data: null, error: null }` would let a handler
+calling the **wrong function name** pass, and the name is the entire contract with the database.
+
+## SQL that lives outside the app
+
+`tests/sql/` holds the Postgres functions the app calls with `sb.rpc()`. They are **not** applied
+by any script here — they're run by hand in the Supabase SQL editor, and the copy in this repo is
+the reviewable record of what was run. `rename_area.sql` carries its own read-before-running notes
+(it is `SECURITY DEFINER`, so it bypasses RLS and its internal authorisation check is the only
+gate) and a set of verify-after-running queries.
+
+If you change one of these, the matching handler in `app.jsx` and the tests naming it have to move
+with it: `test-areas.mjs` pins the function *name* precisely because a typo there is undetectable
+from the app side.
 
 Two more things about the **fake Supabase** (`makeFakeSB`) are worth knowing before you write a
 test against an upsert:
