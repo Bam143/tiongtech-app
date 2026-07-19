@@ -783,7 +783,9 @@ let CFG_SLA = {
   followup: 72,
   followupWarnAt: 48
 };
-const AREAS = ["SL Balit", "Talacogon", "Poblacion", "San Isidro", "San Roque"];
+// Sentinel <option> value: picking it swaps the Area select for a text box.
+// Not a real area, so it must never collide with one stored on a client.
+const AREA_NEW = "__tt_new_area__";
 const PLANS = ["25MBPS-ISP1", "50MBPS-ISP1", "100MBPS-ISP1", "200MBPS-BIZ"];
 const OLT_STANDARDS = ["IEEE 802.3ah (EPON)", "ITU-T G.984 (GPON)", "ITU-T G.9807 (XGS-PON)"];
 let techAccounts = [{
@@ -21609,11 +21611,13 @@ function ClientsView({
   const [csv, setCsv] = useState("");
   const [preview, setPreview] = useState([]);
   const [flash, setFlash] = useState("");
+  // area starts blank so a new client forces a deliberate choice, rather than
+  // silently inheriting whichever area happened to be first in a fixed list.
   const blankForm = {
     first_name: "",
     last_name: "",
     account_number: "",
-    area: AREAS[0],
+    area: "",
     address: "",
     phone: "",
     email: "",
@@ -21630,6 +21634,8 @@ function ClientsView({
   const [form, setForm] = useState(blankForm);
   const [joFor, setJoFor] = useState(null);
   const [editing, setEditing] = useState(null);
+  // true while the Area field is a free-text box for an area not yet in the data
+  const [areaNew, setAreaNew] = useState(false);
   const fullName = c => `${c.first_name} ${c.last_name}`.trim();
   // Area options come from the loaded clients, not a fixed list, so the dropdown
   // always covers what is actually in the data (and stays right after imports).
@@ -21773,11 +21779,13 @@ function ClientsView({
       ..._napChainOpen(c)
     });
     setEditing(c);
+    setAreaNew(false);
     setShowForm(true);
   };
   const startAdd = () => {
     setForm(blankForm);
     setEditing(null);
+    setAreaNew(false);
     setShowForm(true);
   };
   const deleteClient = c => {
@@ -22560,15 +22568,56 @@ function ClientsView({
     style: selStyle
   })), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("label", {
     style: lbl
-  }, "Area"), /*#__PURE__*/React.createElement("input", {
+  }, "Area"), areaNew ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("input", {
+    autoFocus: true,
     value: form.area,
     onChange: e => setForm({
       ...form,
       area: e.target.value
     }),
-    placeholder: "e.g. SL Balit",
+    placeholder: "Name the new area",
     style: selStyle
-  })), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setAreaNew(false);
+      setForm({
+        ...form,
+        area: ""
+      });
+    },
+    style: {
+      background: "none",
+      border: "none",
+      color: t.accent,
+      cursor: "pointer",
+      fontSize: 11.5,
+      fontWeight: 600,
+      padding: "4px 0 0"
+    }
+  }, "Choose from the list instead")) : /*#__PURE__*/React.createElement("select", {
+    value: form.area,
+    onChange: e => {
+      const v = e.target.value;
+      if (v === AREA_NEW) {
+        setAreaNew(true);
+        setForm({
+          ...form,
+          area: ""
+        });
+      } else setForm({
+        ...form,
+        area: v
+      });
+    },
+    style: selStyle
+  }, /*#__PURE__*/React.createElement("option", {
+    value: ""
+  }, "\u2014 Select area \u2014"), areas.map(a => /*#__PURE__*/React.createElement("option", {
+    key: a,
+    value: a
+  }, a)), /*#__PURE__*/React.createElement("option", {
+    value: AREA_NEW
+  }, "+ Add new area\u2026"))), /*#__PURE__*/React.createElement("div", {
     style: {
       gridColumn: "1 / -1"
     }

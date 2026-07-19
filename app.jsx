@@ -355,7 +355,9 @@ let CFG_JOBTYPES = ["Client Repair", "Follow-up", "INSTALL", "Mainline Repair", 
 let CFG_ISSUES = ["Disconnected Clients", "Custom J.O", "New Client", "Red Modem", "Installation", "Weak Wi-Fi Signal", "No Power", "No Internet Connection", "SSID Missing", "Unstable Connection"];
 let CFG_SOLUTIONS = ["Completed New Installation", "Escalated Mainline Repair", "Gidoot ang FIC", "Gitarong mga Saksakan", "Replace FIC Connector", "Replace Power Supply", "Replaced Modem", "Restart Modem", "Rewire/Fusion"];
 let CFG_SLA = { standard: 24, warningLead: 3, followup: 72, followupWarnAt: 48 };
-const AREAS = ["SL Balit", "Talacogon", "Poblacion", "San Isidro", "San Roque"];
+// Sentinel <option> value: picking it swaps the Area select for a text box.
+// Not a real area, so it must never collide with one stored on a client.
+const AREA_NEW = "__tt_new_area__";
 const PLANS = ["25MBPS-ISP1", "50MBPS-ISP1", "100MBPS-ISP1", "200MBPS-BIZ"];
 const OLT_STANDARDS = ["IEEE 802.3ah (EPON)", "ITU-T G.984 (GPON)", "ITU-T G.9807 (XGS-PON)"];
 
@@ -7928,10 +7930,14 @@ function ClientsView({ t }) {
   const [csv, setCsv] = useState("");
   const [preview, setPreview] = useState([]);
   const [flash, setFlash] = useState("");
-  const blankForm = { first_name: "", last_name: "", account_number: "", area: AREAS[0], address: "", phone: "", email: "", profile: PLANS[0], mrc: "", subscription_date: "", coordinates: "", olt: "", pon: "", nap: "", napPort: "", notes: "" };
+  // area starts blank so a new client forces a deliberate choice, rather than
+  // silently inheriting whichever area happened to be first in a fixed list.
+  const blankForm = { first_name: "", last_name: "", account_number: "", area: "", address: "", phone: "", email: "", profile: PLANS[0], mrc: "", subscription_date: "", coordinates: "", olt: "", pon: "", nap: "", napPort: "", notes: "" };
   const [form, setForm] = useState(blankForm);
   const [joFor, setJoFor] = useState(null);
   const [editing, setEditing] = useState(null);
+  // true while the Area field is a free-text box for an area not yet in the data
+  const [areaNew, setAreaNew] = useState(false);
 
   const fullName = (c) => `${c.first_name} ${c.last_name}`.trim();
   // Area options come from the loaded clients, not a fixed list, so the dropdown
@@ -8024,8 +8030,8 @@ function ClientsView({ t }) {
   };
   // _napChainOpen last: it fills the olt/pon the row cannot carry, so the cascade opens on the
   // saved chain instead of "Select...". Display only — neither field reaches a save.
-  const startEdit = (c) => { setForm({ ...blankForm, ...c, ..._napChainOpen(c) }); setEditing(c); setShowForm(true); };
-  const startAdd = () => { setForm(blankForm); setEditing(null); setShowForm(true); };
+  const startEdit = (c) => { setForm({ ...blankForm, ...c, ..._napChainOpen(c) }); setEditing(c); setAreaNew(false); setShowForm(true); };
+  const startAdd = () => { setForm(blankForm); setEditing(null); setAreaNew(false); setShowForm(true); };
   const deleteClient = (c) => {
     if (!window.confirm("Delete " + fullName(c) + "?")) return;
     if (c.id) _save("delete_client", { id: c.id });
@@ -8201,7 +8207,20 @@ function ClientsView({ t }) {
               <div><label style={lbl}>First name</label><input value={form.first_name} onChange={(e) => setForm({ ...form, first_name: e.target.value })} placeholder="e.g. Jinky" style={selStyle} /></div>
               <div><label style={lbl}>Last name</label><input value={form.last_name} onChange={(e) => setForm({ ...form, last_name: e.target.value })} placeholder="e.g. Cabahug" style={selStyle} /></div>
               <div><label style={lbl}>Account number</label><input value={form.account_number} onChange={(e) => setForm({ ...form, account_number: e.target.value })} placeholder="e.g. 208111523" style={selStyle} /></div>
-              <div><label style={lbl}>Area</label><input value={form.area} onChange={(e) => setForm({ ...form, area: e.target.value })} placeholder="e.g. SL Balit" style={selStyle} /></div>
+              <div><label style={lbl}>Area</label>
+                {areaNew ? (
+                  <>
+                    <input autoFocus value={form.area} onChange={(e) => setForm({ ...form, area: e.target.value })} placeholder="Name the new area" style={selStyle} />
+                    <button onClick={() => { setAreaNew(false); setForm({ ...form, area: "" }); }} style={{ background: "none", border: "none", color: t.accent, cursor: "pointer", fontSize: 11.5, fontWeight: 600, padding: "4px 0 0" }}>Choose from the list instead</button>
+                  </>
+                ) : (
+                  <select value={form.area} onChange={(e) => { const v = e.target.value; if (v === AREA_NEW) { setAreaNew(true); setForm({ ...form, area: "" }); } else setForm({ ...form, area: v }); }} style={selStyle}>
+                    <option value="">— Select area —</option>
+                    {areas.map((a) => <option key={a} value={a}>{a}</option>)}
+                    <option value={AREA_NEW}>+ Add new area…</option>
+                  </select>
+                )}
+              </div>
               <div style={{ gridColumn: "1 / -1" }}><label style={lbl}>Address</label><input value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} placeholder="Street, Barangay, City" style={selStyle} /></div>
               <div><label style={lbl}>Phone</label><input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="09xx xxx xxxx" style={selStyle} /></div>
               <div><label style={lbl}>Email</label><input value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="name@example.com" style={selStyle} /></div>
