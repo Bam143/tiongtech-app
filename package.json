@@ -5,7 +5,7 @@
   "description": "TIONGTECH ERP — build and test tooling. The app itself is app.js, loaded directly by index.html.",
   "scripts": {
     "build": "node tests/build.mjs app.jsx app.js",
-    "test": "node tests/test-payroll.mjs app.js",
+    "test": "node tests/test-payroll.mjs app.js && node tests/test-access.mjs app.js",
     "mutate": "node tests/mutate.mjs app.js",
     "test:rls": "node tests/rls-live.mjs"
   },

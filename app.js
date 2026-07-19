@@ -472,13 +472,34 @@ const ROLE_VIEWS = {
   payroll: ["payroll", "loans", "collections"],
   technician: ["jobs", "joboverview", "salary"]
 };
+// erp_users.allowed_views is a TEXT column, so PostgREST hands it back as a JSON STRING and every
+// reader has to parse it. The bootstrap's `me` branch always did (app.jsx:427); the users list
+// feeding Settings did NOT. That asymmetry is the whole bug: an unparsed string fails
+// `typeof === "object"`, so the Settings UI fell through to its full-access default and showed a
+// restricted user as unrestricted, while login restricted the same user correctly. One helper
+// now, shared by enforcement and display, so a reader cannot forget again.
+// Returns a non-empty plain object, or null when there is no usable grant.
+function _normPerms(v) {
+  let o = v;
+  if (typeof o === "string") {
+    try {
+      o = JSON.parse(o);
+    } catch (e) {
+      return null;
+    }
+  }
+  if (!o || typeof o !== "object" || Array.isArray(o)) return null;
+  return Object.keys(o).length ? o : null;
+}
+function _myPerms() {
+  return _normPerms(ME.allowed_views);
+}
 function _hasPerms() {
-  const av = ME.allowed_views;
-  return !!av && typeof av === "object" && !Array.isArray(av) && Object.keys(av).length > 0;
+  return !!_myPerms();
 }
 function _cap(id) {
-  const av = ME.allowed_views;
-  return _hasPerms() && av[id] ? av[id] : null;
+  const av = _myPerms();
+  return av && av[id] ? av[id] : null;
 } // {a,e,d} or null
 function _permHas(p, cap) {
   return (PERM_MENU[p] || []).some(m => {
@@ -492,10 +513,12 @@ function canView(id) {
   if (id === "owner") {
     // Owner Dashboard
     if (ME.role === "owner") return true; // the real owner always sees it
-    return _hasPerms() ? "owner" in ME.allowed_views : false; // everyone else (incl. admins) only if granted in Settings
+    const own = _myPerms();
+    return own ? "owner" in own : false; // everyone else (incl. admins) only if granted in Settings
   }
   if (ME.role === "owner") return true;
-  if (_hasPerms()) return id in ME.allowed_views;
+  const av = _myPerms();
+  if (av) return id in av;
   const v = ROLE_VIEWS[ME.role];
   if (v === "*") return true;
   return (v || []).includes(id);
@@ -557,6 +580,34 @@ const ACCESS_MENUS = [{
   items: [["ai", "AI Assistant"]]
 }];
 const ALL_MENU_IDS = ACCESS_MENUS.flatMap(g => g.items.map(it => it[0]));
+// What a user can ACTUALLY see, resolved by the same precedence canView() uses at login: a
+// per-user grant wins outright, and the role is consulted only when there is no grant.
+//
+// The Access column must never be read off `role` alone. In this database `role` and `position`
+// are different fields — most staff carry role "admin" while their real job title lives in
+// `position`, and allowed_views is what actually restricts them. Labelling from role therefore
+// called a restricted technician "Full access". Anything that renders an access summary goes
+// through here so the label and the enforcement cannot drift apart again.
+function _userAccess(u) {
+  const av = _normPerms(u && u.allowed_views);
+  if (av) return {
+    full: ALL_MENU_IDS.every(id => id in av),
+    count: Object.keys(av).length
+  };
+  const v = ROLE_VIEWS[u && u.role]; // no grant: canView falls back to the role
+  if (u && u.role === "owner") return {
+    full: true,
+    count: ALL_MENU_IDS.length
+  };
+  if (v === "*") return {
+    full: true,
+    count: ALL_MENU_IDS.length
+  };
+  return {
+    full: false,
+    count: (v || []).length
+  };
+}
 let FIN_RECENT = [];
 let FIN_MONTH = null;
 let FIN_ALL = null;
@@ -1103,14 +1154,7 @@ async function _supaBootstrap() {
     } = await sb.from("erp_users").select("id,username,full_name,role,position,allowed_views").eq("auth_uid", uid).single();
     me = data;
   }
-  let allowed = null;
-  if (me && me.allowed_views) {
-    try {
-      allowed = typeof me.allowed_views === "string" ? JSON.parse(me.allowed_views) : me.allowed_views;
-    } catch (e) {
-      allowed = null;
-    }
-  }
+  const allowed = _normPerms(me && me.allowed_views);
   let prId = null;
   if (me) {
     const {
@@ -1143,7 +1187,13 @@ async function _supaBootstrap() {
   out.goals = await _supaAll(sb, "goals", "id,title,category,target,current,unit,target_date,notes,done");
   out.clientSnapshots = await _supaAll(sb, "client_snapshots", "snap_date,active,registered,pesowifi");
   out.techAccounts = await _supaAll(sb, "tech_accounts", "name,contact,username");
-  out.users = await _supaAll(sb, "erp_users", "id,username,full_name,role,position,allowed_views");
+  // Parsed on the way in — this is the read the Settings screen renders from. It used to hand the
+  // raw TEXT column straight through, and every downstream reader mistook the string for "no
+  // restrictions". Normalising here means the list and the edit modal see what login sees.
+  out.users = (await _supaAll(sb, "erp_users", "id,username,full_name,role,position,allowed_views")).map(u => ({
+    ...u,
+    allowed_views: _normPerms(u.allowed_views)
+  }));
   out.jobs = await _supaAll(sb, "job_orders", "jo_id,customer,job_type,tech,issue,solution,start_date,start_time,finish_date,finish_time,status,resolution_hours,sla24,sla48,warning,followup");
   // renewal stages keyed by account
   const rs = await _supaAll(sb, "renewal_stages", "account_number,stage,next_date,remarks,promise_date,amount_due,payment_method");
@@ -13546,9 +13596,9 @@ function UserModal({
     schedule_id: user && user.schedule_id || 1
   };
   const [form, setForm] = useState(init);
-  const _av = user && user.allowed_views && typeof user.allowed_views === "object" && !Array.isArray(user.allowed_views) ? user.allowed_views : null;
+  const _av = _normPerms(user && user.allowed_views); // parses the TEXT column; null = no grant
   const _isFull = _av && ALL_MENU_IDS.every(id => _av[id] && _av[id].a && _av[id].e && _av[id].d);
-  const [perms, setPerms] = useState(_av && Object.keys(_av).length && !_isFull ? _av : null); // null = full access; else {menuId: {a,e,d}}
+  const [perms, setPerms] = useState(_av && !_isFull ? _av : null); // null = full access; else {menuId: {a,e,d}}
   const restricted = perms !== null;
   const setCap = (id, present, caps) => setPerms(p => {
     const cur = {
@@ -14298,117 +14348,120 @@ function SettingsPage({
         color: t.textFaint,
         fontSize: 12.5
       }
-    }, uq ? "No users match your search." : "No users loaded.")), fu.map(u => /*#__PURE__*/React.createElement("tr", {
-      key: u.id,
-      style: {
-        borderBottom: `1px solid ${t.borderSoft}`
-      }
-    }, /*#__PURE__*/React.createElement("td", {
-      style: {
-        padding: "10px 12px",
-        color: t.text,
-        fontSize: 12.5,
-        fontWeight: 600
-      }
-    }, u.full_name || "—"), /*#__PURE__*/React.createElement("td", {
-      style: {
-        padding: "10px 12px",
-        color: t.textMuted,
-        fontSize: 12.5,
-        fontFamily: "ui-monospace, monospace"
-      }
-    }, u.username), /*#__PURE__*/React.createElement("td", {
-      style: {
-        padding: "10px 12px",
-        color: t.textMuted,
-        fontSize: 12.5
-      }
-    }, u.position || "—"), /*#__PURE__*/React.createElement("td", {
-      style: {
-        padding: "10px 12px",
-        fontSize: 12
-      }
-    }, u.role === "owner" ? /*#__PURE__*/React.createElement("span", {
-      className: "rounded-full",
-      style: {
-        background: t.accentSoft,
-        color: t.accent,
-        padding: "2px 9px",
-        fontWeight: 700
-      }
-    }, "Owner") : u.allowed_views && typeof u.allowed_views === "object" && !Array.isArray(u.allowed_views) && Object.keys(u.allowed_views).length ? /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: t.textMuted
-      }
-    }, "Limited \xB7 ", Object.keys(u.allowed_views).length, " menus") : /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: t.good,
-        fontWeight: 600
-      }
-    }, "Full access")), /*#__PURE__*/React.createElement("td", {
-      style: {
-        padding: "10px 12px",
-        fontSize: 12
-      }
-    }, u.pr_employee_id || Number(u.per_day) > 0 ? /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: t.text
-      }
-    }, peso(u.per_day), "/day ", /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: t.textFaint
-      }
-    }, "\xB7 ", Number(u.schedule_id) === 2 ? "B" : "A")) : /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: t.textFaint
-      }
-    }, "\u2014")), /*#__PURE__*/React.createElement("td", {
-      style: {
-        padding: "8px 12px",
-        textAlign: "right",
-        whiteSpace: "nowrap"
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      className: "inline-flex items-center gap-3"
-    }, /*#__PURE__*/React.createElement("button", {
-      onClick: () => setModal({
-        user: u
-      }),
-      title: "Edit",
-      style: {
-        background: "transparent",
-        border: "none",
-        color: t.textMuted,
-        cursor: "pointer",
-        padding: 2
-      }
-    }, /*#__PURE__*/React.createElement(IconPencil, {
-      size: 16
-    })), u.role !== "owner" && /*#__PURE__*/React.createElement("button", {
-      onClick: () => resetPw(u),
-      title: "Reset password",
-      style: {
-        background: "transparent",
-        border: "none",
-        color: t.accent,
-        cursor: "pointer",
-        padding: 2
-      }
-    }, /*#__PURE__*/React.createElement(ShieldCheck, {
-      size: 15
-    })), /*#__PURE__*/React.createElement("button", {
-      onClick: () => delUser(u),
-      title: "Delete",
-      style: {
-        background: "transparent",
-        border: "none",
-        color: t.bad,
-        cursor: "pointer",
-        padding: 2
-      }
-    }, /*#__PURE__*/React.createElement(IconX, {
-      size: 16
-    })))))));
+    }, uq ? "No users match your search." : "No users loaded.")), fu.map(u => {
+      const acc = _userAccess(u);
+      return /*#__PURE__*/React.createElement("tr", {
+        key: u.id,
+        style: {
+          borderBottom: `1px solid ${t.borderSoft}`
+        }
+      }, /*#__PURE__*/React.createElement("td", {
+        style: {
+          padding: "10px 12px",
+          color: t.text,
+          fontSize: 12.5,
+          fontWeight: 600
+        }
+      }, u.full_name || "—"), /*#__PURE__*/React.createElement("td", {
+        style: {
+          padding: "10px 12px",
+          color: t.textMuted,
+          fontSize: 12.5,
+          fontFamily: "ui-monospace, monospace"
+        }
+      }, u.username), /*#__PURE__*/React.createElement("td", {
+        style: {
+          padding: "10px 12px",
+          color: t.textMuted,
+          fontSize: 12.5
+        }
+      }, u.position || "—"), /*#__PURE__*/React.createElement("td", {
+        style: {
+          padding: "10px 12px",
+          fontSize: 12
+        }
+      }, u.role === "owner" ? /*#__PURE__*/React.createElement("span", {
+        className: "rounded-full",
+        style: {
+          background: t.accentSoft,
+          color: t.accent,
+          padding: "2px 9px",
+          fontWeight: 700
+        }
+      }, "Owner") : acc.full ? /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.good,
+          fontWeight: 600
+        }
+      }, "Full access") : /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.textMuted
+        }
+      }, "Limited \xB7 ", acc.count, " menus")), /*#__PURE__*/React.createElement("td", {
+        style: {
+          padding: "10px 12px",
+          fontSize: 12
+        }
+      }, u.pr_employee_id || Number(u.per_day) > 0 ? /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.text
+        }
+      }, peso(u.per_day), "/day ", /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.textFaint
+        }
+      }, "\xB7 ", Number(u.schedule_id) === 2 ? "B" : "A")) : /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.textFaint
+        }
+      }, "\u2014")), /*#__PURE__*/React.createElement("td", {
+        style: {
+          padding: "8px 12px",
+          textAlign: "right",
+          whiteSpace: "nowrap"
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        className: "inline-flex items-center gap-3"
+      }, /*#__PURE__*/React.createElement("button", {
+        onClick: () => setModal({
+          user: u
+        }),
+        title: "Edit",
+        style: {
+          background: "transparent",
+          border: "none",
+          color: t.textMuted,
+          cursor: "pointer",
+          padding: 2
+        }
+      }, /*#__PURE__*/React.createElement(IconPencil, {
+        size: 16
+      })), u.role !== "owner" && /*#__PURE__*/React.createElement("button", {
+        onClick: () => resetPw(u),
+        title: "Reset password",
+        style: {
+          background: "transparent",
+          border: "none",
+          color: t.accent,
+          cursor: "pointer",
+          padding: 2
+        }
+      }, /*#__PURE__*/React.createElement(ShieldCheck, {
+        size: 15
+      })), /*#__PURE__*/React.createElement("button", {
+        onClick: () => delUser(u),
+        title: "Delete",
+        style: {
+          background: "transparent",
+          border: "none",
+          color: t.bad,
+          cursor: "pointer",
+          padding: 2
+        }
+      }, /*#__PURE__*/React.createElement(IconX, {
+        size: 16
+      })))));
+    }));
   })()))), /*#__PURE__*/React.createElement("div", {
     className: "tt-mob",
     style: {
@@ -14425,117 +14478,120 @@ function SettingsPage({
         color: t.textFaint,
         fontSize: 12.5
       }
-    }, uq ? "No users match your search." : "No users loaded."), fu.map(u => /*#__PURE__*/React.createElement("div", {
-      key: "m" + u.id,
-      style: {
-        background: t.surface2,
-        border: `1px solid ${t.border}`,
-        borderRadius: 12,
-        padding: 12
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        display: "flex",
-        justifyContent: "space-between",
-        alignItems: "flex-start",
-        gap: 10
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        minWidth: 0
-      }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: {
-        color: t.text,
-        fontWeight: 700,
-        fontSize: 14
-      }
-    }, u.full_name || "—"), /*#__PURE__*/React.createElement("div", {
-      style: {
-        color: t.textMuted,
-        fontSize: 12,
-        fontFamily: "ui-monospace, monospace"
-      }
-    }, u.username, u.position ? " · " + u.position : "")), /*#__PURE__*/React.createElement("div", {
-      className: "inline-flex items-center gap-3",
-      style: {
-        flexShrink: 0
-      }
-    }, /*#__PURE__*/React.createElement("button", {
-      onClick: () => setModal({
-        user: u
-      }),
-      title: "Edit",
-      style: {
-        background: "transparent",
-        border: "none",
-        color: t.textMuted,
-        cursor: "pointer",
-        padding: 2
-      }
-    }, /*#__PURE__*/React.createElement(IconPencil, {
-      size: 17
-    })), u.role !== "owner" && /*#__PURE__*/React.createElement("button", {
-      onClick: () => resetPw(u),
-      title: "Reset password",
-      style: {
-        background: "transparent",
-        border: "none",
-        color: t.accent,
-        cursor: "pointer",
-        padding: 2
-      }
-    }, /*#__PURE__*/React.createElement(ShieldCheck, {
-      size: 16
-    })), /*#__PURE__*/React.createElement("button", {
-      onClick: () => delUser(u),
-      title: "Delete",
-      style: {
-        background: "transparent",
-        border: "none",
-        color: t.bad,
-        cursor: "pointer",
-        padding: 2
-      }
-    }, /*#__PURE__*/React.createElement(IconX, {
-      size: 17
-    })))), /*#__PURE__*/React.createElement("div", {
-      style: {
-        marginTop: 8,
-        display: "flex",
-        flexWrap: "wrap",
-        gap: 8,
-        alignItems: "center",
-        fontSize: 12
-      }
-    }, u.role === "owner" ? /*#__PURE__*/React.createElement("span", {
-      className: "rounded-full",
-      style: {
-        background: t.accentSoft,
-        color: t.accent,
-        padding: "2px 9px",
-        fontWeight: 700
-      }
-    }, "Owner") : u.allowed_views && typeof u.allowed_views === "object" && !Array.isArray(u.allowed_views) && Object.keys(u.allowed_views).length ? /*#__PURE__*/React.createElement("span", {
-      className: "rounded-full",
-      style: {
-        background: t.borderSoft,
-        color: t.textMuted,
-        padding: "2px 9px"
-      }
-    }, "Limited \xB7 ", Object.keys(u.allowed_views).length, " menus") : /*#__PURE__*/React.createElement("span", {
-      className: "rounded-full",
-      style: {
-        background: t.goodSoft,
-        color: t.good,
-        padding: "2px 9px",
-        fontWeight: 600
-      }
-    }, "Full access"), u.pr_employee_id || Number(u.per_day) > 0 ? /*#__PURE__*/React.createElement("span", {
-      style: {
-        color: t.textMuted
-      }
-    }, peso(u.per_day), "/day \xB7 Sched ", Number(u.schedule_id) === 2 ? "B" : "A") : null))));
+    }, uq ? "No users match your search." : "No users loaded."), fu.map(u => {
+      const acc = _userAccess(u);
+      return /*#__PURE__*/React.createElement("div", {
+        key: "m" + u.id,
+        style: {
+          background: t.surface2,
+          border: `1px solid ${t.border}`,
+          borderRadius: 12,
+          padding: 12
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "flex-start",
+          gap: 10
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          minWidth: 0
+        }
+      }, /*#__PURE__*/React.createElement("div", {
+        style: {
+          color: t.text,
+          fontWeight: 700,
+          fontSize: 14
+        }
+      }, u.full_name || "—"), /*#__PURE__*/React.createElement("div", {
+        style: {
+          color: t.textMuted,
+          fontSize: 12,
+          fontFamily: "ui-monospace, monospace"
+        }
+      }, u.username, u.position ? " · " + u.position : "")), /*#__PURE__*/React.createElement("div", {
+        className: "inline-flex items-center gap-3",
+        style: {
+          flexShrink: 0
+        }
+      }, /*#__PURE__*/React.createElement("button", {
+        onClick: () => setModal({
+          user: u
+        }),
+        title: "Edit",
+        style: {
+          background: "transparent",
+          border: "none",
+          color: t.textMuted,
+          cursor: "pointer",
+          padding: 2
+        }
+      }, /*#__PURE__*/React.createElement(IconPencil, {
+        size: 17
+      })), u.role !== "owner" && /*#__PURE__*/React.createElement("button", {
+        onClick: () => resetPw(u),
+        title: "Reset password",
+        style: {
+          background: "transparent",
+          border: "none",
+          color: t.accent,
+          cursor: "pointer",
+          padding: 2
+        }
+      }, /*#__PURE__*/React.createElement(ShieldCheck, {
+        size: 16
+      })), /*#__PURE__*/React.createElement("button", {
+        onClick: () => delUser(u),
+        title: "Delete",
+        style: {
+          background: "transparent",
+          border: "none",
+          color: t.bad,
+          cursor: "pointer",
+          padding: 2
+        }
+      }, /*#__PURE__*/React.createElement(IconX, {
+        size: 17
+      })))), /*#__PURE__*/React.createElement("div", {
+        style: {
+          marginTop: 8,
+          display: "flex",
+          flexWrap: "wrap",
+          gap: 8,
+          alignItems: "center",
+          fontSize: 12
+        }
+      }, u.role === "owner" ? /*#__PURE__*/React.createElement("span", {
+        className: "rounded-full",
+        style: {
+          background: t.accentSoft,
+          color: t.accent,
+          padding: "2px 9px",
+          fontWeight: 700
+        }
+      }, "Owner") : acc.full ? /*#__PURE__*/React.createElement("span", {
+        className: "rounded-full",
+        style: {
+          background: t.goodSoft,
+          color: t.good,
+          padding: "2px 9px",
+          fontWeight: 600
+        }
+      }, "Full access") : /*#__PURE__*/React.createElement("span", {
+        className: "rounded-full",
+        style: {
+          background: t.borderSoft,
+          color: t.textMuted,
+          padding: "2px 9px"
+        }
+      }, "Limited \xB7 ", acc.count, " menus"), u.pr_employee_id || Number(u.per_day) > 0 ? /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.textMuted
+        }
+      }, peso(u.per_day), "/day \xB7 Sched ", Number(u.schedule_id) === 2 ? "B" : "A") : null));
+    }));
   })())), /*#__PURE__*/React.createElement(Card, {
     t: t,
     style: {

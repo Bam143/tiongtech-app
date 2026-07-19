@@ -28,6 +28,49 @@ import { join } from "node:path";
 // scoping is how they stay distinct without anchoring on a neighbouring comment that is free to
 // change). `why` is what breaks in the real world if this mutation ever survives.
 const MUTATIONS = [
+  // ---- the Settings Access label telling the truth (tests/test-access.mjs) ----
+  // These carry `suite` because the payroll suite cannot see them: it never reads erp_users.
+  // Every one of them restores a shape the display bug actually took in production.
+  {
+    name: "drop-users-perms-parse",
+    suite: "test-access.mjs",
+    why: "the exact shipped bug — Settings reads the raw TEXT column and shows a restricted user as 'Full access'",
+    from: `  out.users = (await _supaAll(sb, "erp_users", "id,username,full_name,role,position,allowed_views")).map(u => ({
+    ...u,
+    allowed_views: _normPerms(u.allowed_views)
+  }));`,
+    to: `  out.users = await _supaAll(sb, "erp_users", "id,username,full_name,role,position,allowed_views");`,
+  },
+  {
+    name: "drop-normperms-string-parse",
+    suite: "test-access.mjs",
+    why: "a JSON string stops parsing, so every grant reads as absent and the role silently takes over",
+    from: `  if (typeof o === "string") {
+    try {
+      o = JSON.parse(o);
+    } catch (e) {
+      return null;
+    }
+  }
+`,
+    to: "",
+  },
+  {
+    name: "normperms-accepts-array",
+    suite: "test-access.mjs",
+    why: "an array passes as a grant, and `in` then answers against its indices — every menu denied, silently",
+    from: `  if (!o || typeof o !== "object" || Array.isArray(o)) return null;`,
+    to: `  if (!o || typeof o !== "object") return null;`,
+  },
+  {
+    name: "label-full-on-any-grant",
+    suite: "test-access.mjs",
+    why: "the Access column calls any granted user 'Full access' — the misleading label this fix exists to remove",
+    from: `  if (av) return {
+    full: ALL_MENU_IDS.every(id => id in av),`,
+    to: `  if (av) return {
+    full: true,`,
+  },
   // ---- the write actually landing (silent-write fix) ----
   {
     name: "drop-save-zerorows",
@@ -1020,7 +1063,7 @@ for (const m of MUTATIONS) {
   writeFileSync(tmp, mutated, "utf8");
   let out = "", green = false;
   try {
-    out = execFileSync("node", ["tests/test-payroll.mjs", tmp], { encoding: "utf8", stdio: "pipe" });
+    out = execFileSync("node", [`tests/${m.suite || "test-payroll.mjs"}`, tmp], { encoding: "utf8", stdio: "pipe" });
     green = true;                       // exit 0 = the suite still passed = the mutation lived
   } catch (e) {
     out = String((e.stdout || "") + (e.stderr || ""));
