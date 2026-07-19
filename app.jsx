@@ -482,7 +482,7 @@ async function _supaBootstrap() {
   if (me) { const { data: pe } = await sb.from("pr_employees").select("id").eq("user_id", me.id).eq("active", 1).limit(1); if (pe && pe.length) prId = pe[0].id; }
   out.me = me ? { role: me.role, name: me.full_name, uid: me.id, position: me.position, allowed_views: allowed, pr_employee_id: prId } : { role: "admin", name: "", uid: null, position: null, allowed_views: null, pr_employee_id: null };
   // core datasets
-  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password,last_seen");
+  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password,last_seen,optical_status,rx_power_dbm,onu_id");
   out.vendos = await _supaAll(sb, "vendos", "id,vlan_number,name,address,coordinates,area,phone,email,date_installed,port,nap,url_link,notes,nap_port_id");
   out.olts = await _supaAll(sb, "olt", "id,name,description,standard,total_pon_ports,areas_served");
   out.ponPorts = await _supaAll(sb, "pon_port", "id,olt_id,port_number");
@@ -2621,6 +2621,11 @@ async function loadLiveData() {
       // last_seen stays NULL rather than "" — the Status column distinguishes "never seen" (—)
       // from a real timestamp, and "" would parse to an Invalid Date and read as Offline.
       pppoe_username: c.pppoe_username || "", pppoe_password: c.pppoe_password || "", last_seen: c.last_seen || null,
+      // Same NULL-not-"" reasoning as last_seen: the Optical column shows "—" for a client the
+      // OLT has never reported on, and that is a different fact from a reading of 0.
+      optical_status: c.optical_status || null,
+      rx_power_dbm: c.rx_power_dbm != null && c.rx_power_dbm !== "" ? Number(c.rx_power_dbm) : null,
+      onu_id: c.onu_id || "",
     }));
     if (Array.isArray(d.vendos)) pisos = d.vendos.map((v) => ({
       id: v.id, name: v.name || "", vlan_number: v.vlan_number || "", area: v.area || "", address: v.address || "",
@@ -8098,6 +8103,10 @@ function ClientsView({ t }) {
     // minutes ago both render "Online", and sorting on the label would make them interchangeable.
     // Never-seen rows sort as 0, so they group at the far end rather than scattering.
     "Status": (c) => c.last_seen ? new Date(c.last_seen).getTime() : 0,
+    // Sorts by the reading, not the label, for the same reason Status sorts by recency. Rx power
+    // is negative and worse as it falls, so ascending puts the weakest signals first. No reading
+    // sorts as -Infinity to keep those rows together instead of mixed among real values.
+    "Optical": (c) => c.rx_power_dbm != null ? Number(c.rx_power_dbm) : -Infinity,
   };
   const sorted = sortKey ? sortRows(filtered, _CLIENT_ACC[sortKey], sortDir) : filtered;
   const pg = prPaginate(sorted, size, page);
@@ -8207,7 +8216,7 @@ function ClientsView({ t }) {
                     Status. Keep this list, the <td> order below, and _CLIENT_ACC's keys in step —
                     SortTh looks its accessor up BY LABEL, so a header with no matching key sorts
                     by undefined and silently does nothing. */}
-                {["Client", "Note", "Phone", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Status"].map((h) => (
+                {["Client", "Note", "Phone", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Status", "Optical"].map((h) => (
                   <SortTh key={h} t={t} label={h} sortKey={sortKey} sortDir={sortDir} onSort={onSort} align={h === "MRC" ? "right" : "left"} />
                 ))}
                 <th style={{ borderBottom: `1px solid ${t.border}` }} />
@@ -8245,6 +8254,23 @@ function ClientsView({ t }) {
                     const online = (Date.now() - new Date(ls).getTime()) / 60000 <= 10;
                     const col = online ? t.good : t.bad;
                     return <span className="rounded-full" style={{ background: col + "22", color: col, fontSize: 11, fontWeight: 700, padding: "3px 9px" }}>{online ? "Online" : "Offline"}</span>;
+                  })()}</td>
+                  {/* Optical sits beside Status because they answer the same question from two
+                      sides: Status says whether the ONU is reporting, Optical says how healthy the
+                      light is when it does. A client can be Online and still be critical. No
+                      optical_status is "—" — the OLT has not reported this ONU, which is not the
+                      same as a good reading. onu_id rides along as the tooltip. */}
+                  <td style={{ padding: "11px 16px", whiteSpace: "nowrap" }}>{(() => {
+                    const col = { good: t.good, warning: t.warn, critical: t.bad }[c.optical_status];
+                    if (!col) return <span style={{ color: t.textFaint, fontSize: 13 }}>—</span>;
+                    const rx = c.rx_power_dbm != null ? Number(c.rx_power_dbm).toFixed(1) : "";
+                    return (
+                      <span className="rounded-full inline-flex items-center gap-1" title={c.onu_id || ""}
+                        style={{ background: col + "22", color: col, fontSize: 11, fontWeight: 700, padding: "3px 9px" }}>
+                        <span style={{ width: 7, height: 7, borderRadius: "50%", background: col, display: "inline-block" }} />
+                        {rx}
+                      </span>
+                    );
                   })()}</td>
                   <td style={{ padding: "11px 10px", textAlign: "right" }}>
                     <div className="inline-flex items-center gap-3">

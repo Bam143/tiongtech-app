@@ -1204,7 +1204,7 @@ async function _supaBootstrap() {
     pr_employee_id: null
   };
   // core datasets
-  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password,last_seen");
+  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password,last_seen,optical_status,rx_power_dbm,onu_id");
   out.vendos = await _supaAll(sb, "vendos", "id,vlan_number,name,address,coordinates,area,phone,email,date_installed,port,nap,url_link,notes,nap_port_id");
   out.olts = await _supaAll(sb, "olt", "id,name,description,standard,total_pon_ports,areas_served");
   out.ponPorts = await _supaAll(sb, "pon_port", "id,olt_id,port_number");
@@ -4713,7 +4713,12 @@ async function loadLiveData() {
       // from a real timestamp, and "" would parse to an Invalid Date and read as Offline.
       pppoe_username: c.pppoe_username || "",
       pppoe_password: c.pppoe_password || "",
-      last_seen: c.last_seen || null
+      last_seen: c.last_seen || null,
+      // Same NULL-not-"" reasoning as last_seen: the Optical column shows "—" for a client the
+      // OLT has never reported on, and that is a different fact from a reading of 0.
+      optical_status: c.optical_status || null,
+      rx_power_dbm: c.rx_power_dbm != null && c.rx_power_dbm !== "" ? Number(c.rx_power_dbm) : null,
+      onu_id: c.onu_id || ""
     }));
     if (Array.isArray(d.vendos)) pisos = d.vendos.map(v => ({
       id: v.id,
@@ -21880,7 +21885,11 @@ function ClientsView({
     // Sorts by RECENCY, not by the rendered word: a client seen 2 minutes ago and one seen 9
     // minutes ago both render "Online", and sorting on the label would make them interchangeable.
     // Never-seen rows sort as 0, so they group at the far end rather than scattering.
-    "Status": c => c.last_seen ? new Date(c.last_seen).getTime() : 0
+    "Status": c => c.last_seen ? new Date(c.last_seen).getTime() : 0,
+    // Sorts by the reading, not the label, for the same reason Status sorts by recency. Rx power
+    // is negative and worse as it falls, so ascending puts the weakest signals first. No reading
+    // sorts as -Infinity to keep those rows together instead of mixed among real values.
+    "Optical": c => c.rx_power_dbm != null ? Number(c.rx_power_dbm) : -Infinity
   };
   const sorted = sortKey ? sortRows(filtered, _CLIENT_ACC[sortKey], sortDir) : filtered;
   const pg = prPaginate(sorted, size, page);
@@ -22170,7 +22179,7 @@ function ClientsView({
       textTransform: "uppercase",
       letterSpacing: "0.06em"
     }
-  }, ["Client", "Note", "Phone", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Status"].map(h => /*#__PURE__*/React.createElement(SortTh, {
+  }, ["Client", "Note", "Phone", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Status", "Optical"].map(h => /*#__PURE__*/React.createElement(SortTh, {
     key: h,
     t: t,
     label: h,
@@ -22373,6 +22382,43 @@ function ClientsView({
           padding: "3px 9px"
         }
       }, online ? "Online" : "Offline");
+    })()), /*#__PURE__*/React.createElement("td", {
+      style: {
+        padding: "11px 16px",
+        whiteSpace: "nowrap"
+      }
+    }, (() => {
+      const col = {
+        good: t.good,
+        warning: t.warn,
+        critical: t.bad
+      }[c.optical_status];
+      if (!col) return /*#__PURE__*/React.createElement("span", {
+        style: {
+          color: t.textFaint,
+          fontSize: 13
+        }
+      }, "\u2014");
+      const rx = c.rx_power_dbm != null ? Number(c.rx_power_dbm).toFixed(1) : "";
+      return /*#__PURE__*/React.createElement("span", {
+        className: "rounded-full inline-flex items-center gap-1",
+        title: c.onu_id || "",
+        style: {
+          background: col + "22",
+          color: col,
+          fontSize: 11,
+          fontWeight: 700,
+          padding: "3px 9px"
+        }
+      }, /*#__PURE__*/React.createElement("span", {
+        style: {
+          width: 7,
+          height: 7,
+          borderRadius: "50%",
+          background: col,
+          display: "inline-block"
+        }
+      }), rx);
     })()), /*#__PURE__*/React.createElement("td", {
       style: {
         padding: "11px 10px",
