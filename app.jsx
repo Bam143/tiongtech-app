@@ -458,7 +458,7 @@ async function _supaBootstrap() {
   if (me) { const { data: pe } = await sb.from("pr_employees").select("id").eq("user_id", me.id).eq("active", 1).limit(1); if (pe && pe.length) prId = pe[0].id; }
   out.me = me ? { role: me.role, name: me.full_name, uid: me.id, position: me.position, allowed_views: allowed, pr_employee_id: prId } : { role: "admin", name: "", uid: null, position: null, allowed_views: null, pr_employee_id: null };
   // core datasets
-  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile");
+  out.clients = await _supaAll(sb, "clients", "id,account_number,first_name,last_name,address,coordinates,area,phone,email,subscription_date,profile,mrc,balance,port,nap,url_link,notes,renewal_note,nap_port_id,bill_date,due_date,billing_status,active_profile,pppoe_username,pppoe_password,last_seen");
   out.vendos = await _supaAll(sb, "vendos", "id,vlan_number,name,address,coordinates,area,phone,email,date_installed,port,nap,url_link,notes,nap_port_id");
   out.olts = await _supaAll(sb, "olt", "id,name,description,standard,total_pon_ports,areas_served");
   out.ponPorts = await _supaAll(sb, "pon_port", "id,olt_id,port_number");
@@ -2465,6 +2465,9 @@ async function loadLiveData() {
       profile: c.profile || "", mrc: c.mrc != null ? Number(c.mrc) : "", balance: c.balance != null && c.balance !== "" ? Number(c.balance) : null, subscription_date: c.subscription_date || "",
       coordinates: c.coordinates || "", olt: "", nap: c.nap || "", napPort: c.port || "", notes: c.notes || "", renewal_note: c.renewal_note || "",
       bill_date: c.bill_date || "", due_date: c.due_date || "", billing_status: c.billing_status || "", active_profile: c.active_profile || "",
+      // last_seen stays NULL rather than "" — the Status column distinguishes "never seen" (—)
+      // from a real timestamp, and "" would parse to an Invalid Date and read as Offline.
+      pppoe_username: c.pppoe_username || "", pppoe_password: c.pppoe_password || "", last_seen: c.last_seen || null,
     }));
     if (Array.isArray(d.vendos)) pisos = d.vendos.map((v) => ({
       id: v.id, name: v.name || "", vlan_number: v.vlan_number || "", area: v.area || "", address: v.address || "",
@@ -7623,7 +7626,7 @@ function ClientProfile({ t, client, onClose, pmode }) {
     ["Email", client.email || "—"],
     ["NAP", client.nap ? `${client.nap}${client.napPort ? " · p" + client.napPort : ""}` : "—"],
     [pmode ? "Date Installed" : "Subscription Date", client.subscription_date || "—"],
-    ...(pmode ? [] : [["Bill Date", fmtDate(clientBillDate(client))], ["Due Date", fmtDate(clientDueDate(client))]]),
+    ...(pmode ? [] : [["Bill Date", fmtDate(clientBillDate(client))], ["Due Date", fmtDate(clientDueDate(client))], ["PPPoE Username", client.pppoe_username || "—"], ["PPPoE Password", client.pppoe_password || "—"]]),
   ];
   const th = { textAlign: "left", padding: "8px 12px", fontWeight: 700, fontSize: 10.5, textTransform: "uppercase", letterSpacing: "0.05em", color: t.textFaint, borderBottom: `1px solid ${t.border}` };
   const td = { padding: "8px 12px", fontSize: 12.5, color: t.textMuted, borderBottom: `1px solid ${t.borderSoft}` };
@@ -7876,7 +7879,6 @@ function ClientsView({ t }) {
   const _CLIENT_ACC = {
     "Client": (c) => (fullName(c) || "").toLowerCase(),
     "Note": (c) => (clientNoteInfo(c).text || "").toLowerCase(),
-    "Coordinates": (c) => (c.coordinates || "").toLowerCase(),
     "Area": (c) => (c.area || "").toLowerCase(),
     "Plan / Profile": (c) => (c.profile || "").toLowerCase(),
     "MRC": (c) => Number(c.mrc) || 0,
@@ -7886,6 +7888,10 @@ function ClientsView({ t }) {
     "Due Date": (c) => { const d = clientDueDate(c); return d ? d.getTime() : 0; },
     "NAP": (c) => (c.nap || "").toLowerCase(),
     "Phone": (c) => (c.phone || "").toLowerCase(),
+    // Sorts by RECENCY, not by the rendered word: a client seen 2 minutes ago and one seen 9
+    // minutes ago both render "Online", and sorting on the label would make them interchangeable.
+    // Never-seen rows sort as 0, so they group at the far end rather than scattering.
+    "Status": (c) => c.last_seen ? new Date(c.last_seen).getTime() : 0,
   };
   const sorted = sortKey ? sortRows(filtered, _CLIENT_ACC[sortKey], sortDir) : filtered;
   const pg = prPaginate(sorted, size, page);
@@ -7988,7 +7994,11 @@ function ClientsView({ t }) {
           <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 860 }}>
             <thead>
               <tr style={{ color: t.textFaint, fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em" }}>
-                {["Client", "Note", "Coordinates", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Phone"].map((h) => (
+                {/* Coordinates gave up its slot to Phone, and the old trailing Phone column became
+                    Status. Keep this list, the <td> order below, and _CLIENT_ACC's keys in step —
+                    SortTh looks its accessor up BY LABEL, so a header with no matching key sorts
+                    by undefined and silently does nothing. */}
+                {["Client", "Note", "Phone", "Area", "Plan / Profile", "MRC", "Balance", "Subscription Date", "Tenure", "Due Date", "NAP", "Status"].map((h) => (
                   <SortTh key={h} t={t} label={h} sortKey={sortKey} sortDir={sortDir} onSort={onSort} align={h === "MRC" ? "right" : "left"} />
                 ))}
                 <th style={{ borderBottom: `1px solid ${t.border}` }} />
@@ -8007,7 +8017,7 @@ function ClientsView({ t }) {
                     {(() => { const ll = c.coordinates ? parseLatLng(c.coordinates) : null; return ll ? <a href={`https://www.google.com/maps/search/?api=1&query=${ll[0]},${ll[1]}`} target="_blank" rel="noreferrer" title="Open location in Google Maps" style={{ marginTop: 3, color: "#f59e0b", display: "inline-flex", alignItems: "center", gap: 3, fontSize: 11, fontWeight: 600, textDecoration: "none" }}><MapPin size={12} />map</a> : null; })()}
                   </td>
                   <td style={{ padding: "11px 16px", fontSize: 12.5 }}>{(() => { const ni = clientNoteInfo(c); if (ni.kind === "del") return <span className="rounded-full" style={{ background: t.bad + "22", color: t.bad, fontWeight: 800, fontSize: 11, padding: "3px 9px" }}>For Deletion</span>; if (ni.kind === "vip") return <span className="inline-flex items-center gap-1.5"><span className="rounded-full" style={{ background: (t.violet || t.accent) + "22", color: t.violet || t.accent, fontWeight: 800, fontSize: 11, padding: "3px 9px" }}>VIP</span>{ni.note ? <span style={{ color: t.textMuted, fontSize: 12 }}>{ni.note}</span> : null}</span>; return <span style={{ color: ni.text ? t.textMuted : t.textFaint }}>{ni.text || "—"}</span>; })()}</td>
-                  <td style={{ padding: "11px 16px", color: t.textMuted, fontSize: 12, fontFamily: "ui-monospace, monospace", whiteSpace: "nowrap" }}>{c.coordinates || "—"}</td>
+                  <td style={{ padding: "11px 16px", color: t.textMuted, fontSize: 13 }}>{c.phone || "—"}</td>
                   <td style={{ padding: "11px 16px", color: t.textMuted, fontSize: 13 }}>{c.area}</td>
                   <td style={{ padding: "11px 16px", color: t.textMuted, fontSize: 13 }}>{c.profile}</td>
                   <td style={{ padding: "11px 16px", textAlign: "right", fontSize: 13, fontWeight: 600, color: t.text }}>{c.mrc ? peso(c.mrc) : "—"}</td>
@@ -8016,7 +8026,17 @@ function ClientsView({ t }) {
                   <td style={{ padding: "11px 16px", fontSize: 12.5, fontWeight: 600, color: t.accent, whiteSpace: "nowrap" }}>{tenureOf(c.subscription_date)}</td>
                   <td style={{ padding: "11px 16px", whiteSpace: "nowrap" }}>{di.color ? <span className="rounded-full" style={{ background: di.color + "22", color: di.color, fontSize: 11, fontWeight: 700, padding: "3px 9px" }}>{di.date}</span> : <span style={{ color: t.textFaint, fontSize: 13 }}>—</span>}</td>
                   <td style={{ padding: "11px 16px", color: t.textMuted, fontSize: 12.5 }}>{c.nap ? `${c.nap}${c.napPort ? " · p" + c.napPort : ""}` : "—"}</td>
-                  <td style={{ padding: "11px 16px", color: t.textMuted, fontSize: 13 }}>{c.phone || "—"}</td>
+                  {/* Online = last_seen within 10 minutes. Read off Date.now() at RENDER time, so a
+                      tab left open goes stale until something re-renders — it is a snapshot, not a
+                      live feed. No last_seen at all is "—", deliberately distinct from Offline:
+                      never-reported and reported-late are different facts about a client. */}
+                  <td style={{ padding: "11px 16px", color: t.textMuted, fontSize: 13 }}>{(() => {
+                    const ls = c.last_seen;
+                    if (!ls) return <span style={{ color: t.textFaint, fontSize: 13 }}>—</span>;
+                    const online = (Date.now() - new Date(ls).getTime()) / 60000 <= 10;
+                    const col = online ? t.good : t.bad;
+                    return <span className="rounded-full" style={{ background: col + "22", color: col, fontSize: 11, fontWeight: 700, padding: "3px 9px" }}>{online ? "Online" : "Offline"}</span>;
+                  })()}</td>
                   <td style={{ padding: "11px 10px", textAlign: "right" }}>
                     <div className="inline-flex items-center gap-3">
                       {can("edit_clients") && <button onClick={() => setJoFor(c)} title="Create job order" style={{ background: "transparent", border: "none", color: t.accent, cursor: "pointer", padding: 2, display: "inline-flex" }}><IconCalendar size={17} /></button>}
@@ -8028,8 +8048,10 @@ function ClientsView({ t }) {
                 </tr>
                 );
               })}
+              {/* 13, not 12: twelve data columns plus the trailing actions cell. The old 12 was
+                  already one short, so the empty-state row under-spanned the table. */}
               {filtered.length === 0 && (
-                <tr><td colSpan={12} style={{ padding: "24px 16px", textAlign: "center", color: t.textFaint, fontSize: 13 }}>No clients match your search.</td></tr>
+                <tr><td colSpan={13} style={{ padding: "24px 16px", textAlign: "center", color: t.textFaint, fontSize: 13 }}>No clients match your search.</td></tr>
               )}
             </tbody>
           </table>
