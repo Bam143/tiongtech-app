@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>TIONGTECH — Optical Health</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<style>
+  html,body,#root{height:100%}
+  body{margin:0;background:#0A111E;font-family:Inter,system-ui,sans-serif;color:#E9F0FA;
+       background-image:radial-gradient(1200px 600px at 78% -10%, rgba(44,201,228,0.10), transparent 60%);
+       background-attachment:fixed}
+  #boot{position:fixed;inset:0;display:grid;place-items:center;color:#8598B6;font:14px/1.5 system-ui,sans-serif;z-index:5}
+  #boot .ring{width:34px;height:34px;border:3px solid #22314B;border-top-color:#2CC9E4;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  ::-webkit-scrollbar{height:10px;width:10px}
+  ::-webkit-scrollbar-thumb{background:#22314B;border-radius:6px}
+</style>
+</head><body>
+<div id="boot"><div><div class="ring"></div>Loading optical health…</div></div>
+<div id="root"></div>
+
+<script>
+  // Same Supabase project as index.html. The publishable key is meant to be public — it ships to
+  // every browser that loads this page. Row Level Security protects the data, not this key.
+  // Never put the secret key (sb_secret_...) or the database password here.
+  window.SB = window.supabase.createClient(
+    "https://mgwrjynhbebjtneuahmq.supabase.co",
+    "sb_publishable_Pkf-EbuCxP4ETf5HpfNg9w_3GgUECga"
+  );
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+/* ------------------------------------------------------------------ */
+/*  THEME — mirrors THEMES.dark in app.jsx                             */
+/* ------------------------------------------------------------------ */
+const T = {
+  surface: "#111C2E", surface2: "#0E1728", border: "#22314B", borderSoft: "#1A2740",
+  text: "#E9F0FA", textMuted: "#8598B6", textFaint: "#5E7192",
+  accent: "#2CC9E4", accentSoft: "rgba(44,201,228,0.14)",
+  good: "#34D399", goodSoft: "rgba(52,211,153,0.14)",
+  warn: "#FBBF24", warnSoft: "rgba(251,191,36,0.14)",
+  bad:  "#F87171", badSoft:  "rgba(248,113,113,0.14)",
+  violet: "#A78BFA",
+};
+
+/* Thresholds for the physical-fault heuristic: a short run should not lose
+   this much light. Short distance + weak RX = connector / bend / dirty fiber,
+   not budget loss over length. */
+const SHORT_DISTANCE_M = 3000;
+const WEAK_RX_DBM = -28;
+
+const STATUS = {
+  good:     { label: "Good",     color: T.good,   soft: T.goodSoft },
+  warning:  { label: "Warning",  color: T.warn,   soft: T.warnSoft },
+  critical: { label: "Critical", color: T.bad,    soft: T.badSoft  },
+};
+const statusMeta = (s) => STATUS[String(s || "").toLowerCase()] ||
+  { label: s || "Unknown", color: T.textFaint, soft: "rgba(94,113,146,0.14)" };
+
+/* ------------------------------------------------------------------ */
+/*  HELPERS                                                            */
+/* ------------------------------------------------------------------ */
+const num = (v) => (v === null || v === undefined || v === "" || isNaN(Number(v)) ? null : Number(v));
+const fmt = (v, digits, suffix) => {
+  const n = num(v);
+  return n === null ? "—" : n.toFixed(digits) + (suffix || "");
+};
+const fmtInt = (v, suffix) => {
+  const n = num(v);
+  return n === null ? "—" : Math.round(n).toLocaleString() + (suffix || "");
+};
+const fmtWhen = (ts) => {
+  if (!ts) return "—";
+  const d = new Date(ts);
+  if (isNaN(d)) return "—";
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+};
+
+/* Short distance + weak RX. Both values must be present to make the call. */
+const isPhysicalFault = (r) => {
+  const d = num(r.distance_m), rx = num(r.rx_power_dbm);
+  return d !== null && rx !== null && d < SHORT_DISTANCE_M && rx < WEAK_RX_DBM;
+};
+
+/* Nulls always sort last, whichever direction the user picked. */
+const compare = (a, b, key, dir) => {
+  const av = a[key], bv = b[key];
+  const an = num(av), bn = num(bv);
+  const aEmpty = an === null && (av === null || av === undefined || av === "");
+  const bEmpty = bn === null && (bv === null || bv === undefined || bv === "");
+  if (aEmpty && bEmpty) return 0;
+  if (aEmpty) return 1;
+  if (bEmpty) return -1;
+  let r;
+  if (an !== null && bn !== null) r = an - bn;
+  else r = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: "base" });
+  return dir === "asc" ? r : -r;
+};
+
+/* ------------------------------------------------------------------ */
+/*  SMALL UI PIECES                                                    */
+/* ------------------------------------------------------------------ */
+function Pill({ status }) {
+  const m = statusMeta(status);
+  return (
+    <span className="inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold whitespace-nowrap"
+          style={{ background: m.soft, color: m.color }}>
+      {m.label}
+    </span>
+  );
+}
+
+function FaultTag() {
+  return (
+    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold tracking-wide whitespace-nowrap"
+          style={{ background: "rgba(167,139,250,0.16)", color: T.violet }}>
+      PHYSICAL FAULT LIKELY
+    </span>
+  );
+}
+
+function Card({ label, value, color, soft, sub }) {
+  return (
+    <div className="rounded-xl p-4 border" style={{ background: T.surface, borderColor: T.border }}>
+      <div className="flex items-center gap-2">
+        <span className="w-2 h-2 rounded-full" style={{ background: color }} />
+        <span className="text-xs font-medium uppercase tracking-wide" style={{ color: T.textMuted }}>{label}</span>
+      </div>
+      <div className="mt-2 text-3xl font-bold tabular-nums" style={{ color }}>{value}</div>
+      {sub ? <div className="mt-1 text-xs" style={{ color: T.textFaint }}>{sub}</div> : null}
+    </div>
+  );
+}
+
+/* Critical rows get a card on mobile and a table row on desktop; this is the card. */
+function CriticalCard({ r }) {
+  return (
+    <div className="rounded-lg border p-3" style={{ background: T.surface2, borderColor: T.border }}>
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="font-semibold truncate">{r.onu_id || "—"}</div>
+          <div className="text-xs truncate" style={{ color: T.textMuted }}>{r.description || r.mac || "—"}</div>
+        </div>
+        <div className="text-right shrink-0">
+          <div className="text-xl font-bold tabular-nums" style={{ color: T.bad }}>{fmt(r.rx_power_dbm, 2, " dBm")}</div>
+          <div className="text-[11px]" style={{ color: T.textFaint }}>RX</div>
+        </div>
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs" style={{ color: T.textMuted }}>
+        <span>TX {fmt(r.tx_power_dbm, 2, " dBm")}</span>
+        <span>{fmtInt(r.distance_m, " m")}</span>
+        <span>{fmt(r.temperature_c, 1, " °C")}</span>
+        <span>{r.olt_name || "—"}</span>
+      </div>
+      {isPhysicalFault(r) ? <div className="mt-2"><FaultTag /></div> : null}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  MAIN TABLE                                                         */
+/* ------------------------------------------------------------------ */
+const COLUMNS = [
+  { key: "onu_id",        label: "ONU ID",   align: "left"  },
+  { key: "mac",           label: "MAC",      align: "left",  hideOnMobile: true },
+  { key: "rx_power_dbm",  label: "RX dBm",   align: "right" },
+  { key: "tx_power_dbm",  label: "TX dBm",   align: "right", hideOnMobile: true },
+  { key: "distance_m",    label: "Distance", align: "right", hideOnMobile: true },
+  { key: "temperature_c", label: "Temp",     align: "right", hideOnMobile: true },
+  { key: "signal_status", label: "Status",   align: "left"  },
+];
+
+function OnuTable({ rows, sort, onSort }) {
+  return (
+    <div className="overflow-x-auto rounded-xl border" style={{ borderColor: T.border, background: T.surface }}>
+      <table className="w-full text-sm border-collapse">
+        <thead>
+          <tr style={{ background: T.surface2 }}>
+            {COLUMNS.map((c) => {
+              const active = sort.key === c.key;
+              return (
+                <th key={c.key}
+                    onClick={() => onSort(c.key)}
+                    className={"px-3 py-2.5 font-semibold whitespace-nowrap cursor-pointer select-none " +
+                               (c.align === "right" ? "text-right " : "text-left ") +
+                               (c.hideOnMobile ? "hidden sm:table-cell" : "")}
+                    style={{ color: active ? T.accent : T.textMuted, borderBottom: "1px solid " + T.border }}>
+                  {c.label}
+                  <span className="ml-1 text-[10px]">{active ? (sort.dir === "asc" ? "▲" : "▼") : "↕"}</span>
+                </th>
+              );
+            })}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => {
+            const m = statusMeta(r.signal_status);
+            const fault = isPhysicalFault(r);
+            return (
+              <tr key={r.onu_id ? r.onu_id + "-" + i : i}
+                  style={{ background: m.soft, borderBottom: "1px solid " + T.borderSoft }}>
+                <td className="px-3 py-2.5" style={{ borderLeft: "3px solid " + m.color }}>
+                  <div className="font-medium">{r.onu_id || "—"}</div>
+                  {r.description ? (
+                    <div className="text-[11px] truncate max-w-[180px]" style={{ color: T.textFaint }}>{r.description}</div>
+                  ) : null}
+                  {fault ? <div className="mt-1 sm:hidden"><FaultTag /></div> : null}
+                </td>
+                <td className="px-3 py-2.5 hidden sm:table-cell font-mono text-xs" style={{ color: T.textMuted }}>
+                  {r.mac || "—"}
+                  {fault ? <div className="mt-1"><FaultTag /></div> : null}
+                </td>
+                <td className="px-3 py-2.5 text-right tabular-nums font-semibold" style={{ color: m.color }}>
+                  {fmt(r.rx_power_dbm, 2)}
+                </td>
+                <td className="px-3 py-2.5 text-right tabular-nums hidden sm:table-cell">{fmt(r.tx_power_dbm, 2)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums hidden sm:table-cell">{fmtInt(r.distance_m)}</td>
+                <td className="px-3 py-2.5 text-right tabular-nums hidden sm:table-cell">{fmt(r.temperature_c, 1)}</td>
+                <td className="px-3 py-2.5"><Pill status={r.signal_status} /></td>
+              </tr>
+            );
+          })}
+          {rows.length === 0 ? (
+            <tr><td colSpan={COLUMNS.length} className="px-3 py-8 text-center" style={{ color: T.textFaint }}>
+              No ONUs match this filter.
+            </td></tr>
+          ) : null}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  APP                                                                */
+/* ------------------------------------------------------------------ */
+function App() {
+  const [rows, setRows]       = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError]     = useState(null);
+  const [fetchedAt, setFetchedAt] = useState(null);
+  const [sort, setSort]       = useState({ key: "rx_power_dbm", dir: "asc" });
+  const [filter, setFilter]   = useState("all");
+  const [q, setQ]             = useState("");
+
+  const load = useCallback(async () => {
+    setLoading(true); setError(null);
+    const { data, error } = await window.SB
+      .from("onu_optical")
+      .select("olt_name,onu_id,mac,description,distance_m,temperature_c,voltage_v,tx_bias_ma,tx_power_dbm,rx_power_dbm,signal_status,updated_at");
+    if (error) { setError(error.message || String(error)); setRows([]); }
+    else { setRows(data || []); setFetchedAt(new Date()); }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const counts = useMemo(() => {
+    const c = { good: 0, warning: 0, critical: 0, other: 0, fault: 0 };
+    for (const r of rows) {
+      const s = String(r.signal_status || "").toLowerCase();
+      if (c[s] === undefined) c.other++; else c[s]++;
+      if (isPhysicalFault(r)) c.fault++;
+    }
+    return c;
+  }, [rows]);
+
+  const criticals = useMemo(() =>
+    rows.filter((r) => String(r.signal_status || "").toLowerCase() === "critical")
+        .slice()
+        .sort((a, b) => compare(a, b, "rx_power_dbm", "asc")),
+  [rows]);
+
+  const visible = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    let out = rows;
+    if (filter === "fault") out = out.filter(isPhysicalFault);
+    else if (filter !== "all") out = out.filter((r) => String(r.signal_status || "").toLowerCase() === filter);
+    if (needle) {
+      out = out.filter((r) =>
+        [r.onu_id, r.mac, r.description, r.olt_name]
+          .some((v) => String(v || "").toLowerCase().includes(needle)));
+    }
+    return out.slice().sort((a, b) => compare(a, b, sort.key, sort.dir));
+  }, [rows, filter, q, sort]);
+
+  const onSort = (key) => setSort((s) =>
+    s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" }
+                  : { key, dir: key === "rx_power_dbm" || key === "tx_power_dbm" ? "asc" : "asc" });
+
+  const chip = (id, label, color) => (
+    <button key={id} onClick={() => setFilter(id)}
+            className="px-3 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap border transition-colors"
+            style={{ background: filter === id ? (color ? color + "26" : T.accentSoft) : "transparent",
+                     borderColor: filter === id ? (color || T.accent) : T.border,
+                     color: filter === id ? (color || T.accent) : T.textMuted }}>
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="min-h-full px-4 py-5 sm:px-6 sm:py-8 max-w-7xl mx-auto">
+
+      {/* header */}
+      <header className="flex flex-wrap items-start justify-between gap-3 mb-5">
+        <div>
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight">Fiber Optical Health</h1>
+          <p className="text-xs sm:text-sm mt-0.5" style={{ color: T.textMuted }}>
+            {rows.length} ONU{rows.length === 1 ? "" : "s"}
+            {fetchedAt ? " · refreshed " + fetchedAt.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }) : ""}
+          </p>
+        </div>
+        <button onClick={load} disabled={loading}
+                className="px-3.5 py-2 rounded-lg text-sm font-semibold border disabled:opacity-50"
+                style={{ background: T.accentSoft, borderColor: T.accent, color: T.accent }}>
+          {loading ? "Loading…" : "Refresh"}
+        </button>
+      </header>
+
+      {error ? (
+        <div className="rounded-xl border p-4 mb-5 text-sm"
+             style={{ background: T.badSoft, borderColor: T.bad, color: T.text }}>
+          <div className="font-semibold mb-1" style={{ color: T.bad }}>Could not load onu_optical</div>
+          <div style={{ color: T.textMuted }}>{error}</div>
+          <div className="mt-2 text-xs" style={{ color: T.textFaint }}>
+            If this says the table is missing or returns no rows, check that RLS on <code>onu_optical</code> allows the anon role to read.
+          </div>
+        </div>
+      ) : null}
+
+      {/* summary cards */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
+        <Card label="Good"     value={counts.good}     color={T.good} />
+        <Card label="Warning"  value={counts.warning}  color={T.warn} />
+        <Card label="Critical" value={counts.critical} color={T.bad} />
+        <Card label="Physical fault" value={counts.fault} color={T.violet}
+              sub={"< " + SHORT_DISTANCE_M.toLocaleString() + " m and RX < " + WEAK_RX_DBM + " dBm"} />
+      </div>
+
+      {/* critical signals */}
+      {criticals.length > 0 ? (
+        <section className="mb-6">
+          <h2 className="text-sm font-bold uppercase tracking-wide mb-2 flex items-center gap-2" style={{ color: T.bad }}>
+            <span className="w-2 h-2 rounded-full" style={{ background: T.bad }} />
+            Critical Signals — worst first
+          </h2>
+          <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+            {criticals.map((r, i) => <CriticalCard key={(r.onu_id || "") + i} r={r} />)}
+          </div>
+        </section>
+      ) : null}
+
+      {/* physical fault callout */}
+      {counts.fault > 0 ? (
+        <section className="mb-6 rounded-xl border p-4"
+                 style={{ background: "rgba(167,139,250,0.08)", borderColor: T.violet }}>
+          <h2 className="text-sm font-bold mb-1" style={{ color: T.violet }}>
+            {counts.fault} ONU{counts.fault === 1 ? "" : "s"} with a likely physical fault
+          </h2>
+          <p className="text-xs" style={{ color: T.textMuted }}>
+            Short fiber run (&lt; {SHORT_DISTANCE_M.toLocaleString()} m) but RX below {WEAK_RX_DBM} dBm. A run this
+            short should not lose that much light — suspect a dirty or loose connector, a tight bend, or a bad splice
+            rather than distance loss. Filter the table below to see them.
+          </p>
+        </section>
+      ) : null}
+
+      {/* filters */}
+      <div className="flex flex-wrap items-center gap-2 mb-3">
+        {chip("all", "All (" + rows.length + ")")}
+        {chip("good", "Good (" + counts.good + ")", T.good)}
+        {chip("warning", "Warning (" + counts.warning + ")", T.warn)}
+        {chip("critical", "Critical (" + counts.critical + ")", T.bad)}
+        {chip("fault", "Physical fault (" + counts.fault + ")", T.violet)}
+        <input value={q} onChange={(e) => setQ(e.target.value)}
+               placeholder="Search ONU, MAC, description, OLT…"
+               className="flex-1 min-w-[180px] px-3 py-1.5 rounded-lg text-sm outline-none border"
+               style={{ background: T.surface2, borderColor: T.border, color: T.text }} />
+      </div>
+
+      {/* all ONUs */}
+      {loading && rows.length === 0
+        ? <div className="py-12 text-center text-sm" style={{ color: T.textFaint }}>Loading ONUs…</div>
+        : <OnuTable rows={visible} sort={sort} onSort={onSort} />}
+
+      <footer className="mt-4 text-xs" style={{ color: T.textFaint }}>
+        Showing {visible.length} of {rows.length}. Tap any column header to sort.
+      </footer>
+    </div>
+  );
+}
+
+document.getElementById("boot").remove();
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body></html>
