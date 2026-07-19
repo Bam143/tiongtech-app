@@ -355,9 +355,9 @@ let CFG_JOBTYPES = ["Client Repair", "Follow-up", "INSTALL", "Mainline Repair", 
 let CFG_ISSUES = ["Disconnected Clients", "Custom J.O", "New Client", "Red Modem", "Installation", "Weak Wi-Fi Signal", "No Power", "No Internet Connection", "SSID Missing", "Unstable Connection"];
 let CFG_SOLUTIONS = ["Completed New Installation", "Escalated Mainline Repair", "Gidoot ang FIC", "Gitarong mga Saksakan", "Replace FIC Connector", "Replace Power Supply", "Replaced Modem", "Restart Modem", "Rewire/Fusion"];
 let CFG_SLA = { standard: 24, warningLead: 3, followup: 72, followupWarnAt: 48 };
-// Sentinel <option> value: picking it swaps the Area select for a text box.
-// Not a real area, so it must never collide with one stored on a client.
-const AREA_NEW = "__tt_new_area__";
+// Managed area names from the `areas` table, filled by bootstrap. Empty until then —
+// there is no seeded fallback on purpose, so a stale hardcoded list can never resurface.
+let AREA_LIST = [];
 const PLANS = ["25MBPS-ISP1", "50MBPS-ISP1", "100MBPS-ISP1", "200MBPS-BIZ"];
 const OLT_STANDARDS = ["IEEE 802.3ah (EPON)", "ITU-T G.984 (GPON)", "ITU-T G.9807 (XGS-PON)"];
 
@@ -469,6 +469,11 @@ async function _supaBootstrap() {
   out.goals = await _supaAll(sb, "goals", "id,title,category,target,current,unit,target_date,notes,done");
   out.clientSnapshots = await _supaAll(sb, "client_snapshots", "snap_date,active,registered,pesowifi");
   out.techAccounts = await _supaAll(sb, "tech_accounts", "name,contact,username");
+  // Guarded, unlike its neighbours: `areas` is newly created, so a missing table or an
+  // RLS policy that does not grant SELECT is a live possibility. _supaAll throws, and the
+  // bootstrap caller turns any throw into `return false` — which drops the ENTIRE app to
+  // mock data. An empty area list is a contained failure; that is not.
+  try { out.areas = await _supaAll(sb, "areas", "id,name"); } catch (e) { out.areas = []; }
   // Parsed on the way in — this is the read the Settings screen renders from. It used to hand the
   // raw TEXT column straight through, and every downstream reader mistook the string for "no
   // restrictions". Normalising here means the list and the edit modal see what login sees.
@@ -2548,6 +2553,8 @@ async function loadLiveData() {
       });
     }
     if (Array.isArray(d.techAccounts)) techAccounts = d.techAccounts.map((a) => ({ name: a.name, contact: a.contact || "", username: a.username }));
+    // Names only — the client form stores clients.area as text, so the id is not needed yet.
+    if (Array.isArray(d.areas)) AREA_LIST = d.areas.map((a) => (a && a.name != null ? String(a.name).trim() : "")).filter(Boolean).sort((a, b) => a.localeCompare(b));
     if (Array.isArray(d.jobTypes) && d.jobTypes.length) CFG_JOBTYPES = d.jobTypes;
     if (Array.isArray(d.issues) && d.issues.length) CFG_ISSUES = d.issues;
     if (Array.isArray(d.solutions) && d.solutions.length) CFG_SOLUTIONS = d.solutions;
@@ -7936,8 +7943,8 @@ function ClientsView({ t }) {
   const [form, setForm] = useState(blankForm);
   const [joFor, setJoFor] = useState(null);
   const [editing, setEditing] = useState(null);
-  // true while the Area field is a free-text box for an area not yet in the data
-  const [areaNew, setAreaNew] = useState(false);
+  // inline validation message for the client form (currently only the required Area)
+  const [formErr, setFormErr] = useState("");
 
   const fullName = (c) => `${c.first_name} ${c.last_name}`.trim();
   // Area options come from the loaded clients, not a fixed list, so the dropdown
@@ -7945,6 +7952,10 @@ function ClientsView({ t }) {
   // Raw values, not trimmed: the filter below compares c.area exactly, so an option
   // must be a value some row actually holds or it would match nothing.
   const areas = Array.from(new Set(rows.map((c) => c.area).filter((a) => a && String(a).trim()))).sort();
+  // Form options: the managed list, plus this client's own stored area when the table does
+  // not have it (legacy or differently-spelled values). Without that, opening such a client
+  // would show a blank Area and quietly rewrite it on the next save.
+  const formAreaOpts = form.area && !AREA_LIST.includes(form.area) ? [form.area, ...AREA_LIST] : AREA_LIST;
   const filtered = rows.filter((c) => {
     if (areaF !== "All" && c.area !== areaF) return false;
     if (statusF !== "All") {
@@ -8013,6 +8024,9 @@ function ClientsView({ t }) {
   };
   const saveClient = () => {
     if (!form.first_name.trim()) return;
+    // Area is required. Checked before the confirm so a blank one can never reach a write.
+    if (!String(form.area || "").trim()) { setFormErr("Please select an area."); return; }
+    setFormErr("");
     if (!window.confirm(editing ? "Save changes to this client?" : "Add this client?")) return;
     const rec = { ...form, mrc: Number(form.mrc) || 0 };
     if (editing) {
@@ -8030,8 +8044,8 @@ function ClientsView({ t }) {
   };
   // _napChainOpen last: it fills the olt/pon the row cannot carry, so the cascade opens on the
   // saved chain instead of "Select...". Display only — neither field reaches a save.
-  const startEdit = (c) => { setForm({ ...blankForm, ...c, ..._napChainOpen(c) }); setEditing(c); setAreaNew(false); setShowForm(true); };
-  const startAdd = () => { setForm(blankForm); setEditing(null); setAreaNew(false); setShowForm(true); };
+  const startEdit = (c) => { setForm({ ...blankForm, ...c, ..._napChainOpen(c) }); setEditing(c); setFormErr(""); setShowForm(true); };
+  const startAdd = () => { setForm(blankForm); setEditing(null); setFormErr(""); setShowForm(true); };
   const deleteClient = (c) => {
     if (!window.confirm("Delete " + fullName(c) + "?")) return;
     if (c.id) _save("delete_client", { id: c.id });
@@ -8207,19 +8221,13 @@ function ClientsView({ t }) {
               <div><label style={lbl}>First name</label><input value={form.first_name} onChange={(e) => setForm({ ...form, first_name: e.target.value })} placeholder="e.g. Jinky" style={selStyle} /></div>
               <div><label style={lbl}>Last name</label><input value={form.last_name} onChange={(e) => setForm({ ...form, last_name: e.target.value })} placeholder="e.g. Cabahug" style={selStyle} /></div>
               <div><label style={lbl}>Account number</label><input value={form.account_number} onChange={(e) => setForm({ ...form, account_number: e.target.value })} placeholder="e.g. 208111523" style={selStyle} /></div>
-              <div><label style={lbl}>Area</label>
-                {areaNew ? (
-                  <>
-                    <input autoFocus value={form.area} onChange={(e) => setForm({ ...form, area: e.target.value })} placeholder="Name the new area" style={selStyle} />
-                    <button onClick={() => { setAreaNew(false); setForm({ ...form, area: "" }); }} style={{ background: "none", border: "none", color: t.accent, cursor: "pointer", fontSize: 11.5, fontWeight: 600, padding: "4px 0 0" }}>Choose from the list instead</button>
-                  </>
-                ) : (
-                  <select value={form.area} onChange={(e) => { const v = e.target.value; if (v === AREA_NEW) { setAreaNew(true); setForm({ ...form, area: "" }); } else setForm({ ...form, area: v }); }} style={selStyle}>
-                    <option value="">— Select area —</option>
-                    {areas.map((a) => <option key={a} value={a}>{a}</option>)}
-                    <option value={AREA_NEW}>+ Add new area…</option>
-                  </select>
-                )}
+              <div><label style={lbl}>Area <span style={{ color: t.bad }}>*</span></label>
+                <select value={form.area} onChange={(e) => { setForm({ ...form, area: e.target.value }); if (e.target.value) setFormErr(""); }} style={{ ...selStyle, ...(formErr ? { borderColor: t.bad } : null) }}>
+                  <option value="">(Select area)</option>
+                  {formAreaOpts.map((a) => <option key={a} value={a}>{a}</option>)}
+                </select>
+                {formErr && <div style={{ color: t.bad, fontSize: 11.5, fontWeight: 600, marginTop: 4 }}>{formErr}</div>}
+                {!AREA_LIST.length && <div style={{ color: t.textFaint, fontSize: 11, marginTop: 4 }}>No areas loaded — check the areas table.</div>}
               </div>
               <div style={{ gridColumn: "1 / -1" }}><label style={lbl}>Address</label><input value={form.address} onChange={(e) => setForm({ ...form, address: e.target.value })} placeholder="Street, Barangay, City" style={selStyle} /></div>
               <div><label style={lbl}>Phone</label><input value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} placeholder="09xx xxx xxxx" style={selStyle} /></div>
